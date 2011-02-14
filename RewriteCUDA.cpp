@@ -1,17 +1,3 @@
-//===- PrintFunctionNames.cpp ---------------------------------------------===//
-//
-//                     The LLVM Compiler Infrastructure
-//
-// This file is distributed under the University of Illinois Open Source
-// License. See LICENSE.TXT for details.
-//
-//===----------------------------------------------------------------------===//
-//
-// Example clang plugin which simply prints the names of all the top-level decls
-// in the input file.
-//
-//===----------------------------------------------------------------------===//
-
 #include "clang/AST/AST.h"
 #include "clang/AST/ASTConsumer.h"
 #include "clang/AST/ExprCXX.h"
@@ -34,20 +20,20 @@ using namespace clang;
 
 namespace {
 
-/* Find all __global__ and __device__ functions and translate them
- * to OpenCL. */
+/**
+ * An AST consumer made to rewrite CUDA to OpenCL.
+ **/
 class RewriteCUDA : public ASTConsumer {
 private:
     SourceManager *SM;
     Rewriter Rewrite;
     FileID MainFileID;
 
-    //TODO keep track of kernels available
-
     llvm::raw_ostream *HostOutFile;
     llvm::raw_ostream *KernelOutFile;
 
-    std::set<llvm::StringRef> Kernels;
+    //TODO keep track of kernels available?
+    //std::set<llvm::StringRef> Kernels;
 
     std::string Preamble;
 
@@ -56,7 +42,8 @@ private:
             llvm::errs() << "  ";
         llvm::errs() << e->getStmtClassName() << "\n";
         indent++;
-        for (Stmt::child_iterator CI = e->child_begin(), CE = e->child_end(); CI != CE; ++CI)
+        for (Stmt::child_iterator CI = e->child_begin(), CE = e->child_end();
+             CI != CE; ++CI)
             TraverseStmt(*CI, indent);
     }
 
@@ -64,7 +51,8 @@ private:
         if (DeclRefExpr *dr = dyn_cast<DeclRefExpr>(e))
             return dr;
         DeclRefExpr *ret = NULL;
-        for (Stmt::child_iterator CI = e->child_begin(), CE = e->child_end(); CI != CE; ++CI) {
+        for (Stmt::child_iterator CI = e->child_begin(), CE = e->child_end();
+             CI != CE; ++CI) {
             ret = FindDeclRefExpr(*CI);
             if (ret)
                 return ret;
@@ -95,57 +83,77 @@ private:
 
     void RewriteCUDACall(CallExpr *cudaCall) {
         llvm::errs() << "Rewriting CUDA API call\n";
-        FunctionDecl *cudaFunc = cudaCall->getDirectCallee();
-        std::string funcName = cudaFunc->getNameAsString();
+        std::string funcName = cudaCall->getDirectCallee()->getNameAsString();
         if (funcName == "cudaThreadExit") {
             //Replace with clReleaseContext()
-            Rewrite.ReplaceText(cudaCall->getExprLoc(),
-                                Rewrite.getRangeSize(cudaCall->getSourceRange()),
-                                "clReleaseContext(clContext)");
+            ReplaceStmtWithText(cudaCall, "clReleaseContext(clContext)");
         }
         else if (funcName == "cudaThreadSynchronize") {
             //Replace with clFinish
-            Rewrite.ReplaceText(cudaCall->getExprLoc(),
-                                Rewrite.getRangeSize(cudaCall->getSourceRange()),
-                                "clFinish(clCommandQueue)");
+            ReplaceStmtWithText(cudaCall, "clFinish(clCommandQueue)");
+        }
+        else if (funcName == "cudaSetDevice") {
+            //TODO implement
+            llvm::errs() << "cudaSetDevice not implemented yet\n";
         }
         else if (funcName == "cudaMalloc") {
             //TODO check if the return value is being placed somewhere
             //TODO case if cudaMalloc being used as argument to something
-            //TODO get arguments
             Expr *varExpr = cudaCall->getArg(0);
             Expr *size = cudaCall->getArg(1);
-            //TraverseStmt(varExpr, 0);
-            //TraverseStmt(size, 0);
             DeclRefExpr *dr = FindDeclRefExpr(varExpr);
-            llvm::StringRef varName = dr->getDecl()->getName();
-            //llvm::errs() << "cudaMalloc var name: " << varName.str() << "\n";
-            //TODO use printPretty printing to an llvm::raw_string_ostream to print AST portions
+            VarDecl *var = dyn_cast<VarDecl>(dr->getDecl());
+            llvm::StringRef varName = var->getName();
             std::string SStr;
             llvm::raw_string_ostream S(SStr);
             size->printPretty(S, 0, PrintingPolicy(Rewrite.getLangOpts()));
+
             //Replace with clCreateBuffer
-            Rewrite.ReplaceText(cudaCall->getExprLoc(),
-                                Rewrite.getRangeSize(cudaCall->getSourceRange()),
-                                varName.str() + " = clCreateBuffer(clContext, CL_MEM_READ_WRITE, " + S.str() + ", NULL, NULL)");
+            std::string sub = varName.str() + " = clCreateBuffer(clContext, CL_MEM_READ_WRITE, " + S.str() + ", NULL, NULL)";
+            ReplaceStmtWithText(cudaCall, sub);
+
+            //Change variable's type to cl_mem
+            TypeLoc tl = var->getTypeSourceInfo()->getTypeLoc();
+            Rewrite.ReplaceText(tl.getBeginLoc(),
+                                Rewrite.getRangeSize(tl.getSourceRange()),
+                                "cl_mem ");
         }
         else if (funcName == "cudaFree") {
+            Expr *varExpr = cudaCall->getArg(0);
+            DeclRefExpr *dr = FindDeclRefExpr(varExpr);
+            llvm::StringRef varName = dr->getDecl()->getName();
+
             //Replace with clReleaseMemObject
-            Rewrite.ReplaceText(cudaCall->getExprLoc(),
-                                Rewrite.getRangeSize(cudaCall->getSourceRange()),
-                                "clReleaseMemObject()");
+            ReplaceStmtWithText(cudaCall, "clReleaseMemObject(" + varName.str() + ")");
         }
         else if (funcName == "cudaMemcpy") {
+            Expr *dst = cudaCall->getArg(0);
+            Expr *src = cudaCall->getArg(1);
+            Expr *count = cudaCall->getArg(2);
+            Expr *kind = cudaCall->getArg(3);
+            //TODO check kind and perform transformation
         }
         else if (funcName == "cudaMemset") {
+            Expr *devPtr = cudaCall->getArg(0);
+            Expr *value = cudaCall->getArg(1);
+            Expr *count = cudaCall->getArg(2);
         }
         else {
+            //TODO Use diagnostics to print pretty errors
             llvm::errs() << "Unsupported CUDA call: " << funcName << "\n";
         }
     }
 
     void RewriteCUDAKernelCall(CUDAKernelCallExpr *kernelCall) {
         llvm::errs() << "Rewriting CUDA kernel call\n";
+        //TODO go through args and "config"
+        //for ()
+    }
+
+    bool ReplaceStmtWithText(Stmt *OldStmt, llvm::StringRef NewStr) {
+        return Rewrite.ReplaceText(OldStmt->getLocStart(),
+                                   Rewrite.getRangeSize(OldStmt->getSourceRange()),
+                                   NewStr);
     }
 
 public:
@@ -203,7 +211,7 @@ public:
     }
 
     virtual void HandleTranslationUnit(ASTContext &) {
-        //TODO add global CL declarations
+        //Add global CL declarations
         Rewrite.InsertTextBefore(SM->getLocForStartOfFile(MainFileID), Preamble);
 
         //Write the rewritten buffer to a file
@@ -212,6 +220,7 @@ public:
             *HostOutFile << std::string(RewriteBuff->begin(), RewriteBuff->end());
         }
         else {
+            //TODO use diagnostics for pretty errors
             llvm::errs() << "No changes made!\n";
         }
         HostOutFile->flush();
@@ -221,38 +230,41 @@ public:
 
 class RewriteCUDAAction : public PluginASTAction {
 protected:
-  ASTConsumer *CreateASTConsumer(CompilerInstance &CI, llvm::StringRef InFile) {
-    if (llvm::raw_ostream *HostOS = CI.createDefaultOutputFile(false, InFile, "c")) {
-        if (llvm::raw_ostream *KernelOS = CI.createDefaultOutputFile(false, InFile, "cl")) {
-            return new RewriteCUDA(HostOS, KernelOS);
+    ASTConsumer *CreateASTConsumer(CompilerInstance &CI, llvm::StringRef InFile) {
+        if (llvm::raw_ostream *HostOS =
+            CI.createDefaultOutputFile(false, InFile, "c")) {
+            if (llvm::raw_ostream *KernelOS =
+                CI.createDefaultOutputFile(false, InFile, "cl")) {
+                return new RewriteCUDA(HostOS, KernelOS);
+            }
+            //FIXME cleanup HostOS
         }
-        //TODO cleanup HostOS
+        return NULL;
     }
-    return NULL;
-  }
 
-  bool ParseArgs(const CompilerInstance &CI,
-                 const std::vector<std::string>& args) {
-    for (unsigned i = 0, e = args.size(); i != e; ++i) {
-      llvm::errs() << "RewriteCUDA arg = " << args[i] << "\n";
+    bool ParseArgs(const CompilerInstance &CI,
+                   const std::vector<std::string> &args) {
+        for (unsigned i = 0, e = args.size(); i != e; ++i) {
+            llvm::errs() << "RewriteCUDA arg = " << args[i] << "\n";
 
-      // Example error handling.
-      if (args[i] == "-an-error") {
-        Diagnostic &D = CI.getDiagnostics();
-        unsigned DiagID = D.getCustomDiagID(
-          Diagnostic::Error, "invalid argument '" + args[i] + "'");
-        D.Report(DiagID);
-        return false;
-      }
+            // Example error handling.
+            if (args[i] == "-an-error") {
+                Diagnostic &D = CI.getDiagnostics();
+                unsigned DiagID = D.getCustomDiagID(
+                Diagnostic::Error, "invalid argument '" + args[i] + "'");
+                D.Report(DiagID);
+                return false;
+            }
+        }
+        if (args.size() && args[0] == "help")
+        PrintHelp(llvm::errs());
+
+        return true;
     }
-    if (args.size() && args[0] == "help")
-      PrintHelp(llvm::errs());
 
-    return true;
-  }
-  void PrintHelp(llvm::raw_ostream& ros) {
-    ros << "Help for RewriteCUDA plugin goes here\n";
-  }
+    void PrintHelp(llvm::raw_ostream &ros) {
+        ros << "Help for RewriteCUDA plugin goes here\n";
+    }
 
 };
 
