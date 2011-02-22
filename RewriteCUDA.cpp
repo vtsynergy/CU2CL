@@ -1,19 +1,24 @@
 #include "clang/AST/AST.h"
 #include "clang/AST/ASTConsumer.h"
+#include "clang/AST/Expr.h"
 #include "clang/AST/ExprCXX.h"
 #include "clang/AST/Stmt.h"
 
+#include "clang/Basic/Diagnostic.h"
 #include "clang/Basic/SourceManager.h"
 
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Frontend/FrontendPluginRegistry.h"
 
+#include "clang/Lex/Preprocessor.h"
+
 #include "clang/Rewrite/Rewriter.h"
 
 #include "llvm/Support/raw_ostream.h"
 
+#include <list>
 #include <set>
-//#include <sstream>
+#include <sstream>
 #include <string>
 
 using namespace clang;
@@ -25,17 +30,26 @@ namespace {
  **/
 class RewriteCUDA : public ASTConsumer {
 private:
+    CompilerInstance *CI;
     SourceManager *SM;
+    Preprocessor *PP;
     Rewriter Rewrite;
     FileID MainFileID;
 
     llvm::raw_ostream *HostOutFile;
     llvm::raw_ostream *KernelOutFile;
 
-    //TODO keep track of kernels available?
-    //std::set<llvm::StringRef> Kernels;
+    std::set<llvm::StringRef> Kernels;
+
+    FunctionDecl *MainDecl;
+
+    std::set<VarDecl *> DeviceMems;
 
     std::string Preamble;
+    //TODO break Preamble up into different portions that are combined
+
+    std::string CLInit;
+    std::string CLClean;
 
     void TraverseStmt(Stmt *e, unsigned int indent) {
         for (unsigned int i = 0; i < indent; i++)
@@ -45,6 +59,18 @@ private:
         for (Stmt::child_iterator CI = e->child_begin(), CE = e->child_end();
              CI != CE; ++CI)
             TraverseStmt(*CI, indent);
+    }
+
+    void FindLeafStmts(Stmt *s, std::vector<Stmt *> &leaves) {
+        if (s->children().empty()) {
+            leaves.push_back(s);
+        }
+        else {
+            for (Stmt::child_iterator CI = s->child_begin(), CE = s->child_end();
+                 CI != CE; ++CI) {
+                FindLeafStmts(*CI, leaves);
+            }
+        }
     }
 
     DeclRefExpr *FindDeclRefExpr(Stmt *e) {
@@ -63,6 +89,7 @@ private:
 
     void RewriteStmt(Stmt *s) {
         //TODO for recursively going through Stmts
+        //TODO support for, while, do-while, if, CompoundStmts
         /*if (CallExpr *ce = dyn_cast<CallExpr>(body))
         {
             
@@ -79,6 +106,7 @@ private:
         //TODO find way to rewrite attributes
         //GlobalAttr *ga = fd->getAttr<GlobalAttr>();
         //Rewrite.ReplaceText(ga->getLocation(), sizeof(char)*(sizeof("__global__")-1), "__kernel");
+        //Rewrite.ReplaceText(cudaKernel->getLocStart(), Rewrite.getRangeSize(cudaKernel->getSourceRange()), "__kernel");
     }
 
     void RewriteCUDACall(CallExpr *cudaCall) {
@@ -117,26 +145,87 @@ private:
             Rewrite.ReplaceText(tl.getBeginLoc(),
                                 Rewrite.getRangeSize(tl.getSourceRange()),
                                 "cl_mem ");
+
+            //Add var to DeviceMems
+            DeviceMems.insert(var);
         }
         else if (funcName == "cudaFree") {
-            Expr *varExpr = cudaCall->getArg(0);
-            DeclRefExpr *dr = FindDeclRefExpr(varExpr);
+            Expr *devPtr = cudaCall->getArg(0);
+            DeclRefExpr *dr = FindDeclRefExpr(devPtr);
             llvm::StringRef varName = dr->getDecl()->getName();
 
             //Replace with clReleaseMemObject
             ReplaceStmtWithText(cudaCall, "clReleaseMemObject(" + varName.str() + ")");
         }
         else if (funcName == "cudaMemcpy") {
+            std::string replace;
+            std::string SStr;
+            llvm::raw_string_ostream S(SStr);
+
             Expr *dst = cudaCall->getArg(0);
             Expr *src = cudaCall->getArg(1);
             Expr *count = cudaCall->getArg(2);
             Expr *kind = cudaCall->getArg(3);
-            //TODO check kind and perform transformation
+            DeclRefExpr *dr = FindDeclRefExpr(kind);
+            EnumConstantDecl *enumConst = dyn_cast<EnumConstantDecl>(dr->getDecl());
+            std::string enumString = enumConst->getNameAsString();
+            //llvm::errs() << enumString << "\n";
+            if (enumString == "cudaMemcpyHostToHost") {
+                //standard memcpy
+                //TODO make sure to include <string.h>
+                replace += "memcpy(";
+                dst->printPretty(S, 0, PrintingPolicy(Rewrite.getLangOpts()));
+                replace += S.str() + ", ";
+                SStr = "";
+                src->printPretty(S, 0, PrintingPolicy(Rewrite.getLangOpts()));
+                replace += S.str() + ", ";
+                SStr = "";
+                count->printPretty(S, 0, PrintingPolicy(Rewrite.getLangOpts()));
+                replace += S.str() + ")";
+                ReplaceStmtWithText(cudaCall, replace);
+            }
+            else if (enumString == "cudaMemcpyHostToDevice") {
+                //clEnqueueWriteBuffer
+                replace += "clEnqueueWriteBuffer(clCommandQueue, ";
+                dst->printPretty(S, 0, PrintingPolicy(Rewrite.getLangOpts()));
+                replace += S.str() + ", CL_TRUE, 0, ";
+                SStr = "";
+                count->printPretty(S, 0, PrintingPolicy(Rewrite.getLangOpts()));
+                replace += S.str() + ", ";
+                SStr = "";
+                src->printPretty(S, 0, PrintingPolicy(Rewrite.getLangOpts()));
+                replace += S.str() + ", 0, NULL, NULL)";
+                ReplaceStmtWithText(cudaCall, replace);
+            }
+            else if (enumString == "cudaMemcpyDeviceToHost") {
+                //clEnqueueReadBuffer
+                replace += "clEnqueueReadBuffer(clCommandQueue, ";
+                src->printPretty(S, 0, PrintingPolicy(Rewrite.getLangOpts()));
+                replace += S.str() + ", CL_TRUE, 0, ";
+                SStr = "";
+                count->printPretty(S, 0, PrintingPolicy(Rewrite.getLangOpts()));
+                replace += S.str() + ", ";
+                SStr = "";
+                dst->printPretty(S, 0, PrintingPolicy(Rewrite.getLangOpts()));
+                replace += S.str() + ", 0, NULL, NULL)";
+                ReplaceStmtWithText(cudaCall, replace);
+            }
+            else if (enumString == "cudaMemcpyDeviceToDevice") {
+                //TODO clEnqueueReadBuffer -> clEnqueueWriteBuffer
+                ReplaceStmtWithText(cudaCall, "clEnqueueReadBuffer(clCommandQueue, src, CL_TRUE, 0, count, temp, 0, NULL, NULL)");
+                ReplaceStmtWithText(cudaCall, "clEnqueueWriteBuffer(clCommandQueue, dst, CL_TRUE, 0, count, temp, 0, NULL, NULL)");
+            }
+            else {
+                //TODO Use diagnostics to print pretty errors
+                llvm::errs() << "Unsupported cudaMemcpy type: " << enumString << "\n";
+            }
         }
         else if (funcName == "cudaMemset") {
-            Expr *devPtr = cudaCall->getArg(0);
+            //TODO follow Swan's example of setting via a kernel
+            //TODO add memset kernel to the list of kernels
+            /*Expr *devPtr = cudaCall->getArg(0);
             Expr *value = cudaCall->getArg(1);
-            Expr *count = cudaCall->getArg(2);
+            Expr *count = cudaCall->getArg(2);*/
         }
         else {
             //TODO Use diagnostics to print pretty errors
@@ -146,8 +235,76 @@ private:
 
     void RewriteCUDAKernelCall(CUDAKernelCallExpr *kernelCall) {
         llvm::errs() << "Rewriting CUDA kernel call\n";
-        //TODO go through args and "config"
-        //for ()
+        FunctionDecl *callee = kernelCall->getDirectCallee();
+        CallExpr *kernelConfig = kernelCall->getConfig();
+        std::string kernelName = "clKernel_" + callee->getNameAsString();
+        std::ostringstream args;
+        for (unsigned i = 0; i < kernelCall->getNumArgs(); i++) {
+            Expr *arg = kernelCall->getArg(i);
+            VarDecl *var = dyn_cast<VarDecl>(FindDeclRefExpr(arg)->getDecl());
+            args << "clSetKernelArg(" << kernelName << ", " << i << ", sizeof(";
+            if (DeviceMems.find(var) != DeviceMems.end()) {
+                //arg var is a cl_mem
+                args << "cl_mem";
+            }
+            else {
+                args << var->getType().getAsString();
+            }
+            args << "), &" << var->getNameAsString() << ");\n";
+        }
+        //TODO guaranteed to be dim3s, so pull out their x,y,z values
+        //TODO if constants, create global size_t arrays for them
+        Expr *grid = kernelConfig->getArg(0);
+        Expr *block = kernelConfig->getArg(1);
+        //TraverseStmt(grid, 0);
+        //TraverseStmt(block, 0);
+        //TODO check if these are constants or variables
+        if (CXXConstructExpr *construct = dyn_cast<CXXConstructExpr>(grid)) {
+            //constant passed
+            std::vector<Stmt *> gridExprs;
+            std::vector<Stmt *> blockExprs;
+            std::ostringstream globalWorkSize[3];
+            std::ostringstream localWorkSize[3];
+            FindLeafStmts(block, blockExprs);
+            for (unsigned int i = 0; i < 3; i++) {
+                localWorkSize[i] << "localWorkSize[" << i << "] = ";
+                if (IntegerLiteral *intArg = dyn_cast<IntegerLiteral>(blockExprs[i])) {
+                    localWorkSize[i] << intArg->getValue().toString(10, true);
+                }
+                else if (CXXDefaultArgExpr *defArg = dyn_cast<CXXDefaultArgExpr>(blockExprs[i])) {
+                    localWorkSize[i] << "1";
+                }
+                else {
+                    //TODO unimplemented argument
+                }
+                localWorkSize[i] << ";\n";
+                args << localWorkSize[i].str();
+            }
+            FindLeafStmts(grid, gridExprs);
+            for (unsigned int i = 0; i < 3; i++) {
+                globalWorkSize[i] << "globalWorkSize[" << i << "] = ";
+                if (IntegerLiteral *intArg = dyn_cast<IntegerLiteral>(gridExprs[i])) {
+                    globalWorkSize[i] << intArg->getValue().toString(10, true);
+                }
+                else if (CXXDefaultArgExpr *defArg = dyn_cast<CXXDefaultArgExpr>(gridExprs[i])) {
+                    globalWorkSize[i] << "1";
+                }
+                else {
+                    //TODO unimplemented argument
+                }
+                globalWorkSize[i] << "*localWorkSize[" << i << "];\n";
+                args << globalWorkSize[i].str();
+            }
+        }
+        else {
+            //TODO variable passed
+        }
+        args << "clEnqueueNDRangeKernel(clCommandQueue, " << kernelName << ", 3, NULL, globalWorkSize, localWorkSize, 0, NULL, NULL)";
+        ReplaceStmtWithText(kernelCall, args.str());
+    }
+
+    void RewriteMain(FunctionDecl *mainDecl) {
+        MainDecl = mainDecl;
     }
 
     bool ReplaceStmtWithText(Stmt *OldStmt, llvm::StringRef NewStr) {
@@ -157,46 +314,58 @@ private:
     }
 
 public:
-    RewriteCUDA(llvm::raw_ostream *HostOS, llvm::raw_ostream *KernelOS) :
-        ASTConsumer(), HostOutFile(HostOS), KernelOutFile(KernelOS) { }
+    RewriteCUDA(llvm::raw_ostream *HostOS, llvm::raw_ostream *KernelOS, CompilerInstance *comp) :
+        ASTConsumer(), HostOutFile(HostOS), KernelOutFile(KernelOS), CI(comp) { }
 
     virtual ~RewriteCUDA() { }
 
     virtual void Initialize(ASTContext &Context) {
         SM = &Context.getSourceManager();
+        PP = &CI->getPreprocessor();
         Rewrite.setSourceMgr(Context.getSourceManager(), Context.getLangOptions());
         MainFileID = Context.getSourceManager().getMainFileID();
 
+        Preamble += "#ifdef __APPLE__\n";
+        Preamble += "#include <OpenCL/opencl.h>\n";
+        Preamble += "#else\n";
+        Preamble += "#include <CL/opencl.h>\n";
+        Preamble += "#endif\n\n";
         Preamble += "cl_platform_id clPlatform;\n";
         Preamble += "cl_device_id clDevice;\n";
         Preamble += "cl_context clContext;\n";
         Preamble += "cl_command_queue clCommandQueue;\n";
         Preamble += "cl_program clProgram;\n\n";
+        Preamble += "size_t globalWorkSize[3];\n";
+        Preamble += "size_t localWorkSize[3];\n\n";
     }
 
     virtual void HandleTopLevelDecl(DeclGroupRef DG) {
+        //TODO check where the declaration comes from (may have been included)
         for(DeclGroupRef::iterator i = DG.begin(), e = DG.end(); i != e; ++i) {
             if (FunctionDecl *fd = dyn_cast<FunctionDecl>(*i)) {
-                if (fd->hasAttr<GlobalAttr>() || fd->hasAttr<DeviceAttr>()) {
+                if (fd->hasAttr<CUDAGlobalAttr>() || fd->hasAttr<CUDADeviceAttr>()) {
                     //Is a device function
                     RewriteCUDAKernel(fd);
                 }
                 else if (Stmt *body = fd->getBody()) {
-                    assert(body->getStmtClass() == Stmt::CompoundStmtClass && "Invalid statement: Not a statement class");
+                    assert(body->getStmtClass() == Stmt::CompoundStmtClass &&
+                           "Invalid statement: Not a statement class");
                     CompoundStmt *cs = dyn_cast<CompoundStmt>(body);
-                    llvm::errs() << "Number of Stmts: " << cs->size() << "\n";
+                    //llvm::errs() << "Number of Stmts: " << cs->size() << "\n";
                     for (Stmt::child_iterator ci = cs->child_begin(), ce = cs->child_end();
                          ci != ce; ++ci) {
                         if (Stmt *childStmt = *ci) {
-                            llvm::errs() << "Child Stmt: " << childStmt->getStmtClassName() << "\n";
+                            //llvm::errs() << "Child Stmt: " << childStmt->getStmtClassName() << "\n";
                             if (CallExpr *ce = dyn_cast<CallExpr>(childStmt)) {
                                 llvm::errs() << "\tCallExpr: ";
                                 if (CUDAKernelCallExpr *kce = dyn_cast<CUDAKernelCallExpr>(ce)) {
+                                    llvm::errs() << kce->getDirectCallee()->getName() << "\n";
                                     RewriteCUDAKernelCall(kce);
                                 }
-                                if (FunctionDecl *callee = ce->getDirectCallee()) {
-                                    llvm::errs() << callee->getName() << "\n";
-                                    if (callee->getNameAsString().find("cuda") == 0) {
+                                else if (FunctionDecl *callee = ce->getDirectCallee()) {
+                                    std::string calleeName = callee->getNameAsString();
+                                    //llvm::errs() << calleeName << "\n";
+                                    if (calleeName.find("cuda") == 0) {
                                         RewriteCUDACall(ce);
                                     }
                                 }
@@ -206,6 +375,13 @@ public:
                         }
                     }
                 }
+                if (fd->getNameAsString() == "main") {
+                    RewriteMain(fd);
+                }
+            }
+            else if (VarDecl *vd = dyn_cast<VarDecl>(*i)) {
+                //TODO get type of the variable, if dim3 rewrite to size_t[3]
+                //TODO check other CUDA-only types to rewrite
             }
         }
     }
@@ -213,6 +389,36 @@ public:
     virtual void HandleTranslationUnit(ASTContext &) {
         //Add global CL declarations
         Rewrite.InsertTextBefore(SM->getLocForStartOfFile(MainFileID), Preamble);
+
+        CompoundStmt *mainBody = dyn_cast<CompoundStmt>(MainDecl->getBody());
+        //Add opencl initialization stuff at top of main
+        CLInit += "\n";
+        CLInit += "clGetPlatformIDs(1, &clPlatform, NULL);\n";
+        CLInit += "clGetDeviceIDs(clPlatform, CL_DEVICE_TYPE_GPU, 1, &clDevice, NULL);\n";
+        CLInit += "clContext = clCreateContext(NULL, 1, &clDevice, NULL, NULL, NULL);\n";
+        CLInit += "clCommandQueue = clCreateCommandQueue(clContext, clDevice, 0, NULL);\n";
+        CLInit += "clProgram = clCreateProgramWithSource(clContext, count, strings, lengths, NULL);\n";
+        CLInit += "clBuildProgram(clProgram, 1, &clDevice, NULL, NULL, NULL);\n";
+        for (std::set<llvm::StringRef>::iterator it = Kernels.begin();
+             it != Kernels.end(); it++) {
+            std::string kernelName = (*it).str();
+            CLInit += "clKernel_" + kernelName + " = clCreateKernel(clProgram, \"" + kernelName + "\", NULL);\n";
+        }
+        CLInit += "\n";
+        Rewrite.InsertTextAfter(PP->getLocForEndOfToken(mainBody->getLBracLoc()), CLInit);
+
+        //Add cleanup code at bottom of main
+        CLClean += "\n";
+        for (std::set<llvm::StringRef>::iterator it = Kernels.begin();
+             it != Kernels.end(); it++) {
+            std::string kernelName = (*it).str();
+            CLClean += "clReleaseKernel(clKernel_" + kernelName + ");\n";
+        }
+        CLClean += "clReleaseProgram(clProgram);\n";
+        CLClean += "clReleaseCommandQueue(clCommandQueue);\n";
+        CLClean += "clReleaseContext(clContext);\n";
+        CLClean += "\n";
+        Rewrite.InsertTextBefore(mainBody->getRBracLoc(), CLClean);
 
         //Write the rewritten buffer to a file
         if (const RewriteBuffer *RewriteBuff =
@@ -233,11 +439,11 @@ protected:
     ASTConsumer *CreateASTConsumer(CompilerInstance &CI, llvm::StringRef InFile) {
         if (llvm::raw_ostream *HostOS =
             CI.createDefaultOutputFile(false, InFile, "c")) {
-            if (llvm::raw_ostream *KernelOS =
+            /*if (llvm::raw_ostream *KernelOS =
                 CI.createDefaultOutputFile(false, InFile, "cl")) {
                 return new RewriteCUDA(HostOS, KernelOS);
-            }
-            //FIXME cleanup HostOS
+            }*/
+            return new RewriteCUDA(HostOS, NULL, &CI);
         }
         return NULL;
     }
@@ -246,18 +452,10 @@ protected:
                    const std::vector<std::string> &args) {
         for (unsigned i = 0, e = args.size(); i != e; ++i) {
             llvm::errs() << "RewriteCUDA arg = " << args[i] << "\n";
-
-            // Example error handling.
-            if (args[i] == "-an-error") {
-                Diagnostic &D = CI.getDiagnostics();
-                unsigned DiagID = D.getCustomDiagID(
-                Diagnostic::Error, "invalid argument '" + args[i] + "'");
-                D.Report(DiagID);
-                return false;
-            }
+            //TODO parse arguments
         }
         if (args.size() && args[0] == "help")
-        PrintHelp(llvm::errs());
+            PrintHelp(llvm::errs());
 
         return true;
     }
