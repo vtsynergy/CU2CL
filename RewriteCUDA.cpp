@@ -40,7 +40,6 @@ private:
     //std::set<FileID> IncludedFileIDs;
 
     llvm::raw_ostream *MainOutFile;
-    llvm::raw_ostream *KernelOutFile;
 
     std::set<llvm::StringRef> Kernels;
     std::set<VarDecl *> DeviceMems;
@@ -63,18 +62,7 @@ private:
             TraverseStmt(*CI, indent);
     }
 
-    void FindLeafStmts(Stmt *s, std::vector<Stmt *> &leaves) {
-        if (s->children().empty()) {
-            leaves.push_back(s);
-        }
-        else {
-            for (Stmt::child_iterator CI = s->child_begin(), CE = s->child_end();
-                 CI != CE; ++CI) {
-                FindLeafStmts(*CI, leaves);
-            }
-        }
-    }
-
+    //TODO include template?
     DeclRefExpr *FindDeclRefExpr(Stmt *e) {
         if (DeclRefExpr *dr = dyn_cast<DeclRefExpr>(e))
             return dr;
@@ -90,17 +78,30 @@ private:
     }
 
     void RewriteHostStmt(Stmt *s) {
-        //TODO recurse
-        /*for (Stmt::child_iterator CI = s->child_begin(), CE = s->child_end();
+        //Traverse children and recurse
+        for (Stmt::child_iterator CI = s->child_begin(), CE = s->child_end();
              CI != CE; ++CI) {
-            RewriteHostStmt(*CI);
-        }*/
-        //TODO visit
-        //TODO for recursively going through Stmts
-        //TODO support for, while, do-while, if, CompoundStmts
-        /*switch (body->getStmtClass()) {
+            if (*CI)
+                RewriteHostStmt(*CI);
         }
-        */
+        //Visit this node
+        //TODO support for, while, do-while, if, CompoundStmts
+        if (CUDAKernelCallExpr *kce = dyn_cast<CUDAKernelCallExpr>(s)) {
+            RewriteCUDAKernelCall(kce);
+        }
+        else if (CallExpr *ce = dyn_cast<CallExpr>(s)) {
+            if (ce->getDirectCallee()->getNameAsString().find("cuda") == 0)
+                RewriteCUDACall(ce);
+        }
+        else if (DeclStmt *ds = dyn_cast<DeclStmt>(s)) {
+            DeclGroupRef DG = ds->getDeclGroup();
+            for(DeclGroupRef::iterator i = DG.begin(), e = DG.end(); i != e; ++i) {
+                if (VarDecl *vd = dyn_cast<VarDecl>(*i)) {
+                    RewriteVarDecl(vd);
+                }
+                //TODO other non-top level declarations??
+            }
+        }
     }
 
     void RewriteCUDAKernel(FunctionDecl *cudaKernel) {
@@ -122,54 +123,48 @@ private:
     }
 
     void RewriteKernelStmt(Stmt *ks) {
-        //TODO recurse
+        //Traverse children and recurse
         for (Stmt::child_iterator CI = ks->child_begin(), CE = ks->child_end();
              CI != CE; ++CI) {
-            RewriteKernelStmt(*CI);
+            if (*CI)
+                RewriteKernelStmt(*CI);
         }
-        //TODO visit
+        //Visit this node
         std::string SStr;
         llvm::raw_string_ostream S(SStr);
-        switch (ks->getStmtClass()) {
-            case Stmt::MemberExprClass:
-                //llvm::errs() << ((MemberExpr *) ks)->getMemberNameInfo().getAsString() << "\n";
-                ks->printPretty(S, 0, PrintingPolicy(Rewrite.getLangOpts()));
-                if (S.str() == "threadIdx.x")
-                    ReplaceStmtWithText(ks, "get_local_id(0)");
-                else if (S.str() == "threadIdx.y")
-                    ReplaceStmtWithText(ks, "get_local_id(1)");
-                else if (S.str() == "threadIdx.z")
-                    ReplaceStmtWithText(ks, "get_local_id(2)");
-                else if (S.str() == "blockIdx.x")
-                    ReplaceStmtWithText(ks, "get_group_id(0)");
-                else if (S.str() == "blockIdx.y")
-                    ReplaceStmtWithText(ks, "get_group_id(1)");
-                else if (S.str() == "blockIdx.z")
-                    ReplaceStmtWithText(ks, "get_group_id(2)");
-                else if (S.str() == "blockDim.x")
-                    ReplaceStmtWithText(ks, "get_local_size(0)");
-                else if (S.str() == "blockDim.y")
-                    ReplaceStmtWithText(ks, "get_local_size(1)");
-                else if (S.str() == "blockDim.z")
-                    ReplaceStmtWithText(ks, "get_local_size(2)");
-                else if (S.str() == "gridDim.x")
-                    ReplaceStmtWithText(ks, "get_group_size(0)");
-                else if (S.str() == "gridDim.y")
-                    ReplaceStmtWithText(ks, "get_group_size(1)");
-                else if (S.str() == "gridDim.z")
-                    ReplaceStmtWithText(ks, "get_group_size(2)");
-                break;
-            case Stmt::DeclRefExprClass:
-                //llvm::errs() << ((DeclRefExpr *) ks)->getNameInfo().getAsString() << "\n";
-                //ks->printPretty(S, 0, PrintingPolicy(Rewrite.getLangOpts()));
-                //llvm::errs() << S.str() << "\n";
-                break;
-            case Stmt::CallExprClass:
-                ks->printPretty(S, 0, PrintingPolicy(Rewrite.getLangOpts()));
-                if (S.str() == "__syncthreads()")
-                    ReplaceStmtWithText(ks, "barrier(CLK_LOCAL_MEM_FENCE)");
-            default:
-                break;
+        if (MemberExpr *me = dyn_cast<MemberExpr>(ks)) {
+            me->printPretty(S, 0, PrintingPolicy(Rewrite.getLangOpts()));
+            if (S.str() == "threadIdx.x")
+                ReplaceStmtWithText(ks, "get_local_id(0)");
+            else if (S.str() == "threadIdx.y")
+                ReplaceStmtWithText(ks, "get_local_id(1)");
+            else if (S.str() == "threadIdx.z")
+                ReplaceStmtWithText(ks, "get_local_id(2)");
+            else if (S.str() == "blockIdx.x")
+                ReplaceStmtWithText(ks, "get_group_id(0)");
+            else if (S.str() == "blockIdx.y")
+                ReplaceStmtWithText(ks, "get_group_id(1)");
+            else if (S.str() == "blockIdx.z")
+                ReplaceStmtWithText(ks, "get_group_id(2)");
+            else if (S.str() == "blockDim.x")
+                ReplaceStmtWithText(ks, "get_local_size(0)");
+            else if (S.str() == "blockDim.y")
+                ReplaceStmtWithText(ks, "get_local_size(1)");
+            else if (S.str() == "blockDim.z")
+                ReplaceStmtWithText(ks, "get_local_size(2)");
+            else if (S.str() == "gridDim.x")
+                ReplaceStmtWithText(ks, "get_group_size(0)");
+            else if (S.str() == "gridDim.y")
+                ReplaceStmtWithText(ks, "get_group_size(1)");
+            else if (S.str() == "gridDim.z")
+                ReplaceStmtWithText(ks, "get_group_size(2)");
+        }
+        else if (DeclRefExpr *dre = dyn_cast<DeclRefExpr>(ks)) {
+        }
+        else if (CallExpr *ce = dyn_cast<CallExpr>(ks)) {
+            ce->printPretty(S, 0, PrintingPolicy(Rewrite.getLangOpts()));
+            if (S.str() == "__syncthreads()")
+                ReplaceStmtWithText(ks, "barrier(CLK_LOCAL_MEM_FENCE)");
         }
     }
 
@@ -320,45 +315,31 @@ private:
         //TODO if constants, create global size_t arrays for them
         Expr *grid = kernelConfig->getArg(0);
         Expr *block = kernelConfig->getArg(1);
-        //TraverseStmt(grid, 0);
-        //TraverseStmt(block, 0);
+        TraverseStmt(grid, 0);
+        TraverseStmt(block, 0);
         //TODO check if these are constants or variables
-        if (CXXConstructExpr *construct = dyn_cast<CXXConstructExpr>(grid)) {
-            //constant passed
-            std::vector<Stmt *> gridExprs;
-            std::vector<Stmt *> blockExprs;
-            std::ostringstream globalWorkSize[3];
-            std::ostringstream localWorkSize[3];
-            FindLeafStmts(block, blockExprs);
-            for (unsigned int i = 0; i < 3; i++) {
-                localWorkSize[i] << "localWorkSize[" << i << "] = ";
-                if (IntegerLiteral *intArg = dyn_cast<IntegerLiteral>(blockExprs[i])) {
-                    localWorkSize[i] << intArg->getValue().toString(10, true);
-                }
-                else if (CXXDefaultArgExpr *defArg = dyn_cast<CXXDefaultArgExpr>(blockExprs[i])) {
-                    localWorkSize[i] << "1";
-                }
-                else {
-                    //TODO unimplemented argument
-                }
-                localWorkSize[i] << ";\n";
-                args << localWorkSize[i].str();
-            }
-            FindLeafStmts(grid, gridExprs);
-            for (unsigned int i = 0; i < 3; i++) {
-                globalWorkSize[i] << "globalWorkSize[" << i << "] = ";
-                if (IntegerLiteral *intArg = dyn_cast<IntegerLiteral>(gridExprs[i])) {
-                    globalWorkSize[i] << intArg->getValue().toString(10, true);
-                }
-                else if (CXXDefaultArgExpr *defArg = dyn_cast<CXXDefaultArgExpr>(gridExprs[i])) {
-                    globalWorkSize[i] << "1";
-                }
-                else {
-                    //TODO unimplemented argument
-                }
-                globalWorkSize[i] << "*localWorkSize[" << i << "];\n";
-                args << globalWorkSize[i].str();
-            }
+        CXXConstructExpr *construct = dyn_cast<CXXConstructExpr>(block);
+        ImplicitCastExpr *cast = dyn_cast<ImplicitCastExpr>(construct->getArg(0));
+        if (cast->getSubExprAsWritten()->getStmtClass() != Stmt::DeclRefExprClass) {
+            //constant passed to block
+            Expr *arg = cast->getSubExprAsWritten();
+            std::string SStr;
+            llvm::raw_string_ostream S(SStr);
+            arg->printPretty(S, 0, PrintingPolicy(Rewrite.getLangOpts()));
+            args << "localWorkSize[0] = " << S.str() << ";\n";
+        }
+        else {
+            //TODO variable passed
+        }
+        construct = dyn_cast<CXXConstructExpr>(grid);
+        cast = dyn_cast<ImplicitCastExpr>(construct->getArg(0));
+        if (cast->getSubExprAsWritten()->getStmtClass() != Stmt::DeclRefExprClass) {
+            //constant passed to grid
+            Expr *arg = cast->getSubExprAsWritten();
+            std::string SStr;
+            llvm::raw_string_ostream S(SStr);
+            arg->printPretty(S, 0, PrintingPolicy(Rewrite.getLangOpts()));
+            args << "globalWorkSize[0] = (" << S.str() << ")*localWorkSize[0];\n";
         }
         else {
             //TODO variable passed
@@ -371,6 +352,27 @@ private:
         MainDecl = mainDecl;
     }
 
+    void RewriteVarDecl(VarDecl *var) {
+        //TODO get type of the variable, if dim3 rewrite to size_t[3]
+        std::string type = var->getType().getAsString();
+        if (type == "dim3") {
+            //TODO rewrite statement as a whole with a new string
+            //RewriteDim3(vd);
+            TypeLoc tl = var->getTypeSourceInfo()->getTypeLoc();
+            Rewrite.ReplaceText(tl.getBeginLoc(),
+                                Rewrite.getRangeSize(tl.getSourceRange()),
+                                "size_t");
+        }
+        //TODO check other CUDA-only types to rewrite
+    }
+
+    std::string PrintPrettyToString(Stmt *s) {
+        std::string SStr;
+        llvm::raw_string_ostream S(SStr);
+        s->printPretty(S, 0, PrintingPolicy(Rewrite.getLangOpts()));
+        return S.str();
+    }
+
     bool ReplaceStmtWithText(Stmt *OldStmt, llvm::StringRef NewStr) {
         return Rewrite.ReplaceText(OldStmt->getLocStart(),
                                    Rewrite.getRangeSize(OldStmt->getSourceRange()),
@@ -378,8 +380,8 @@ private:
     }
 
 public:
-    RewriteCUDA(llvm::raw_ostream *HostOS, llvm::raw_ostream *KernelOS, CompilerInstance *comp) :
-        ASTConsumer(), MainOutFile(HostOS), KernelOutFile(KernelOS), CI(comp) { }
+    RewriteCUDA(llvm::raw_ostream *HostOS, CompilerInstance *comp) :
+        ASTConsumer(), CI(comp), MainOutFile(HostOS) { }
 
     virtual ~RewriteCUDA() { }
 
@@ -404,11 +406,9 @@ public:
     }
 
     virtual void HandleTopLevelDecl(DeclGroupRef DG) {
-        //TODO check where the declaration comes from (may have been included)
+        //TODO check where the declaration(s) comes from (may have been included)
         for(DeclGroupRef::iterator i = DG.begin(), e = DG.end(); i != e; ++i) {
             SourceLocation loc = (*i)->getLocation();
-            //PresumedLoc pl = SM->getPresumedLoc(d->getLocation());
-            //llvm::errs() << pl.getFilename() << "\n";
             if (SM->isFromMainFile(loc) /*||
                 strstr(SM->getPresumedLoc(loc).getFilename(), ".cu") != NULL*/) {
                 if (FunctionDecl *fd = dyn_cast<FunctionDecl>(*i)) {
@@ -417,40 +417,14 @@ public:
                         RewriteCUDAKernel(fd);
                     }
                     else if (Stmt *body = fd->getBody()) {
-                        assert(body->getStmtClass() == Stmt::CompoundStmtClass &&
-                               "Invalid statement: Not a statement class");
-                        CompoundStmt *cs = dyn_cast<CompoundStmt>(body);
-                        //llvm::errs() << "Number of Stmts: " << cs->size() << "\n";
-                        for (Stmt::child_iterator ci = cs->child_begin(), ce = cs->child_end();
-                             ci != ce; ++ci) {
-                            if (Stmt *childStmt = *ci) {
-                                //llvm::errs() << "Child Stmt: " << childStmt->getStmtClassName() << "\n";
-                                if (CallExpr *ce = dyn_cast<CallExpr>(childStmt)) {
-                                    llvm::errs() << "\tCallExpr: ";
-                                    if (CUDAKernelCallExpr *kce = dyn_cast<CUDAKernelCallExpr>(ce)) {
-                                        llvm::errs() << kce->getDirectCallee()->getName() << "\n";
-                                        RewriteCUDAKernelCall(kce);
-                                    }
-                                    else if (FunctionDecl *callee = ce->getDirectCallee()) {
-                                        std::string calleeName = callee->getNameAsString();
-                                        //llvm::errs() << calleeName << "\n";
-                                        if (calleeName.find("cuda") == 0) {
-                                            RewriteCUDACall(ce);
-                                        }
-                                    }
-                                    else
-                                        llvm::errs() << "??\n";
-                                }
-                            }
-                        }
+                        RewriteHostStmt(body);
                     }
                     if (fd->getNameAsString() == "main") {
                         RewriteMain(fd);
                     }
                 }
                 else if (VarDecl *vd = dyn_cast<VarDecl>(*i)) {
-                    //TODO get type of the variable, if dim3 rewrite to size_t[3]
-                    //TODO check other CUDA-only types to rewrite
+                    RewriteVarDecl(vd);
                 }
             }
         }
@@ -513,7 +487,7 @@ protected:
                 CI.createDefaultOutputFile(false, InFile, "cl")) {
                 return new RewriteCUDA(HostOS, KernelOS);
             }*/
-            return new RewriteCUDA(HostOS, NULL, &CI);
+            return new RewriteCUDA(HostOS, &CI);
         }
         return NULL;
     }
