@@ -17,6 +17,7 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <list>
+#include <map>
 #include <set>
 #include <sstream>
 #include <string>
@@ -30,6 +31,9 @@ namespace {
  **/
 class RewriteCUDA : public ASTConsumer {
 private:
+    typedef std::map<FileID, llvm::raw_ostream *> IDOutFileMap;
+    typedef std::pair<FileID, llvm::raw_ostream *> IDOutFilePair;
+
     CompilerInstance *CI;
     SourceManager *SM;
     Preprocessor *PP;
@@ -37,9 +41,10 @@ private:
 
     //Rewritten files
     FileID MainFileID;
-    //std::set<FileID> IncludedFileIDs;
-
     llvm::raw_ostream *MainOutFile;
+    llvm::raw_ostream *MainKernelOutFile;
+    IDOutFileMap OutFiles;
+    IDOutFileMap KernelOutFiles;
 
     std::set<llvm::StringRef> Kernels;
     std::set<VarDecl *> DeviceMems;
@@ -49,10 +54,10 @@ private:
     std::string Preamble;
     //TODO break Preamble up into different portions that are combined
 
-    bool IncludingStringH;
-
     std::string CLInit;
     std::string CLClean;
+
+    bool IncludingStringH;
 
     void TraverseStmt(Stmt *e, unsigned int indent) {
         for (unsigned int i = 0; i < indent; i++)
@@ -122,7 +127,7 @@ private:
         if (cudaKernel->hasAttr<CUDAHostAttr>()) {
             SourceLocation loc = FindAttr(cudaKernel->getLocStart(), "__host__");
             RewriteAttr("__host__", loc);
-            //TODO copy code to main file
+            //TODO leave rewritten code in original file
         }
         //Rewrite arguments
         for (FunctionDecl::param_iterator PI = cudaKernel->param_begin(),
@@ -135,6 +140,7 @@ private:
             //TraverseStmt(cudaKernel->getBody(), 0);
             RewriteKernelStmt(cudaKernel->getBody());
         }
+        //TODO remove kernel from original source location
     }
 
     void RewriteKernelParam(ParmVarDecl *parmDecl) {
@@ -430,8 +436,10 @@ private:
     }
 
 public:
-    RewriteCUDA(llvm::raw_ostream *HostOS, CompilerInstance *comp) :
-        ASTConsumer(), CI(comp), MainOutFile(HostOS) { }
+    RewriteCUDA(CompilerInstance *comp, llvm::raw_ostream *HostOS,
+                llvm::raw_ostream *KernelOS) :
+        ASTConsumer(), CI(comp),
+        MainOutFile(HostOS), MainKernelOutFile(KernelOS) { }
 
     virtual ~RewriteCUDA() { }
 
@@ -458,11 +466,31 @@ public:
     }
 
     virtual void HandleTopLevelDecl(DeclGroupRef DG) {
-        //TODO check where the declaration(s) comes from (may have been included)
-        for(DeclGroupRef::iterator i = DG.begin(), e = DG.end(); i != e; ++i) {
-            SourceLocation loc = (*i)->getLocation();
-            if (SM->isFromMainFile(loc) /*||
-                strstr(SM->getPresumedLoc(loc).getFilename(), ".cu") != NULL*/) {
+        //Check where the declaration(s) comes from (may have been included)
+        if (!DG.isNull()) {
+            SourceLocation loc = (DG.isSingleDecl() ? DG.getSingleDecl() :
+                                  DG.getDeclGroup()[0])->getLocation();
+            if (strstr(SM->getPresumedLoc(loc).getFilename(), ".cu") != NULL &&
+                OutFiles.find(SM->getFileID(loc)) != OutFiles.end()) {
+                //Create new files
+                FileID fileid = SM->getFileID(loc);
+                std::string filename = SM->getPresumedLoc(loc).getFilename();
+                size_t dotPos = filename.rfind('.');
+                filename = filename.substr(0, dotPos) + "-cl" + filename.substr(dotPos);
+                llvm::raw_ostream *hostOS = CI->createDefaultOutputFile(false, filename, "cpp");
+                llvm::raw_ostream *kernelOS = CI->createDefaultOutputFile(false, filename, "cl");
+                if (hostOS && kernelOS) {
+                    OutFiles[fileid] = hostOS;
+                    KernelOutFiles[fileid] = kernelOS;
+                }
+                else {
+                    //TODO report and print error
+                }
+            }
+            else if (!SM->isFromMainFile(loc)) {
+                return;
+            }
+            for (DeclGroupRef::iterator i = DG.begin(), e = DG.end(); i != e; ++i) {
                 if (FunctionDecl *fd = dyn_cast<FunctionDecl>(*i)) {
                     if (fd->hasAttr<CUDAGlobalAttr>() || fd->hasAttr<CUDADeviceAttr>()) {
                         //Is a device function
@@ -526,6 +554,8 @@ public:
         //TODO Write the rewritten kernel buffers to new files
 
         MainOutFile->flush();
+        MainKernelOutFile->flush();
+        //TODO flush other OutFiles and KernelOutFiles
     }
 
 };
@@ -533,14 +563,14 @@ public:
 class RewriteCUDAAction : public PluginASTAction {
 protected:
     ASTConsumer *CreateASTConsumer(CompilerInstance &CI, llvm::StringRef InFile) {
-        if (llvm::raw_ostream *HostOS =
-            CI.createDefaultOutputFile(false, InFile, "c")) {
-            /*if (llvm::raw_ostream *KernelOS =
-                CI.createDefaultOutputFile(false, InFile, "cl")) {
-                return new RewriteCUDA(HostOS, KernelOS);
-            }*/
-            return new RewriteCUDA(HostOS, &CI);
-        }
+        std::string filename = InFile.str();
+        size_t dotPos = filename.rfind('.');
+        filename = filename.substr(0, dotPos) + "-cl" + filename.substr(dotPos);
+        llvm::raw_ostream *hostOS = CI.createDefaultOutputFile(false, filename, "cpp");
+        llvm::raw_ostream *kernelOS = CI.createDefaultOutputFile(false, filename, "cl");
+        if (hostOS && kernelOS)
+            return new RewriteCUDA(&CI, hostOS, kernelOS);
+        //TODO cleanup files?
         return NULL;
     }
 
