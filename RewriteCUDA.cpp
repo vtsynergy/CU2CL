@@ -16,7 +16,6 @@
 
 #include "llvm/Support/raw_ostream.h"
 
-#include <list>
 #include <map>
 #include <set>
 #include <sstream>
@@ -112,7 +111,7 @@ private:
     }
 
     void RewriteCUDAKernel(FunctionDecl *cudaKernel) {
-        llvm::errs() << "Rewriting CUDA kernel\n";
+        //llvm::errs() << "Rewriting CUDA kernel\n";
         Kernels.insert(cudaKernel->getName());
         Preamble += "cl_kernel clKernel_" + cudaKernel->getName().str() + ";\n";
         //Rewrite kernel attributes
@@ -199,8 +198,8 @@ private:
             else if (str == "gridDim.z")
                 ReplaceStmtWithText(ks, "get_group_size(2)");
         }
-        else if (DeclRefExpr *dre = dyn_cast<DeclRefExpr>(ks)) {
-        }
+        /*else if (DeclRefExpr *dre = dyn_cast<DeclRefExpr>(ks)) {
+        }*/
         else if (CallExpr *ce = dyn_cast<CallExpr>(ks)) {
             str = PrintPrettyToString(ce);
             if (str == "__syncthreads()")
@@ -209,7 +208,7 @@ private:
     }
 
     void RewriteCUDACall(CallExpr *cudaCall) {
-        llvm::errs() << "Rewriting CUDA API call\n";
+        //llvm::errs() << "Rewriting CUDA API call\n";
         std::string funcName = cudaCall->getDirectCallee()->getNameAsString();
         if (funcName == "cudaThreadExit") {
             //Replace with clReleaseContext()
@@ -318,7 +317,7 @@ private:
     }
 
     void RewriteCUDAKernelCall(CUDAKernelCallExpr *kernelCall) {
-        llvm::errs() << "Rewriting CUDA kernel call\n";
+        //llvm::errs() << "Rewriting CUDA kernel call\n";
         FunctionDecl *callee = kernelCall->getDirectCallee();
         CallExpr *kernelConfig = kernelCall->getConfig();
         std::string kernelName = "clKernel_" + callee->getNameAsString();
@@ -336,32 +335,48 @@ private:
             }
             args << "), &" << var->getNameAsString() << ");\n";
         }
-        //TODO guaranteed to be dim3s, so pull out their x,y,z values
-        //TODO if constants, create global size_t arrays for them
+        //Guaranteed to be dim3s, so pull out their x,y,z values
         Expr *grid = kernelConfig->getArg(0);
         Expr *block = kernelConfig->getArg(1);
-        TraverseStmt(grid, 0);
-        TraverseStmt(block, 0);
-        //TODO check if these are constants or variables
+        //TraverseStmt(grid, 0);
+        //TraverseStmt(block, 0);
         CXXConstructExpr *construct = dyn_cast<CXXConstructExpr>(block);
         ImplicitCastExpr *cast = dyn_cast<ImplicitCastExpr>(construct->getArg(0));
-        if (cast->getSubExprAsWritten()->getStmtClass() != Stmt::DeclRefExprClass) {
+        if (DeclRefExpr *dre = dyn_cast<DeclRefExpr>(cast->getSubExprAsWritten())) {
+            //variable passed
+            ValueDecl *value = dre->getDecl();
+            std::string type = value->getType().getAsString();
+            if (type == "dim3") {
+                for (unsigned int i = 0; i < 3; i++)
+                    args << "localWorkSize[" << i << "] = " << value->getNameAsString() << "[" << i << "];\n";
+            }
+            else {
+                //TODO ??
+            }
+        }
+        else {
             //constant passed to block
             Expr *arg = cast->getSubExprAsWritten();
             args << "localWorkSize[0] = " << PrintPrettyToString(arg) << ";\n";
         }
-        else {
-            //TODO variable passed
-        }
         construct = dyn_cast<CXXConstructExpr>(grid);
         cast = dyn_cast<ImplicitCastExpr>(construct->getArg(0));
-        if (cast->getSubExprAsWritten()->getStmtClass() != Stmt::DeclRefExprClass) {
+        if (DeclRefExpr *dre = dyn_cast<DeclRefExpr>(cast->getSubExprAsWritten())) {
+            //variable passed
+            ValueDecl *value = dre->getDecl();
+            std::string type = value->getType().getAsString();
+            if (type == "dim3") {
+                for (unsigned int i = 0; i < 3; i++)
+                    args << "globalWorkSize[" << i << "] = " << value->getNameAsString() << "[" << i << "]*localWorkSize[" << i << "];\n";
+            }
+            else {
+                //TODO ??
+            }
+        }
+        else {
             //constant passed to grid
             Expr *arg = cast->getSubExprAsWritten();
             args << "globalWorkSize[0] = (" << PrintPrettyToString(arg) << ")*localWorkSize[0];\n";
-        }
-        else {
-            //TODO variable passed
         }
         args << "clEnqueueNDRangeKernel(clCommandQueue, " << kernelName << ", 3, NULL, globalWorkSize, localWorkSize, 0, NULL, NULL)";
         ReplaceStmtWithText(kernelCall, args.str());
@@ -372,15 +387,44 @@ private:
     }
 
     void RewriteVarDecl(VarDecl *var) {
-        //TODO get type of the variable, if dim3 rewrite to size_t[3]
         std::string type = var->getType().getAsString();
         if (type == "dim3") {
+            //Rewrite to size_t array
             //TODO rewrite statement as a whole with a new string
-            //RewriteDim3(vd);
             TypeLoc tl = var->getTypeSourceInfo()->getTypeLoc();
             Rewrite.ReplaceText(tl.getBeginLoc(),
                                 Rewrite.getRangeSize(tl.getSourceRange()),
                                 "size_t");
+            if (var->hasInit()) {
+                //Rewrite initial value
+                CXXConstructExpr *ce = (CXXConstructExpr *) var->getInit();
+                std::string args = " = {";
+                for (CXXConstructExpr::arg_iterator i = ce->arg_begin(), e = ce->arg_end();
+                     i != e; ++i) {
+                    Expr *arg = *i;
+                    if (CXXDefaultArgExpr *defArg = dyn_cast<CXXDefaultArgExpr>(arg)) {
+                        args += PrintPrettyToString(defArg->getExpr());
+                    }
+                    else {
+                        args += PrintPrettyToString(arg);
+                    }
+                    if (i + 1 != e)
+                        args += ", ";
+                }
+                args += "}";
+                SourceRange parenRange = ce->getParenRange();
+                if (parenRange.isValid()) {
+                    Rewrite.ReplaceText(parenRange.getBegin(),
+                                        Rewrite.getRangeSize(parenRange),
+                                        args);
+                    Rewrite.InsertTextBefore(parenRange.getBegin(), "[3]");
+                }
+                else {
+                    Rewrite.InsertTextAfter(PP->getLocForEndOfToken(var->getLocEnd()), "[3]");
+                    Rewrite.InsertTextAfter(PP->getLocForEndOfToken(var->getLocEnd()),
+                                            args);
+                }
+            }
         }
         //TODO check other CUDA-only types to rewrite
     }
@@ -470,21 +514,22 @@ public:
         if (!DG.isNull()) {
             SourceLocation loc = (DG.isSingleDecl() ? DG.getSingleDecl() :
                                   DG.getDeclGroup()[0])->getLocation();
-            if (strstr(SM->getPresumedLoc(loc).getFilename(), ".cu") != NULL &&
-                OutFiles.find(SM->getFileID(loc)) != OutFiles.end()) {
-                //Create new files
-                FileID fileid = SM->getFileID(loc);
-                std::string filename = SM->getPresumedLoc(loc).getFilename();
-                size_t dotPos = filename.rfind('.');
-                filename = filename.substr(0, dotPos) + "-cl" + filename.substr(dotPos);
-                llvm::raw_ostream *hostOS = CI->createDefaultOutputFile(false, filename, "cpp");
-                llvm::raw_ostream *kernelOS = CI->createDefaultOutputFile(false, filename, "cl");
-                if (hostOS && kernelOS) {
-                    OutFiles[fileid] = hostOS;
-                    KernelOutFiles[fileid] = kernelOS;
-                }
-                else {
-                    //TODO report and print error
+            if (strstr(SM->getPresumedLoc(loc).getFilename(), ".cu") != NULL) {
+                if (OutFiles.find(SM->getFileID(loc)) == OutFiles.end()) {
+                    //Create new files
+                    FileID fileid = SM->getFileID(loc);
+                    std::string filename = SM->getPresumedLoc(loc).getFilename();
+                    size_t dotPos = filename.rfind('.');
+                    filename = filename.substr(0, dotPos) + "-cl" + filename.substr(dotPos);
+                    llvm::raw_ostream *hostOS = CI->createDefaultOutputFile(false, filename, "cpp");
+                    llvm::raw_ostream *kernelOS = CI->createDefaultOutputFile(false, filename, "cl");
+                    if (hostOS && kernelOS) {
+                        OutFiles[fileid] = hostOS;
+                        KernelOutFiles[fileid] = kernelOS;
+                    }
+                    else {
+                        //TODO report and print error
+                    }
                 }
             }
             else if (!SM->isFromMainFile(loc)) {
@@ -553,9 +598,27 @@ public:
         }
         //TODO Write the rewritten kernel buffers to new files
 
+        //Flush rewritten files
         MainOutFile->flush();
         MainKernelOutFile->flush();
-        //TODO flush other OutFiles and KernelOutFiles
+        for (IDOutFileMap::iterator i = OutFiles.begin(), e = OutFiles.end();
+             i != e; i++) {
+            FileID fid = (*i).first;
+            llvm::raw_ostream *outFile = (*i).second;
+            if (const RewriteBuffer *RewriteBuff =
+                Rewrite.getRewriteBufferFor(fid)) {
+                *outFile << std::string(RewriteBuff->begin(), RewriteBuff->end());
+            }
+            else {
+                //TODO use diagnostics for pretty errors
+                llvm::errs() << "No changes made!\n";
+            }
+            outFile->flush();
+        }
+        for (IDOutFileMap::iterator i = KernelOutFiles.begin(), e = KernelOutFiles.end();
+             i != e; i++) {
+            (*i).second->flush();
+        }
     }
 
 };
