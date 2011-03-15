@@ -15,8 +15,10 @@
 
 #include "clang/Rewrite/Rewriter.h"
 
+#include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <list>
 #include <map>
 #include <set>
 #include <sstream>
@@ -32,7 +34,7 @@ namespace {
 class RewriteCUDA : public ASTConsumer {
 private:
     typedef std::map<FileID, llvm::raw_ostream *> IDOutFileMap;
-    typedef std::map<llvm::StringRef, FileID> StringRefIDMap;
+    typedef std::map<llvm::StringRef, std::list<llvm::StringRef> > StringRefListMap;
 
     CompilerInstance *CI;
     SourceManager *SM;
@@ -47,8 +49,9 @@ private:
     llvm::raw_ostream *MainKernelOutFile;
     IDOutFileMap OutFiles;
     IDOutFileMap KernelOutFiles;
+    //TODO lump IDs and both outfiles together
 
-    StringRefIDMap Kernels;
+    StringRefListMap Kernels;
     std::set<VarDecl *> DeviceMems;
 
     FunctionDecl *MainDecl;
@@ -68,7 +71,8 @@ private:
         indent++;
         for (Stmt::child_iterator CI = e->child_begin(), CE = e->child_end();
              CI != CE; ++CI)
-            TraverseStmt(*CI, indent);
+            if (*CI)
+                TraverseStmt(*CI, indent);
     }
 
     //TODO include template?
@@ -87,6 +91,7 @@ private:
     }
 
     void RewriteHostFunction(FunctionDecl *hostFunc) {
+        //llvm::errs() << "Rewriting host function: " << hostFunc->getName() << "\n";
         //Remove from KernelRewrite
         RemoveFunction(hostFunc, KernelRewrite);
         //Rewrite __host__ attribute
@@ -95,6 +100,7 @@ private:
             RewriteAttr("__host__", loc, HostRewrite);
         }
         if (Stmt *body = hostFunc->getBody()) {
+            //TraverseStmt(body, 0);
             RewriteHostStmt(body);
         }
     }
@@ -130,7 +136,9 @@ private:
         if (!kernelFunc->hasAttr<CUDAHostAttr>()) {
             RemoveFunction(kernelFunc, HostRewrite);
         }
-        Kernels[kernelFunc->getName()] = SM->getFileID(kernelFunc->getLocation());
+        llvm::StringRef r = llvm::sys::path::stem(SM->getFileEntryForID(SM->getFileID(kernelFunc->getLocation()))->getName());
+        std::list<llvm::StringRef> &l = Kernels[r];
+        l.push_back(kernelFunc->getName());
         Preamble += "cl_kernel clKernel_" + kernelFunc->getName().str() + ";\n";
         //Rewrite kernel attributes
         if (kernelFunc->hasAttr<CUDAGlobalAttr>()) {
@@ -447,7 +455,6 @@ private:
     }
 
     void RewriteAttr(std::string attr, SourceLocation loc, Rewriter &Rewrite) {
-        //llvm::StringRef fileBuf = SM->getBufferData(fileID);
         std::string replace;
         if (attr == "__global__") {
             replace = "__kernel";
@@ -553,12 +560,22 @@ public:
         Preamble += "#include <OpenCL/opencl.h>\n";
         Preamble += "#else\n";
         Preamble += "#include <CL/opencl.h>\n";
-        Preamble += "#endif\n\n";
+        Preamble += "#endif\n";
+        Preamble += "#include <stdio.h>\n\n";
+        Preamble += "size_t loadProgramSource(char *filename, char **progSrc) {\n" \
+                    "    FILE *f = fopen(filename, \"r\");\n" \
+                    "    fseek(f, 0, SEEK_END);\n" \
+                    "    size_t len = (size_t) ftell(f);\n" \
+                    "    *progSrc = (char *) malloc(sizeof(char)*len);\n" \
+                    "    rewind(f);\n" \
+                    "    fread((void *) progSrc, len, 1, f);\n" \
+                    "    fclose(f);\n" \
+                    "    return len;\n" \
+                    "}\n\n";
         Preamble += "cl_platform_id clPlatform;\n";
         Preamble += "cl_device_id clDevice;\n";
         Preamble += "cl_context clContext;\n";
-        Preamble += "cl_command_queue clCommandQueue;\n";
-        Preamble += "cl_program clProgram;\n\n";
+        Preamble += "cl_command_queue clCommandQueue;\n\n";
         Preamble += "size_t globalWorkSize[3];\n";
         Preamble += "size_t localWorkSize[3];\n\n";
 
@@ -611,36 +628,59 @@ public:
     }
 
     virtual void HandleTranslationUnit(ASTContext &) {
-        //TODO declare global clProgram structres for files with kernels
-        //Add global CL declarations
+        //Declare global clPrograms
+        for (StringRefListMap::iterator i = Kernels.begin(),
+             e = Kernels.end(); i != e; i++) {
+            llvm::StringRef r = (*i).first;
+            Preamble += "cl_program clProgram_" + r.str() + ";\n";
+        }
+        //Insert global CL declarations
         HostRewrite.InsertTextBefore(SM->getLocForStartOfFile(MainFileID), Preamble);
 
         CompoundStmt *mainBody = dyn_cast<CompoundStmt>(MainDecl->getBody());
-        //Add opencl initialization stuff at top of main
+        //Insert opencl initialization stuff at top of main
         CLInit += "\n";
+        CLInit += "char *progSrc;\n";
+        CLInit += "size_t progLen;\n\n";
         CLInit += "clGetPlatformIDs(1, &clPlatform, NULL);\n";
         CLInit += "clGetDeviceIDs(clPlatform, CL_DEVICE_TYPE_GPU, 1, &clDevice, NULL);\n";
         CLInit += "clContext = clCreateContext(NULL, 1, &clDevice, NULL, NULL, NULL);\n";
         CLInit += "clCommandQueue = clCreateCommandQueue(clContext, clDevice, 0, NULL);\n";
-        //TODO create clPrograms with the new cl files
-        CLInit += "clProgram = clCreateProgramWithSource(clContext, count, strings, lengths, NULL);\n";
-        //TODO build the programs
-        CLInit += "clBuildProgram(clProgram, 1, &clDevice, NULL, NULL, NULL);\n";
-        for (StringRefIDMap::iterator i = Kernels.begin(),
+        for (StringRefListMap::iterator i = Kernels.begin(),
              e = Kernels.end(); i != e; i++) {
-            std::string kernelName = (*i).first.str();
-            CLInit += "clKernel_" + kernelName + " = clCreateKernel(clProgram, \"" + kernelName + "\", NULL);\n";
+            llvm::StringRef r = (*i).first;
+            CLInit += "progLen = loadProgramSource(\"" + r.str() + "-cl.cl\", &progSrc);\n";
+            CLInit += "clProgram_" + r.str() + " = clCreateProgramWithSource(clContext, 1, &progSrc, &progLen, NULL);\n";
+            CLInit += "free(progSrc);\n";
+            CLInit += "clBuildProgram(clProgram_" + r.str() + ", 1, &clDevice, NULL, NULL, NULL);\n";
+        }
+        for (StringRefListMap::iterator i = Kernels.begin(),
+             e = Kernels.end(); i != e; i++) {
+            std::list<llvm::StringRef> &l = (*i).second;
+            for (std::list<llvm::StringRef>::iterator li = l.begin(), le = l.end();
+                 li != le; li++) {
+                std::string kernelName = (*li).str();
+                CLInit += "clKernel_" + kernelName + " = clCreateKernel(clProgram_" + (*i).first.str() + ", \"" + kernelName + "\", NULL);\n";
+            }
         }
         HostRewrite.InsertTextAfter(PP->getLocForEndOfToken(mainBody->getLBracLoc()), CLInit);
 
-        //Add cleanup code at bottom of main
+        //Insert cleanup code at bottom of main
         CLClean += "\n";
-        for (StringRefIDMap::iterator i = Kernels.begin(),
+        for (StringRefListMap::iterator i = Kernels.begin(),
              e = Kernels.end(); i != e; i++) {
-            std::string kernelName = (*i).first.str();
-            CLClean += "clReleaseKernel(clKernel_" + kernelName + ");\n";
+            std::list<llvm::StringRef> &l = (*i).second;
+            for (std::list<llvm::StringRef>::iterator li = l.begin(), le = l.end();
+                 li != le; li++) {
+                std::string kernelName = (*li).str();
+                CLClean += "clReleaseKernel(clKernel_" + kernelName + ");\n";
+            }
         }
-        CLClean += "clReleaseProgram(clProgram);\n";
+        for (StringRefListMap::iterator i = Kernels.begin(),
+             e = Kernels.end(); i != e; i++) {
+            llvm::StringRef r = (*i).first;
+            CLClean += "clReleaseProgram(clProgram_" + r.str() + ");\n";
+        }
         CLClean += "clReleaseCommandQueue(clCommandQueue);\n";
         CLClean += "clReleaseContext(clContext);\n";
         HostRewrite.InsertTextBefore(mainBody->getRBracLoc(), CLClean);
