@@ -8,6 +8,8 @@
 #include "clang/Basic/FileManager.h"
 #include "clang/Basic/SourceManager.h"
 
+#include "clang/Lex/PPCallbacks.h"
+
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Frontend/FrontendPluginRegistry.h"
 
@@ -25,13 +27,30 @@
 #include <string>
 
 using namespace clang;
+using namespace llvm::sys::path;
 
 namespace {
+
+class RewriteCUDA;
+
+class RewriteIncludesCallback : public PPCallbacks {
+private:
+    RewriteCUDA *RCUDA;
+
+public:
+    RewriteIncludesCallback(RewriteCUDA *);
+
+    virtual void InclusionDirective(SourceLocation, const Token &,
+                                    llvm::StringRef, bool,
+                                    const FileEntry *, SourceLocation/*,
+                                    const llvm::SmallVectorImpl<char> &*/);
+
+};
 
 /**
  * An AST consumer made to rewrite CUDA to OpenCL.
  **/
-class RewriteCUDA : public ASTConsumer {
+class RewriteCUDA : public ASTConsumer, public PPCallbacks {
 private:
     typedef std::map<FileID, llvm::raw_ostream *> IDOutFileMap;
     typedef std::map<llvm::StringRef, std::list<llvm::StringRef> > StringRefListMap;
@@ -136,7 +155,7 @@ private:
         if (!kernelFunc->hasAttr<CUDAHostAttr>()) {
             RemoveFunction(kernelFunc, HostRewrite);
         }
-        llvm::StringRef r = llvm::sys::path::stem(SM->getFileEntryForID(SM->getFileID(kernelFunc->getLocation()))->getName());
+        llvm::StringRef r = stem(SM->getFileEntryForID(SM->getFileID(kernelFunc->getLocation()))->getName());
         std::list<llvm::StringRef> &l = Kernels[r];
         l.push_back(kernelFunc->getName());
         Preamble += "cl_kernel clKernel_" + kernelFunc->getName().str() + ";\n";
@@ -552,6 +571,9 @@ public:
     virtual void Initialize(ASTContext &Context) {
         SM = &Context.getSourceManager();
         PP = &CI->getPreprocessor();
+
+        PP->addPPCallbacks(new RewriteIncludesCallback(this));
+
         HostRewrite.setSourceMgr(Context.getSourceManager(), Context.getLangOptions());
         KernelRewrite.setSourceMgr(Context.getSourceManager(), Context.getLangOptions());
         MainFileID = Context.getSourceManager().getMainFileID();
@@ -737,6 +759,39 @@ public:
         }
     }
 
+    void RewriteInclude(SourceLocation HashLoc, const Token &IncludeTok,
+                        llvm::StringRef FileName, bool IsAngled,
+                        const FileEntry *File, SourceLocation EndLoc/*,
+                        const llvm::SmallVectorImpl<char> &RawPath*/) {
+        if (SM->isFromMainFile(HashLoc) ||
+            extension(SM->getPresumedLoc(HashLoc).getFilename()).str() == ".cu") {
+            if (IsAngled) {
+                KernelRewrite.RemoveText(HashLoc, KernelRewrite.getRangeSize(SourceRange(HashLoc, EndLoc)));
+                if (filename(FileName).str() == "cuda.h")
+                    HostRewrite.RemoveText(HashLoc, HostRewrite.getRangeSize(SourceRange(HashLoc, EndLoc)));
+            }
+            else if (filename(FileName).str() == "cuda.h") {
+                HostRewrite.RemoveText(HashLoc, HostRewrite.getRangeSize(SourceRange(HashLoc, EndLoc)));
+                KernelRewrite.RemoveText(HashLoc, KernelRewrite.getRangeSize(SourceRange(HashLoc, EndLoc)));
+            }
+            else if (extension(FileName).str() == ".cu") {
+                FileID fileID = SM->getFileID(HashLoc);
+                SourceLocation fileStartLoc = SM->getLocForStartOfFile(fileID);
+                llvm::StringRef fileBuf = SM->getBufferData(fileID);
+                const char *fileBufStart = fileBuf.begin();
+
+                llvm::StringRef ext = extension(FileName);
+                SourceLocation start = fileStartLoc.getFileLocWithOffset(ext.begin() - fileBufStart);
+                SourceLocation end = fileStartLoc.getFileLocWithOffset((ext.end()-1) - fileBufStart);
+                HostRewrite.ReplaceText(start, HostRewrite.getRangeSize(SourceRange(start, end)), "-cl.h");
+                KernelRewrite.ReplaceText(start, KernelRewrite.getRangeSize(SourceRange(start, end)), "-cl.cl");
+            }
+            else {
+                //TODO store include info to rewrite later?
+            }
+        }
+    }
+
 };
 
 class RewriteCUDAAction : public PluginASTAction {
@@ -770,6 +825,17 @@ protected:
     }
 
 };
+
+RewriteIncludesCallback::RewriteIncludesCallback(RewriteCUDA *RC) :
+    RCUDA(RC) {
+}
+
+void RewriteIncludesCallback::InclusionDirective(SourceLocation HashLoc, const Token &IncludeTok,
+                                                 llvm::StringRef FileName, bool IsAngled,
+                                                 const FileEntry *File, SourceLocation EndLoc/*,
+                                                 const llvm::SmallVectorImpl<char> &RawPath*/) {
+    RCUDA->RewriteInclude(HashLoc, IncludeTok, FileName, IsAngled, File, EndLoc);
+}
 
 }
 
