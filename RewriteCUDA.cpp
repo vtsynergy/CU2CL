@@ -31,6 +31,14 @@ using namespace llvm::sys::path;
 
 namespace {
 
+struct cmpDG {
+    bool operator()(DeclGroupRef a, DeclGroupRef b) {
+        SourceLocation aLoc = (a.isSingleDecl() ? a.getSingleDecl() : a.getDeclGroup()[0])->getLocStart();
+        SourceLocation bLoc = (b.isSingleDecl() ? b.getSingleDecl() : b.getDeclGroup()[0])->getLocStart();
+        return aLoc.getRawEncoding() < bLoc.getRawEncoding();
+    }
+};
+
 class RewriteCUDA;
 
 class RewriteIncludesCallback : public PPCallbacks {
@@ -71,7 +79,11 @@ private:
     //TODO lump IDs and both outfiles together
 
     StringRefListMap Kernels;
-    std::set<VarDecl *> DeviceMems;
+
+    std::set<DeclGroupRef, cmpDG> GlobalVarDeclGroups;
+    std::set<DeclGroupRef, cmpDG> CurVarDeclGroups;
+    std::set<DeclGroupRef, cmpDG> DeviceMemDGs;
+    std::set<VarDecl *> DeviceMemVars;
 
     FunctionDecl *MainDecl;
 
@@ -122,6 +134,7 @@ private:
             //TraverseStmt(body, 0);
             RewriteHostStmt(body);
         }
+        CurVarDeclGroups.clear();
     }
 
     void RewriteHostStmt(Stmt *s) {
@@ -141,6 +154,11 @@ private:
         }
         else if (DeclStmt *ds = dyn_cast<DeclStmt>(s)) {
             DeclGroupRef DG = ds->getDeclGroup();
+            Decl *firstDecl = DG.isSingleDecl() ? DG.getSingleDecl() : DG.getDeclGroup()[0];
+            //Store VarDecl DeclGroupRefs
+            if (firstDecl->getKind() == Decl::Var) {
+                CurVarDeclGroups.insert(DG);
+            }
             for(DeclGroupRef::iterator i = DG.begin(), e = DG.end(); i != e; ++i) {
                 if (VarDecl *vd = dyn_cast<VarDecl>(*i)) {
                     RewriteVarDecl(vd);
@@ -148,11 +166,32 @@ private:
                 //TODO other non-top level declarations??
             }
         }
+        else if (MemberExpr *me = dyn_cast<MemberExpr>(s)) {
+            //Check base Expr, if DeclRefExpr and a dim3, then rewrite
+            if (DeclRefExpr *dre = dyn_cast<DeclRefExpr>(me->getBase())) {
+                if (dre->getDecl()->getType().getAsString() == "dim3") {
+                    std::string name = me->getMemberDecl()->getNameAsString();
+                    if (name == "x") {
+                        name = "[0]";
+                    }
+                    else if (name == "y") {
+                        name = "[1]";
+                    }
+                    else if (name == "z") {
+                        name = "[2]";
+                    }
+                    //TODO find location of arrow or dot and rewrite
+                    SourceRange sr = me->getSourceRange();
+                    HostRewrite.ReplaceText(sr.getBegin(), HostRewrite.getRangeSize(sr), PrintStmtToString(dre) + name);
+                }
+            }
+        }
     }
 
     void RewriteKernelFunction(FunctionDecl *kernelFunc) {
         //llvm::errs() << "Rewriting CUDA kernel\n";
-        if (!kernelFunc->hasAttr<CUDAHostAttr>()) {
+        bool hasHost = kernelFunc->hasAttr<CUDAHostAttr>();
+        if (!hasHost) {
             RemoveFunction(kernelFunc, HostRewrite);
         }
         llvm::StringRef r = stem(SM->getFileEntryForID(SM->getFileID(kernelFunc->getLocation()))->getName());
@@ -163,15 +202,20 @@ private:
         if (kernelFunc->hasAttr<CUDAGlobalAttr>()) {
             SourceLocation loc = FindAttr(kernelFunc->getLocStart(), "__global__");
             RewriteAttr("__global__", loc, KernelRewrite);
+            if (hasHost)
+                RewriteAttr("__global__", loc, HostRewrite);
         }
         if (kernelFunc->hasAttr<CUDADeviceAttr>()) {
             SourceLocation loc = FindAttr(kernelFunc->getLocStart(), "__device__");
             RewriteAttr("__device__", loc, KernelRewrite);
+            if (hasHost)
+                RewriteAttr("__device__", loc, HostRewrite);
         }
         if (kernelFunc->hasAttr<CUDAHostAttr>()) {
             SourceLocation loc = FindAttr(kernelFunc->getLocStart(), "__host__");
             RewriteAttr("__host__", loc, KernelRewrite);
-            //TODO leave rewritten code in original file
+            if (hasHost)
+                RewriteAttr("__host__", loc, HostRewrite);
         }
         //Rewrite arguments
         for (FunctionDecl::param_iterator PI = kernelFunc->param_begin(),
@@ -216,7 +260,8 @@ private:
         //Visit this node
         std::string str;
         if (MemberExpr *me = dyn_cast<MemberExpr>(ks)) {
-            str = PrintPrettyToString(me);
+            //TODO check base expr, if declrefexpr and a dim3, then rewrite
+            str = PrintStmtToString(me);
             if (str == "threadIdx.x")
                 ReplaceStmtWithText(ks, "get_local_id(0)", KernelRewrite);
             else if (str == "threadIdx.y")
@@ -236,18 +281,43 @@ private:
             else if (str == "blockDim.z")
                 ReplaceStmtWithText(ks, "get_local_size(2)", KernelRewrite);
             else if (str == "gridDim.x")
-                ReplaceStmtWithText(ks, "get_group_size(0)", KernelRewrite);
+                ReplaceStmtWithText(ks, "get_num_groups(0)", KernelRewrite);
             else if (str == "gridDim.y")
-                ReplaceStmtWithText(ks, "get_group_size(1)", KernelRewrite);
+                ReplaceStmtWithText(ks, "get_num_groups(1)", KernelRewrite);
             else if (str == "gridDim.z")
-                ReplaceStmtWithText(ks, "get_group_size(2)", KernelRewrite);
+                ReplaceStmtWithText(ks, "get_num_groups(2)", KernelRewrite);
         }
         /*else if (DeclRefExpr *dre = dyn_cast<DeclRefExpr>(ks)) {
         }*/
         else if (CallExpr *ce = dyn_cast<CallExpr>(ks)) {
-            str = PrintPrettyToString(ce);
+            str = PrintStmtToString(ce);
             if (str == "__syncthreads()")
                 ReplaceStmtWithText(ks, "barrier(CLK_LOCAL_MEM_FENCE)", KernelRewrite);
+        }
+        else if (DeclStmt *ds = dyn_cast<DeclStmt>(ks)) {
+            DeclGroupRef DG = ds->getDeclGroup();
+            Decl *firstDecl = DG.isSingleDecl() ? DG.getSingleDecl() : DG.getDeclGroup()[0];
+            //Store VarDecl DeclGroupRefs
+            if (firstDecl->getKind() == Decl::Var) {
+                CurVarDeclGroups.insert(DG);
+            }
+            for(DeclGroupRef::iterator i = DG.begin(), e = DG.end(); i != e; ++i) {
+                if (VarDecl *vd = dyn_cast<VarDecl>(*i)) {
+                    if (vd->hasAttr<CUDADeviceAttr>()) {
+                        SourceLocation loc = FindAttr(vd->getLocStart(), "__device__");
+                        RewriteAttr("__device__", loc, KernelRewrite);
+                    }
+                    else if (vd->hasAttr<CUDAConstantAttr>()) {
+                        SourceLocation loc = FindAttr(vd->getLocStart(), "__constant__");
+                        RewriteAttr("__constant__", loc, KernelRewrite);
+                    }
+                    else if (vd->hasAttr<CUDASharedAttr>()) {
+                        SourceLocation loc = FindAttr(vd->getLocStart(), "__shared__");
+                        RewriteAttr("__shared__", loc, KernelRewrite);
+                    }
+                }
+                //TODO other non-top level declarations??
+            }
         }
     }
 
@@ -274,20 +344,30 @@ private:
             VarDecl *var = dyn_cast<VarDecl>(dr->getDecl());
             llvm::StringRef varName = var->getName();
             std::string str;
-            str = PrintPrettyToString(size);
+            str = PrintStmtToString(size);
 
             //Replace with clCreateBuffer
             std::string sub = varName.str() + " = clCreateBuffer(clContext, CL_MEM_READ_WRITE, " + str + ", NULL, NULL)";
             ReplaceStmtWithText(cudaCall, sub, HostRewrite);
 
-            //Change variable's type to cl_mem
-            TypeLoc tl = var->getTypeSourceInfo()->getTypeLoc();
-            HostRewrite.ReplaceText(tl.getBeginLoc(),
-                                HostRewrite.getRangeSize(tl.getSourceRange()),
-                                "cl_mem ");
+            DeclGroupRef varDG(var);
+            if (CurVarDeclGroups.find(varDG) != CurVarDeclGroups.end()) {
+                DeviceMemDGs.insert(*CurVarDeclGroups.find(varDG));
+            }
+            else if (GlobalVarDeclGroups.find(varDG) != GlobalVarDeclGroups.end()) {
+                DeviceMemDGs.insert(*GlobalVarDeclGroups.find(varDG));
+            }
+            else {
+                //TODO single decl, so rewrite now as before
+                //Change variable's type to cl_mem
+                TypeLoc tl = var->getTypeSourceInfo()->getTypeLoc();
+                HostRewrite.ReplaceText(tl.getBeginLoc(),
+                                    HostRewrite.getRangeSize(tl.getSourceRange()),
+                                    "cl_mem ");
+            }
 
-            //Add var to DeviceMems
-            DeviceMems.insert(var);
+            //Add var to DeviceMemVars
+            DeviceMemVars.insert(var);
         }
         else if (funcName == "cudaFree") {
             Expr *devPtr = cudaCall->getArg(0);
@@ -316,25 +396,25 @@ private:
                     IncludingStringH = true;
                 }
                 replace += "memcpy(";
-                replace += PrintPrettyToString(dst) + ", ";
-                replace += PrintPrettyToString(src) + ", ";
-                replace += PrintPrettyToString(count) + ")";
+                replace += PrintStmtToString(dst) + ", ";
+                replace += PrintStmtToString(src) + ", ";
+                replace += PrintStmtToString(count) + ")";
                 ReplaceStmtWithText(cudaCall, replace, HostRewrite);
             }
             else if (enumString == "cudaMemcpyHostToDevice") {
                 //clEnqueueWriteBuffer
                 replace += "clEnqueueWriteBuffer(clCommandQueue, ";
-                replace += PrintPrettyToString(dst) + ", CL_TRUE, 0, ";
-                replace += PrintPrettyToString(count) + ", ";
-                replace += PrintPrettyToString(src) + ", 0, NULL, NULL)";
+                replace += PrintStmtToString(dst) + ", CL_TRUE, 0, ";
+                replace += PrintStmtToString(count) + ", ";
+                replace += PrintStmtToString(src) + ", 0, NULL, NULL)";
                 ReplaceStmtWithText(cudaCall, replace, HostRewrite);
             }
             else if (enumString == "cudaMemcpyDeviceToHost") {
                 //clEnqueueReadBuffer
                 replace += "clEnqueueReadBuffer(clCommandQueue, ";
-                replace += PrintPrettyToString(src) + ", CL_TRUE, 0, ";
-                replace += PrintPrettyToString(count) + ", ";
-                replace += PrintPrettyToString(dst) + ", 0, NULL, NULL)";
+                replace += PrintStmtToString(src) + ", CL_TRUE, 0, ";
+                replace += PrintStmtToString(count) + ", ";
+                replace += PrintStmtToString(dst) + ", 0, NULL, NULL)";
                 ReplaceStmtWithText(cudaCall, replace, HostRewrite);
             }
             else if (enumString == "cudaMemcpyDeviceToDevice") {
@@ -370,7 +450,7 @@ private:
             Expr *arg = kernelCall->getArg(i);
             VarDecl *var = dyn_cast<VarDecl>(FindDeclRefExpr(arg)->getDecl());
             args << "clSetKernelArg(" << kernelName << ", " << i << ", sizeof(";
-            if (DeviceMems.find(var) != DeviceMems.end()) {
+            if (DeviceMemVars.find(var) != DeviceMemVars.end()) {
                 //arg var is a cl_mem
                 args << "cl_mem";
             }
@@ -401,7 +481,7 @@ private:
         else {
             //constant passed to block
             Expr *arg = cast->getSubExprAsWritten();
-            args << "localWorkSize[0] = " << PrintPrettyToString(arg) << ";\n";
+            args << "localWorkSize[0] = " << PrintStmtToString(arg) << ";\n";
         }
         construct = dyn_cast<CXXConstructExpr>(grid);
         cast = dyn_cast<ImplicitCastExpr>(construct->getArg(0));
@@ -420,7 +500,7 @@ private:
         else {
             //constant passed to grid
             Expr *arg = cast->getSubExprAsWritten();
-            args << "globalWorkSize[0] = (" << PrintPrettyToString(arg) << ")*localWorkSize[0];\n";
+            args << "globalWorkSize[0] = (" << PrintStmtToString(arg) << ")*localWorkSize[0];\n";
         }
         args << "clEnqueueNDRangeKernel(clCommandQueue, " << kernelName << ", 3, NULL, globalWorkSize, localWorkSize, 0, NULL, NULL)";
         ReplaceStmtWithText(kernelCall, args.str(), HostRewrite);
@@ -447,10 +527,10 @@ private:
                      i != e; ++i) {
                     Expr *arg = *i;
                     if (CXXDefaultArgExpr *defArg = dyn_cast<CXXDefaultArgExpr>(arg)) {
-                        args += PrintPrettyToString(defArg->getExpr());
+                        args += PrintStmtToString(defArg->getExpr());
                     }
                     else {
-                        args += PrintPrettyToString(arg);
+                        args += PrintStmtToString(arg);
                     }
                     if (i + 1 != e)
                         args += ", ";
@@ -547,10 +627,17 @@ private:
                            Rewrite.getRangeSize(SourceRange(startLoc, endLoc)));
     }
 
-    std::string PrintPrettyToString(Stmt *s) {
+    std::string PrintStmtToString(Stmt *s) {
         std::string SStr;
         llvm::raw_string_ostream S(SStr);
         s->printPretty(S, 0, PrintingPolicy(HostRewrite.getLangOpts()));
+        return S.str();
+    }
+
+    std::string PrintDeclToString(Decl *d) {
+        std::string SStr;
+        llvm::raw_string_ostream S(SStr);
+        d->print(S);
         return S.str();
     }
 
@@ -583,14 +670,15 @@ public:
         Preamble += "#else\n";
         Preamble += "#include <CL/opencl.h>\n";
         Preamble += "#endif\n";
+        Preamble += "#include <stdlib.h>\n";
         Preamble += "#include <stdio.h>\n\n";
-        Preamble += "size_t loadProgramSource(char *filename, char **progSrc) {\n" \
+        Preamble += "size_t loadProgramSource(char *filename, const char **progSrc) {\n" \
                     "    FILE *f = fopen(filename, \"r\");\n" \
                     "    fseek(f, 0, SEEK_END);\n" \
                     "    size_t len = (size_t) ftell(f);\n" \
-                    "    *progSrc = (char *) malloc(sizeof(char)*len);\n" \
+                    "    *progSrc = (const char *) malloc(sizeof(char)*len);\n" \
                     "    rewind(f);\n" \
-                    "    fread((void *) progSrc, len, 1, f);\n" \
+                    "    fread((void *) *progSrc, len, 1, f);\n" \
                     "    fclose(f);\n" \
                     "    return len;\n" \
                     "}\n\n";
@@ -606,8 +694,8 @@ public:
 
     virtual void HandleTopLevelDecl(DeclGroupRef DG) {
         //Check where the declaration(s) comes from (may have been included)
-        SourceLocation loc = (DG.isSingleDecl() ? DG.getSingleDecl() :
-                              DG.getDeclGroup()[0])->getLocation();
+        Decl *firstDecl = DG.isSingleDecl() ? DG.getSingleDecl() : DG.getDeclGroup()[0];
+        SourceLocation loc = firstDecl->getLocation();
         if (!SM->isFromMainFile(loc)) {
             if (strstr(SM->getPresumedLoc(loc).getFilename(), ".cu") != NULL) {
                 if (OutFiles.find(SM->getFileID(loc)) == OutFiles.end()) {
@@ -631,6 +719,11 @@ public:
                 return;
             }
         }
+        //Store VarDecl DeclGroupRefs
+        if (firstDecl->getKind() == Decl::Var) {
+            GlobalVarDeclGroups.insert(DG);
+        }
+        //Walk declarations in group and rewrite
         for (DeclGroupRef::iterator i = DG.begin(), e = DG.end(); i != e; ++i) {
             if (FunctionDecl *fd = dyn_cast<FunctionDecl>(*i)) {
                 if (fd->hasAttr<CUDAGlobalAttr>() || fd->hasAttr<CUDADeviceAttr>()) {
@@ -662,7 +755,7 @@ public:
         CompoundStmt *mainBody = dyn_cast<CompoundStmt>(MainDecl->getBody());
         //Insert opencl initialization stuff at top of main
         CLInit += "\n";
-        CLInit += "char *progSrc;\n";
+        CLInit += "const char *progSrc;\n";
         CLInit += "size_t progLen;\n\n";
         CLInit += "clGetPlatformIDs(1, &clPlatform, NULL);\n";
         CLInit += "clGetDeviceIDs(clPlatform, CL_DEVICE_TYPE_GPU, 1, &clDevice, NULL);\n";
@@ -673,8 +766,8 @@ public:
             llvm::StringRef r = (*i).first;
             CLInit += "progLen = loadProgramSource(\"" + r.str() + "-cl.cl\", &progSrc);\n";
             CLInit += "clProgram_" + r.str() + " = clCreateProgramWithSource(clContext, 1, &progSrc, &progLen, NULL);\n";
-            CLInit += "free(progSrc);\n";
-            CLInit += "clBuildProgram(clProgram_" + r.str() + ", 1, &clDevice, NULL, NULL, NULL);\n";
+            CLInit += "free((void *) progSrc);\n";
+            CLInit += "clBuildProgram(clProgram_" + r.str() + ", 1, &clDevice, \"-I .\", NULL, NULL);\n";
         }
         for (StringRefListMap::iterator i = Kernels.begin(),
              e = Kernels.end(); i != e; i++) {
@@ -706,6 +799,31 @@ public:
         CLClean += "clReleaseCommandQueue(clCommandQueue);\n";
         CLClean += "clReleaseContext(clContext);\n";
         HostRewrite.InsertTextBefore(mainBody->getRBracLoc(), CLClean);
+
+        //Rewrite cl_mems in DeclGroups
+        for (std::set<DeclGroupRef>::iterator i = DeviceMemDGs.begin(),
+             e = DeviceMemDGs.end(); i != e; i++) {
+            DeclGroupRef DG = *i;
+            SourceLocation start, end;
+            std::string replace;
+            for (DeclGroupRef::iterator iDG = DG.begin(), eDG = DG.end(); iDG != eDG; ++iDG) {
+                VarDecl *vd = (VarDecl *) (*iDG);
+                if (iDG == DG.begin()) {
+                    start = (*iDG)->getLocStart();
+                }
+                if ((iDG + 1) == DG.end()) {
+                    end = (*iDG)->getLocEnd();
+                }
+                if (DeviceMemVars.find(vd) != DeviceMemVars.end()) {
+                    //Change variable's type to cl_mem
+                    replace += "cl_mem " + vd->getNameAsString() + ";\n";
+                }
+                else {
+                    replace += PrintDeclToString(vd) + ";\n";
+                }
+            }
+            HostRewrite.ReplaceText(start, HostRewrite.getRangeSize(SourceRange(start, end)), replace);
+        }
 
         //Output main file's rewritten buffer
         if (const RewriteBuffer *RewriteBuff =
