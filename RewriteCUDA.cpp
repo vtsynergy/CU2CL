@@ -106,19 +106,18 @@ private:
                 TraverseStmt(*CI, indent);
     }
 
-    //TODO include template?
-    DeclRefExpr *FindDeclRefExpr(Stmt *e) {
-        if (DeclRefExpr *dr = dyn_cast<DeclRefExpr>(e))
-            return dr;
-        DeclRefExpr *ret = NULL;
+    template <class T>
+    T *FindStmt(Stmt *e) {
+        if (T *t = dyn_cast<T>(e))
+            return t;
+        T *ret = NULL;
         for (Stmt::child_iterator CI = e->child_begin(), CE = e->child_end();
              CI != CE; ++CI) {
-            ret = FindDeclRefExpr(*CI);
+            ret = FindStmt<T>(*CI);
             if (ret)
                 return ret;
         }
         return NULL;
-
     }
 
     void RewriteHostFunction(FunctionDecl *hostFunc) {
@@ -169,7 +168,8 @@ private:
         else if (MemberExpr *me = dyn_cast<MemberExpr>(s)) {
             //Check base Expr, if DeclRefExpr and a dim3, then rewrite
             if (DeclRefExpr *dre = dyn_cast<DeclRefExpr>(me->getBase())) {
-                if (dre->getDecl()->getType().getAsString() == "dim3") {
+                std::string type = dre->getDecl()->getType().getAsString();
+                if (type == "dim3") {
                     std::string name = me->getMemberDecl()->getNameAsString();
                     if (name == "x") {
                         name = "[0]";
@@ -183,6 +183,11 @@ private:
                     //TODO find location of arrow or dot and rewrite
                     SourceRange sr = me->getSourceRange();
                     HostRewrite.ReplaceText(sr.getBegin(), HostRewrite.getRangeSize(sr), PrintStmtToString(dre) + name);
+                }
+                else if (type == "cudaDeviceProp") {
+                    //TODO check what the reference is
+                    //then insert declaration of new value in string for given VarDecl
+                    //and before this line, insert a call to clGetDeviceInfo
                 }
             }
         }
@@ -332,15 +337,27 @@ private:
             //Replace with clFinish
             ReplaceStmtWithText(cudaCall, "clFinish(clCommandQueue)", HostRewrite);
         }
+        else if (funcName == "cudaGetDevice") {
+            //Replace by assigning current value of clDevice to arg
+            Expr *device = cudaCall->getArg(0);
+            DeclRefExpr *dr = FindStmt<DeclRefExpr>(device);
+            VarDecl *var = dyn_cast<VarDecl>(dr->getDecl());
+            ReplaceStmtWithText(cudaCall, var->getNameAsString() + " = clDevice", HostRewrite);
+        }
         else if (funcName == "cudaSetDevice") {
-            //TODO implement
-            llvm::errs() << "cudaSetDevice not implemented yet\n";
+            //Replace with clCreateContext and clCreateCommandQueue
+            Expr *device = cudaCall->getArg(0);
+            DeclRefExpr *dr = FindStmt<DeclRefExpr>(device);
+            VarDecl *var = dyn_cast<VarDecl>(dr->getDecl());
+            std::string sub = "clContext = clCreateContext(NULL, 1,&" + var->getNameAsString() + ", NULL, NULL, NULL);\n";
+            sub += "clCommandQueue = clCreateCommandQueue(clContext, " + var->getNameAsString() +", 0, NULL);\n";
+            ReplaceStmtWithText(cudaCall, sub, HostRewrite);
         }
         else if (funcName == "cudaMalloc") {
             //TODO check if the return value is being used somehow?
             Expr *varExpr = cudaCall->getArg(0);
             Expr *size = cudaCall->getArg(1);
-            DeclRefExpr *dr = FindDeclRefExpr(varExpr);
+            DeclRefExpr *dr = FindStmt<DeclRefExpr>(varExpr);
             VarDecl *var = dyn_cast<VarDecl>(dr->getDecl());
             llvm::StringRef varName = var->getName();
             std::string str;
@@ -371,7 +388,7 @@ private:
         }
         else if (funcName == "cudaFree") {
             Expr *devPtr = cudaCall->getArg(0);
-            DeclRefExpr *dr = FindDeclRefExpr(devPtr);
+            DeclRefExpr *dr = FindStmt<DeclRefExpr>(devPtr);
             llvm::StringRef varName = dr->getDecl()->getName();
 
             //Replace with clReleaseMemObject
@@ -384,7 +401,7 @@ private:
             Expr *src = cudaCall->getArg(1);
             Expr *count = cudaCall->getArg(2);
             Expr *kind = cudaCall->getArg(3);
-            DeclRefExpr *dr = FindDeclRefExpr(kind);
+            DeclRefExpr *dr = FindStmt<DeclRefExpr>(kind);
             EnumConstantDecl *enumConst = dyn_cast<EnumConstantDecl>(dr->getDecl());
             std::string enumString = enumConst->getNameAsString();
             //llvm::errs() << enumString << "\n";
@@ -446,9 +463,10 @@ private:
         CallExpr *kernelConfig = kernelCall->getConfig();
         std::string kernelName = "clKernel_" + callee->getNameAsString();
         std::ostringstream args;
+        unsigned int dims = 1;
         for (unsigned i = 0; i < kernelCall->getNumArgs(); i++) {
             Expr *arg = kernelCall->getArg(i);
-            VarDecl *var = dyn_cast<VarDecl>(FindDeclRefExpr(arg)->getDecl());
+            VarDecl *var = dyn_cast<VarDecl>(FindStmt<DeclRefExpr>(arg)->getDecl());
             args << "clSetKernelArg(" << kernelName << ", " << i << ", sizeof(";
             if (DeviceMemVars.find(var) != DeviceMemVars.end()) {
                 //arg var is a cl_mem
@@ -471,11 +489,13 @@ private:
             ValueDecl *value = dre->getDecl();
             std::string type = value->getType().getAsString();
             if (type == "dim3") {
+                dims = 3;
                 for (unsigned int i = 0; i < 3; i++)
                     args << "localWorkSize[" << i << "] = " << value->getNameAsString() << "[" << i << "];\n";
             }
             else {
                 //TODO ??
+                args << "localWorkSize[0] = " << PrintStmtToString(dre) << ";\n";
             }
         }
         else {
@@ -490,11 +510,13 @@ private:
             ValueDecl *value = dre->getDecl();
             std::string type = value->getType().getAsString();
             if (type == "dim3") {
+                dims = 3;
                 for (unsigned int i = 0; i < 3; i++)
                     args << "globalWorkSize[" << i << "] = " << value->getNameAsString() << "[" << i << "]*localWorkSize[" << i << "];\n";
             }
             else {
                 //TODO ??
+                args << "globalWorkSize[0] = (" << PrintStmtToString(dre) << ")*localWorkSize[0];\n";
             }
         }
         else {
@@ -502,7 +524,7 @@ private:
             Expr *arg = cast->getSubExprAsWritten();
             args << "globalWorkSize[0] = (" << PrintStmtToString(arg) << ")*localWorkSize[0];\n";
         }
-        args << "clEnqueueNDRangeKernel(clCommandQueue, " << kernelName << ", 3, NULL, globalWorkSize, localWorkSize, 0, NULL, NULL)";
+        args << "clEnqueueNDRangeKernel(clCommandQueue, " << kernelName << ", " << dims << ", NULL, globalWorkSize, localWorkSize, 0, NULL, NULL)";
         ReplaceStmtWithText(kernelCall, args.str(), HostRewrite);
     }
 
@@ -549,6 +571,9 @@ private:
                                             args);
                 }
             }
+        }
+        else if (type == "cudaDeviceProp") {
+            //TODO add entry in map of cudaDeviceProps from VarDecl to string that replaces it
         }
         //TODO check other CUDA-only types to rewrite
     }
@@ -622,6 +647,44 @@ private:
         else {
             //Find location of semi-colon
             endLoc = func->getSourceRange().getEnd();
+        }
+        Rewrite.RemoveText(startLoc,
+                           Rewrite.getRangeSize(SourceRange(startLoc, endLoc)));
+    }
+
+    void RemoveVar(VarDecl *var, Rewriter &Rewrite) {
+        SourceLocation startLoc, endLoc;
+        //Find startLoc
+        if (var->hasAttrs()) {
+            Attr *attr = (var->getAttrs())[0];
+            std::string attrStr;
+            switch (attr->getKind()) {
+                case attr::CUDAGlobal:
+                    attrStr = "__constant__";
+                    break;
+                case attr::CUDADevice:
+                    attrStr = "__device__";
+                    break;
+                case attr::CUDAHost:
+                    attrStr = "__shared__";
+                    break;
+                default:
+                    break;
+            }
+            startLoc = FindAttr(var->getLocStart(), attrStr);
+        }
+        else {
+            //TODO find first specifier location
+            startLoc = var->getTypeSourceInfo()->getTypeLoc().getBeginLoc();
+        }
+        //Find endLoc
+        if (var->hasInit()) {
+            Expr *init = var->getInit();
+            endLoc = init->getLocEnd();;
+        }
+        else {
+            //Find location of semi-colon
+            endLoc = var->getSourceRange().getEnd();
         }
         Rewrite.RemoveText(startLoc,
                            Rewrite.getRangeSize(SourceRange(startLoc, endLoc)));
@@ -737,6 +800,7 @@ public:
                 }
             }
             else if (VarDecl *vd = dyn_cast<VarDecl>(*i)) {
+                RemoveVar(vd, KernelRewrite);
                 RewriteVarDecl(vd);
             }
         }
