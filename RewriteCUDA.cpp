@@ -87,13 +87,25 @@ private:
 
     FunctionDecl *MainDecl;
 
-    std::string Preamble;
-    //TODO break Preamble up into different portions that are combined
+    //Preamble string to insert at top of main host file
+    std::string HostPreamble;
+    std::string HostIncludes;
+    std::string HostDecls;
+    std::string HostGlobalVars;
+    std::string HostKernels;
+    std::string HostFunctions;
+
+    //Preamble string to insert at top of main kernel file
+    std::string DevPreamble;
+    std::string DevFunctions;
 
     std::string CLInit;
     std::string CLClean;
 
+    //Flags used by the rewriter
     bool IncludingStringH;
+    bool UsesCUDADeviceProp;
+    bool UsesCUDAMemset;
 
     void TraverseStmt(Stmt *e, unsigned int indent) {
         for (unsigned int i = 0; i < indent; i++)
@@ -186,8 +198,7 @@ private:
                 }
                 else if (type == "cudaDeviceProp") {
                     //TODO check what the reference is
-                    //then insert declaration of new value in string for given VarDecl
-                    //and before this line, insert a call to clGetDeviceInfo
+                    //TODO if unsupported, print a warning
                 }
             }
         }
@@ -202,7 +213,7 @@ private:
         llvm::StringRef r = stem(SM->getFileEntryForID(SM->getFileID(kernelFunc->getLocation()))->getName());
         std::list<llvm::StringRef> &l = Kernels[r];
         l.push_back(kernelFunc->getName());
-        Preamble += "cl_kernel clKernel_" + kernelFunc->getName().str() + ";\n";
+        HostKernels += "cl_kernel clKernel_" + kernelFunc->getName().str() + ";\n";
         //Rewrite kernel attributes
         if (kernelFunc->hasAttr<CUDAGlobalAttr>()) {
             SourceLocation loc = FindAttr(kernelFunc->getLocStart(), "__global__");
@@ -297,7 +308,7 @@ private:
         else if (CallExpr *ce = dyn_cast<CallExpr>(ks)) {
             str = PrintStmtToString(ce);
             if (str == "__syncthreads()")
-                ReplaceStmtWithText(ks, "barrier(CLK_LOCAL_MEM_FENCE)", KernelRewrite);
+                ReplaceStmtWithText(ks, "barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE)", KernelRewrite);
         }
         else if (DeclStmt *ds = dyn_cast<DeclStmt>(ks)) {
             DeclGroupRef DG = ds->getDeclGroup();
@@ -409,7 +420,7 @@ private:
                 //standard memcpy
                 //make sure to include <string.h>
                 if (!IncludingStringH) {
-                    Preamble = "#include <string.h>\n\n" + Preamble;
+                    HostIncludes += "#include <string.h>\n";
                     IncludingStringH = true;
                 }
                 replace += "memcpy(";
@@ -445,11 +456,29 @@ private:
             }
         }
         else if (funcName == "cudaMemset") {
+            if (!UsesCUDAMemset) {
+                UsesCUDAMemset = true;
+                HostFunctions += "cl_int clMemset(cl_mem devPtr, int value, size_t count) {\n" \
+                                "\tclSetKernelArg(clKernel_clMemset, 0, sizeof(cl_mem), &devPtr);\n" \
+                                "\tclSetKernelArg(clKernel_clMemset, 1, sizeof(int), &value);\n" \
+                                "\tclSetKernelArg(clKernel_clMemset, 2, sizeof(size_t), &count);\n" \
+                                "\tglobalWorkSize[0] = count;\n" \
+                                "\treturn clEnqueueNDRangeKernel(clCommandQueue, clKernel_clMemset, 1, NULL, globalWorkSize, NULL, 0, NULL, NULL);\n" \
+                                "}\n\n";
+                DevFunctions += "__kernel void clMemset(__global unsigned char *ptr, unsigned char value, size_t num) {\n" \
+                            "\tsize_t id = get_global_id(0);\n" \
+                            "\tif (get_global_id(0) < num) {\n" \
+                            "\t\tptr[id] = value;\n" \
+                            "\t}\n" \
+                            "}\n\n";
+                llvm::StringRef r = stem(SM->getFileEntryForID(MainFileID)->getName());
+                std::list<llvm::StringRef> &l = Kernels[r];
+                l.push_back("clMemset");
+                HostKernels += "cl_kernel clKernel_clMemset;\n";
+            }
             //TODO follow Swan's example of setting via a kernel
-            //TODO add memset kernel to the list of kernels
-            /*Expr *devPtr = cudaCall->getArg(0);
-            Expr *value = cudaCall->getArg(1);
-            Expr *count = cudaCall->getArg(2);*/
+
+            HostRewrite.ReplaceText(cudaCall->getLocStart(), funcName.length(), "clMemset");
         }
         else {
             //TODO Use diagnostics to print pretty errors
@@ -572,8 +601,69 @@ private:
                 }
             }
         }
-        else if (type == "cudaDeviceProp") {
-            //TODO add entry in map of cudaDeviceProps from VarDecl to string that replaces it
+        else if (type == "struct cudaDeviceProp") {
+            if (!UsesCUDADeviceProp) {
+                UsesCUDADeviceProp = true;
+                HostDecls +=
+                    "struct clDeviceProp {\n" \
+                    "\tchar name[256];\n" \
+                    "\tcl_ulong totalGlobalMem;\n" \
+                    "\tcl_ulong sharedMemPerBlock;\n" \
+                    "\tcl_uint regsPerBlock;\n" \
+                    "\tcl_uint warpSize;\n" \
+                    "\tint warpSize; //Unsupported!\n" \
+                    "\tsize_t memPitch; //Unsupported!\n" \
+                    "\tsize_t maxThreadsPerBlock;\n" \
+                    "\tsize_t maxThreadsDim[3];\n" \
+                    "\tint maxGridSize[3]; //Unsupported!\n" \
+                    "\tcl_uint clockRate;\n" \
+                    "\tsize_t totalConstMem; //Unsupported!\n" \
+                    "\tcl_uint major;\n" \
+                    "\tcl_uint minor;\n" \
+                    "\tsize_t textureAlignment; //Unsupported!\n" \
+                    "\tcl_bool deviceOverlap;\n" \
+                    "\tcl_uint multiProcessorCount;\n" \
+                    "\tcl_bool kernelExecTimeoutEnabled;\n" \
+                    "\tcl_bool integrated;\n" \
+                    "\tint canMapHostMemory; //Unsupported!\n" \
+                    "\tint computeMode; //Unsupported!\n" \
+                    "\tint maxTexture1D; //Unsupported!\n" \
+                    "\tint maxTexture2D[2]; //Unsupported!\n" \
+                    "\tint maxTexture3D[3]; //Unsupported!\n" \
+                    "\tint maxTexture2DArray[3]; //Unsupported!\n" \
+                    "\tsize_t surfaceAlignment; //Unsupported!\n" \
+                    "\tint concurrentKernels; //Unsupported!\n" \
+                    "\tcl_bool ECCEnabled;\n" \
+                    "\tint pciBusID; //Unsupported!\n" \
+                    "\tint pciDeviceID; //Unsupported!\n" \
+                    "\tint tccDriver; //Unsupported!\n" \
+                    "\t//int __cudaReserved[21];\n" \
+                    "};\n\n";
+                HostFunctions +=
+                    "cl_int clGetDeviceProperties(struct clDeviceProp *prop, cl_device_id device) {\n" \
+                    "\tcl_int ret = CL_SUCCESS;" \
+                    "\tret |= clGetDeviceInfo(device, CL_DEVICE_NAME, sizeof(prop->name), &prop->name, NULL);\n" \
+                    "\tret |= clGetDeviceInfo(device, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(prop->totalGlobalMem), &prop->totalGlobalMem, NULL);\n" \
+                    "\tret |= clGetDeviceInfo(device, CL_DEVICE_LOCAL_MEM_SIZE, sizeof(prop->sharedMemPerBlock), &prop->sharedMemPerBlock, NULL);\n" \
+                    "\tret |= clGetDeviceInfo(device, CL_DEVICE_REGISTERS_PER_BLOCK_NV, sizeof(prop->regsPerBlock), &prop->regsPerBlock, NULL);\n" \
+                    "\tret |= clGetDeviceInfo(device, CL_DEVICE_WARP_SIZE_NV, sizeof(prop->warpSize), &prop->warpSize, NULL);\n" \
+                    "\tret |= clGetDeviceInfo(device, CL_DEVICE_MAX_WORK_GROUP_SIZE, sizeof(prop->maxThreadsPerBlock), &prop->maxThreadsPerBlock, NULL);\n" \
+                    "\tret |= clGetDeviceInfo(device, CL_DEVICE_MAX_WORK_ITEM_SIZES, sizeof(prop->maxThreadsDim), &prop->maxThreadsDim, NULL);\n" \
+                    "\tret |= clGetDeviceInfo(device, CL_DEVICE_MAX_CLOCK_FREQUENCY, sizeof(prop->clockRate), &prop->clockRate, NULL);\n" \
+                    "\tret |= clGetDeviceInfo(device, CL_DEVICE_COMPUTE_CAPABILITY_MAJOR_NV, sizeof(prop->major), &prop->major, NULL);\n" \
+                    "\tret |= clGetDeviceInfo(device, CL_DEVICE_COMPUTE_CAPABILITY_MINOR_NV, sizeof(prop->minor), &prop->minor, NULL);\n" \
+                    "\tret |= clGetDeviceInfo(device, CL_DEVICE_GPU_OVERLAP_NV, sizeof(prop->deviceOverlap), &prop->deviceOverlap, NULL);\n" \
+                    "\tret |= clGetDeviceInfo(device, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(prop->multiProcessorCount), &prop->multiProcessorCount, NULL);\n" \
+                    "\tret |= clGetDeviceInfo(device, CL_DEVICE_KERNEL_EXEC_TIMEOUT_NV, sizeof(prop->kernelExecTimeoutEnabled), &prop->kernelExecTimeoutEnabled, NULL);\n" \
+                    "\tret |= clGetDeviceInfo(device, CL_DEVICE_INTEGRATED_MEMORY_NV, sizeof(prop->integrated), &prop->integrated, NULL);\n" \
+                    "\tret |= clGetDeviceInfo(device, CL_DEVICE_ERROR_CORRECTION_SUPPORT, sizeof(prop->ECCEnabled), &prop->ECCEnabled, NULL);\n" \
+                    "\treturn ret;\n" \
+                    "}\n\n";
+            }
+            TypeLoc tl = var->getTypeSourceInfo()->getTypeLoc();
+            HostRewrite.ReplaceText(tl.getBeginLoc(),
+                                HostRewrite.getRangeSize(tl.getSourceRange()),
+                                "clDeviceProp");
         }
         //TODO check other CUDA-only types to rewrite
     }
@@ -710,6 +800,14 @@ private:
                                    NewStr);
     }
 
+    void idCharFilter(llvm::StringRef ref) {
+        std::string str = ref.str();
+        size_t size = ref.size();
+        for (size_t i = 0; i < size; i++)
+            if (!isalnum(str[i]) && str[i] != '_')
+                str[i] = '_';
+    }
+
 public:
     RewriteCUDA(CompilerInstance *comp, llvm::raw_ostream *HostOS,
                 llvm::raw_ostream *KernelOS) :
@@ -728,31 +826,33 @@ public:
         KernelRewrite.setSourceMgr(Context.getSourceManager(), Context.getLangOptions());
         MainFileID = Context.getSourceManager().getMainFileID();
 
-        Preamble += "#ifdef __APPLE__\n";
-        Preamble += "#include <OpenCL/opencl.h>\n";
-        Preamble += "#else\n";
-        Preamble += "#include <CL/opencl.h>\n";
-        Preamble += "#endif\n";
-        Preamble += "#include <stdlib.h>\n";
-        Preamble += "#include <stdio.h>\n\n";
-        Preamble += "size_t loadProgramSource(char *filename, const char **progSrc) {\n" \
-                    "    FILE *f = fopen(filename, \"r\");\n" \
-                    "    fseek(f, 0, SEEK_END);\n" \
-                    "    size_t len = (size_t) ftell(f);\n" \
-                    "    *progSrc = (const char *) malloc(sizeof(char)*len);\n" \
-                    "    rewind(f);\n" \
-                    "    fread((void *) *progSrc, len, 1, f);\n" \
-                    "    fclose(f);\n" \
-                    "    return len;\n" \
-                    "}\n\n";
-        Preamble += "cl_platform_id clPlatform;\n";
-        Preamble += "cl_device_id clDevice;\n";
-        Preamble += "cl_context clContext;\n";
-        Preamble += "cl_command_queue clCommandQueue;\n\n";
-        Preamble += "size_t globalWorkSize[3];\n";
-        Preamble += "size_t localWorkSize[3];\n\n";
+        HostIncludes += "#ifdef __APPLE__\n";
+        HostIncludes += "#include <OpenCL/opencl.h>\n";
+        HostIncludes += "#else\n";
+        HostIncludes += "#include <CL/opencl.h>\n";
+        HostIncludes += "#endif\n";
+        HostIncludes += "#include <stdlib.h>\n";
+        HostIncludes += "#include <stdio.h>\n";
+        HostGlobalVars += "cl_platform_id clPlatform;\n";
+        HostGlobalVars += "cl_device_id clDevice;\n";
+        HostGlobalVars += "cl_context clContext;\n";
+        HostGlobalVars += "cl_command_queue clCommandQueue;\n\n";
+        HostGlobalVars += "size_t globalWorkSize[3];\n";
+        HostGlobalVars += "size_t localWorkSize[3];\n";
+        HostFunctions += "size_t loadProgramSource(char *filename, const char **progSrc) {\n" \
+                        "\tFILE *f = fopen(filename, \"r\");\n" \
+                        "\tfseek(f, 0, SEEK_END);\n" \
+                        "\tsize_t len = (size_t) ftell(f);\n" \
+                        "\t*progSrc = (const char *) malloc(sizeof(char)*len);\n" \
+                        "\trewind(f);\n" \
+                        "\tfread((void *) *progSrc, len, 1, f);\n" \
+                        "\tfclose(f);\n" \
+                        "\treturn len;\n" \
+                        "}\n\n";
 
         IncludingStringH = false;
+        UsesCUDADeviceProp = false;
+        UsesCUDAMemset = false;
     }
 
     virtual void HandleTopLevelDecl(DeclGroupRef DG) {
@@ -811,10 +911,15 @@ public:
         for (StringRefListMap::iterator i = Kernels.begin(),
              e = Kernels.end(); i != e; i++) {
             llvm::StringRef r = (*i).first;
-            Preamble += "cl_program clProgram_" + r.str() + ";\n";
+            idCharFilter(r);
+            HostGlobalVars += "cl_program clProgram_" + r.str() + ";\n";
         }
-        //Insert global CL declarations
-        HostRewrite.InsertTextBefore(SM->getLocForStartOfFile(MainFileID), Preamble);
+        //Insert host preamble at top of main file
+        HostPreamble = HostIncludes + "\n" + HostDecls + "\n" + HostGlobalVars + "\n" + HostKernels + "\n" + HostFunctions;
+        HostRewrite.InsertTextBefore(SM->getLocForStartOfFile(MainFileID), HostPreamble);
+        //Insert device preamble at top of main kernel file
+        DevPreamble = DevFunctions;
+        KernelRewrite.InsertTextBefore(SM->getLocForStartOfFile(MainFileID), DevPreamble);
 
         CompoundStmt *mainBody = dyn_cast<CompoundStmt>(MainDecl->getBody());
         //Insert opencl initialization stuff at top of main
@@ -828,6 +933,7 @@ public:
         for (StringRefListMap::iterator i = Kernels.begin(),
              e = Kernels.end(); i != e; i++) {
             llvm::StringRef r = (*i).first;
+            idCharFilter(r);
             CLInit += "progLen = loadProgramSource(\"" + r.str() + "-cl.cl\", &progSrc);\n";
             CLInit += "clProgram_" + r.str() + " = clCreateProgramWithSource(clContext, 1, &progSrc, &progLen, NULL);\n";
             CLInit += "free((void *) progSrc);\n";
@@ -838,8 +944,10 @@ public:
             std::list<llvm::StringRef> &l = (*i).second;
             for (std::list<llvm::StringRef>::iterator li = l.begin(), le = l.end();
                  li != le; li++) {
+                llvm::StringRef r = (*i).first;
+                idCharFilter(r);
                 std::string kernelName = (*li).str();
-                CLInit += "clKernel_" + kernelName + " = clCreateKernel(clProgram_" + (*i).first.str() + ", \"" + kernelName + "\", NULL);\n";
+                CLInit += "clKernel_" + kernelName + " = clCreateKernel(clProgram_" + r.str() + ", \"" + kernelName + "\", NULL);\n";
             }
         }
         HostRewrite.InsertTextAfter(PP->getLocForEndOfToken(mainBody->getLBracLoc()), CLInit);
@@ -858,6 +966,7 @@ public:
         for (StringRefListMap::iterator i = Kernels.begin(),
              e = Kernels.end(); i != e; i++) {
             llvm::StringRef r = (*i).first;
+            idCharFilter(r);
             CLClean += "clReleaseProgram(clProgram_" + r.str() + ");\n";
         }
         CLClean += "clReleaseCommandQueue(clCommandQueue);\n";
