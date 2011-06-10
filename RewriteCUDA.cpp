@@ -26,6 +26,75 @@
 #include <sstream>
 #include <string>
 
+#define CL_MEMSET \
+    "cl_int clMemset(cl_mem devPtr, int value, size_t count) {\n" \
+    "    clSetKernelArg(clKernel_clMemset, 0, sizeof(cl_mem), &devPtr);\n" \
+    "    clSetKernelArg(clKernel_clMemset, 1, sizeof(int), &value);\n" \
+    "    clSetKernelArg(clKernel_clMemset, 2, sizeof(size_t), &count);\n" \
+    "    globalWorkSize[0] = count;\n" \
+    "    return clEnqueueNDRangeKernel(clCommandQueue, clKernel_clMemset, 1, NULL, globalWorkSize, NULL, 0, NULL, NULL);\n" \
+    "}\n\n"
+
+#define CL_DEVICE_PROP \
+    "struct clDeviceProp {\n" \
+    "    char name[256];\n" \
+    "    cl_ulong totalGlobalMem;\n" \
+    "    cl_ulong sharedMemPerBlock;\n" \
+    "    cl_uint regsPerBlock;\n" \
+    "    cl_uint warpSize;\n" \
+    "    size_t memPitch; //Unsupported!\n" \
+    "    size_t maxThreadsPerBlock;\n" \
+    "    size_t maxThreadsDim[3];\n" \
+    "    int maxGridSize[3]; //Unsupported!\n" \
+    "    cl_uint clockRate;\n" \
+    "    size_t totalConstMem; //Unsupported!\n" \
+    "    cl_uint major;\n" \
+    "    cl_uint minor;\n" \
+    "    size_t textureAlignment; //Unsupported!\n" \
+    "    cl_bool deviceOverlap;\n" \
+    "    cl_uint multiProcessorCount;\n" \
+    "    cl_bool kernelExecTimeoutEnabled;\n" \
+    "    cl_bool integrated;\n" \
+    "    int canMapHostMemory; //Unsupported!\n" \
+    "    int computeMode; //Unsupported!\n" \
+    "    int maxTexture1D; //Unsupported!\n" \
+    "    int maxTexture2D[2]; //Unsupported!\n" \
+    "    int maxTexture3D[3]; //Unsupported!\n" \
+    "    int maxTexture2DArray[3]; //Unsupported!\n" \
+    "    size_t surfaceAlignment; //Unsupported!\n" \
+    "    int concurrentKernels; //Unsupported!\n" \
+    "    cl_bool ECCEnabled;\n" \
+    "    int pciBusID; //Unsupported!\n" \
+    "    int pciDeviceID; //Unsupported!\n" \
+    "    int tccDriver; //Unsupported!\n" \
+    "    //int __cudaReserved[21];\n" \
+    "};\n\n"
+
+#define CL_GET_DEVICE_INFO(TYPE, NAME) \
+    "    ret |= clGetDeviceInfo(device, CL_DEVICE_" #TYPE ", sizeof(prop->" \
+    #NAME "), &prop->" #NAME ", NULL);\n"
+
+#define CL_GET_DEVICE_PROPS \
+    "cl_int clGetDeviceProperties(struct clDeviceProp *prop, cl_device_id device) {\n" \
+    "    cl_int ret = CL_SUCCESS;\n" \
+    CL_GET_DEVICE_INFO(NAME, name) \
+    CL_GET_DEVICE_INFO(GLOBAL_MEM_SIZE, totalGlobalMem) \
+    CL_GET_DEVICE_INFO(LOCAL_MEM_SIZE, sharedMemPerBlock) \
+    CL_GET_DEVICE_INFO(REGISTERS_PER_BLOCK_NV, regsPerBlock) \
+    CL_GET_DEVICE_INFO(WARP_SIZE_NV, warpSize) \
+    CL_GET_DEVICE_INFO(MAX_WORK_GROUP_SIZE, maxThreadsPerBlock) \
+    CL_GET_DEVICE_INFO(MAX_WORK_ITEM_SIZES, maxThreadsDim) \
+    CL_GET_DEVICE_INFO(MAX_CLOCK_FREQUENCY, clockRate) \
+    CL_GET_DEVICE_INFO(COMPUTE_CAPABILITY_MAJOR_NV, major) \
+    CL_GET_DEVICE_INFO(COMPUTE_CAPABILITY_MINOR_NV, minor) \
+    CL_GET_DEVICE_INFO(GPU_OVERLAP_NV, deviceOverlap) \
+    CL_GET_DEVICE_INFO(MAX_COMPUTE_UNITS, multiProcessorCount) \
+    CL_GET_DEVICE_INFO(KERNEL_EXEC_TIMEOUT_NV, kernelExecTimeoutEnabled) \
+    CL_GET_DEVICE_INFO(INTEGRATED_MEMORY_NV, integrated) \
+    CL_GET_DEVICE_INFO(ERROR_CORRECTION_SUPPORT, ECCEnabled) \
+    "    return ret;\n" \
+    "}\n\n"
+
 using namespace clang;
 using namespace llvm::sys::path;
 
@@ -205,6 +274,9 @@ private:
         }
     }
 
+    std::string RewriteHostExpr(Expr *e) {
+    }
+
     void RewriteKernelFunction(FunctionDecl *kernelFunc) {
         //llvm::errs() << "Rewriting CUDA kernel\n";
         bool hasHost = kernelFunc->hasAttr<CUDAHostAttr>();
@@ -338,11 +410,16 @@ private:
         }
     }
 
+    std::string RewriteKernelExpr(Expr *e) {
+    }
+
     void RewriteCUDACall(CallExpr *cudaCall) {
         //TODO all CUDA calls return a cudaError_t, so need to find a way to keep that working
         //TODO check if the return value is being used somehow?
         //llvm::errs() << "Rewriting CUDA API call\n";
         std::string funcName = cudaCall->getDirectCallee()->getNameAsString();
+
+        //Thread Management
         if (funcName == "cudaThreadExit") {
             //Replace with clReleaseContext
             ReplaceStmtWithText(cudaCall, "clReleaseContext(clContext)", HostRewrite);
@@ -351,6 +428,8 @@ private:
             //Replace with clFinish
             ReplaceStmtWithText(cudaCall, "clFinish(clCommandQueue)", HostRewrite);
         }
+
+        //Device Management
         else if (funcName == "cudaGetDevice") {
             //Replace by assigning current value of clDevice to arg
             Expr *device = cudaCall->getArg(0);
@@ -364,12 +443,17 @@ private:
                                     "cl_device_id");
             ReplaceStmtWithText(cudaCall, var->getNameAsString() + " = clDevice", HostRewrite);
         }
+        else if (funcName == "cudaGetDeviceCount") {
+            //Replace with clGetDeviceIDs
+            Expr *count = cudaCall->getArg(0);
+            ReplaceStmtWithText(cudaCall, "clGetDeviceIDs(clPlatform, CL_DEVICE_TYPE_GPU, 0, NULL, " + PrintStmtToString(count) + ")", HostRewrite);
+        }
         else if (funcName == "cudaSetDevice") {
             //Replace with clCreateContext and clCreateCommandQueue
             Expr *device = cudaCall->getArg(0);
             DeclRefExpr *dr = FindStmt<DeclRefExpr>(device);
             VarDecl *var = dyn_cast<VarDecl>(dr->getDecl());
-            std::string sub = "clContext = clCreateContext(NULL, 1,&" + var->getNameAsString() + ", NULL, NULL, NULL);\n";
+            std::string sub = "clContext = clCreateContext(NULL, 1, &" + var->getNameAsString() + ", NULL, NULL, NULL);\n";
             sub += "clCommandQueue = clCreateCommandQueue(clContext, " + var->getNameAsString() +", 0, NULL);\n";
             ReplaceStmtWithText(cudaCall, sub, HostRewrite);
         }
@@ -377,6 +461,37 @@ private:
             //Replace with clGetDeviceProperties
             HostRewrite.ReplaceText(cudaCall->getLocStart(), funcName.length(), "clGetDeviceProperties");
         }
+
+        //Stream Management
+        else if (funcName == "cudaStreamCreate") {
+            //Replace with clCreateCommandQueue
+            Expr *pStream = cudaCall->getArg(0);
+            DeclRefExpr *dr = FindStmt<DeclRefExpr>(pStream);
+            VarDecl *var = dyn_cast<VarDecl>(dr->getDecl());
+            std::string sub = var->getNameAsString() + " = clCreateCommandQueue(clContext, clDevice, 0, NULL)";
+
+            ReplaceStmtWithText(cudaCall, sub, HostRewrite);
+        }
+        else if (funcName == "cudaStreamDestroy") {
+            //Replace with clReleaseCommandQueue
+            Expr *stream = cudaCall->getArg(0);
+            DeclRefExpr *dr = FindStmt<DeclRefExpr>(stream);
+            VarDecl *var = dyn_cast<VarDecl>(dr->getDecl());
+            std::string sub = "clReleaseCommandQueue(" + var->getNameAsString() + ")";
+
+            ReplaceStmtWithText(cudaCall, sub, HostRewrite);
+        }
+        else if (funcName == "cudaStreamSynchronize") {
+            //Replace with clFinish
+            Expr *stream = cudaCall->getArg(0);
+            DeclRefExpr *dr = FindStmt<DeclRefExpr>(stream);
+            VarDecl *var = dyn_cast<VarDecl>(dr->getDecl());
+            std::string sub = "clFinish(" + var->getNameAsString() + ")";
+
+            ReplaceStmtWithText(cudaCall, sub, HostRewrite);
+        }
+
+        //Memory Management
         else if (funcName == "cudaMalloc") {
             Expr *varExpr = cudaCall->getArg(0);
             Expr *size = cudaCall->getArg(1);
@@ -469,13 +584,7 @@ private:
         }
         else if (funcName == "cudaMemset") {
             if (!UsesCUDAMemset) {
-                HostFunctions += "cl_int clMemset(cl_mem devPtr, int value, size_t count) {\n" \
-                                "\tclSetKernelArg(clKernel_clMemset, 0, sizeof(cl_mem), &devPtr);\n" \
-                                "\tclSetKernelArg(clKernel_clMemset, 1, sizeof(int), &value);\n" \
-                                "\tclSetKernelArg(clKernel_clMemset, 2, sizeof(size_t), &count);\n" \
-                                "\tglobalWorkSize[0] = count;\n" \
-                                "\treturn clEnqueueNDRangeKernel(clCommandQueue, clKernel_clMemset, 1, NULL, globalWorkSize, NULL, 0, NULL, NULL);\n" \
-                                "}\n\n";
+                HostFunctions += CL_MEMSET;
                 DevFunctions += "__kernel void clMemset(__global unsigned char *ptr, unsigned char value, size_t num) {\n" \
                             "\tsize_t id = get_global_id(0);\n" \
                             "\tif (get_global_id(0) < num) {\n" \
@@ -589,6 +698,7 @@ private:
                 for (CXXConstructExpr::arg_iterator i = ce->arg_begin(), e = ce->arg_end();
                      i != e; ++i) {
                     Expr *arg = *i;
+                    //TODO replace these prints with Rewrite{Host,Kernel}Expr
                     if (CXXDefaultArgExpr *defArg = dyn_cast<CXXDefaultArgExpr>(arg)) {
                         args += PrintStmtToString(defArg->getExpr());
                     }
@@ -615,66 +725,20 @@ private:
         }
         else if (type == "struct cudaDeviceProp") {
             if (!UsesCUDADeviceProp) {
-                HostDecls +=
-                    "struct clDeviceProp {\n" \
-                    "\tchar name[256];\n" \
-                    "\tcl_ulong totalGlobalMem;\n" \
-                    "\tcl_ulong sharedMemPerBlock;\n" \
-                    "\tcl_uint regsPerBlock;\n" \
-                    "\tcl_uint warpSize;\n" \
-                    "\tsize_t memPitch; //Unsupported!\n" \
-                    "\tsize_t maxThreadsPerBlock;\n" \
-                    "\tsize_t maxThreadsDim[3];\n" \
-                    "\tint maxGridSize[3]; //Unsupported!\n" \
-                    "\tcl_uint clockRate;\n" \
-                    "\tsize_t totalConstMem; //Unsupported!\n" \
-                    "\tcl_uint major;\n" \
-                    "\tcl_uint minor;\n" \
-                    "\tsize_t textureAlignment; //Unsupported!\n" \
-                    "\tcl_bool deviceOverlap;\n" \
-                    "\tcl_uint multiProcessorCount;\n" \
-                    "\tcl_bool kernelExecTimeoutEnabled;\n" \
-                    "\tcl_bool integrated;\n" \
-                    "\tint canMapHostMemory; //Unsupported!\n" \
-                    "\tint computeMode; //Unsupported!\n" \
-                    "\tint maxTexture1D; //Unsupported!\n" \
-                    "\tint maxTexture2D[2]; //Unsupported!\n" \
-                    "\tint maxTexture3D[3]; //Unsupported!\n" \
-                    "\tint maxTexture2DArray[3]; //Unsupported!\n" \
-                    "\tsize_t surfaceAlignment; //Unsupported!\n" \
-                    "\tint concurrentKernels; //Unsupported!\n" \
-                    "\tcl_bool ECCEnabled;\n" \
-                    "\tint pciBusID; //Unsupported!\n" \
-                    "\tint pciDeviceID; //Unsupported!\n" \
-                    "\tint tccDriver; //Unsupported!\n" \
-                    "\t//int __cudaReserved[21];\n" \
-                    "};\n\n";
-                HostFunctions +=
-                    "cl_int clGetDeviceProperties(struct clDeviceProp *prop, cl_device_id device) {\n" \
-                    "\tcl_int ret = CL_SUCCESS\n;" \
-                    "\tret |= clGetDeviceInfo(device, CL_DEVICE_NAME, sizeof(prop->name), &prop->name, NULL);\n" \
-                    "\tret |= clGetDeviceInfo(device, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(prop->totalGlobalMem), &prop->totalGlobalMem, NULL);\n" \
-                    "\tret |= clGetDeviceInfo(device, CL_DEVICE_LOCAL_MEM_SIZE, sizeof(prop->sharedMemPerBlock), &prop->sharedMemPerBlock, NULL);\n" \
-                    "\tret |= clGetDeviceInfo(device, CL_DEVICE_REGISTERS_PER_BLOCK_NV, sizeof(prop->regsPerBlock), &prop->regsPerBlock, NULL);\n" \
-                    "\tret |= clGetDeviceInfo(device, CL_DEVICE_WARP_SIZE_NV, sizeof(prop->warpSize), &prop->warpSize, NULL);\n" \
-                    "\tret |= clGetDeviceInfo(device, CL_DEVICE_MAX_WORK_GROUP_SIZE, sizeof(prop->maxThreadsPerBlock), &prop->maxThreadsPerBlock, NULL);\n" \
-                    "\tret |= clGetDeviceInfo(device, CL_DEVICE_MAX_WORK_ITEM_SIZES, sizeof(prop->maxThreadsDim), &prop->maxThreadsDim, NULL);\n" \
-                    "\tret |= clGetDeviceInfo(device, CL_DEVICE_MAX_CLOCK_FREQUENCY, sizeof(prop->clockRate), &prop->clockRate, NULL);\n" \
-                    "\tret |= clGetDeviceInfo(device, CL_DEVICE_COMPUTE_CAPABILITY_MAJOR_NV, sizeof(prop->major), &prop->major, NULL);\n" \
-                    "\tret |= clGetDeviceInfo(device, CL_DEVICE_COMPUTE_CAPABILITY_MINOR_NV, sizeof(prop->minor), &prop->minor, NULL);\n" \
-                    "\tret |= clGetDeviceInfo(device, CL_DEVICE_GPU_OVERLAP_NV, sizeof(prop->deviceOverlap), &prop->deviceOverlap, NULL);\n" \
-                    "\tret |= clGetDeviceInfo(device, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(prop->multiProcessorCount), &prop->multiProcessorCount, NULL);\n" \
-                    "\tret |= clGetDeviceInfo(device, CL_DEVICE_KERNEL_EXEC_TIMEOUT_NV, sizeof(prop->kernelExecTimeoutEnabled), &prop->kernelExecTimeoutEnabled, NULL);\n" \
-                    "\tret |= clGetDeviceInfo(device, CL_DEVICE_INTEGRATED_MEMORY_NV, sizeof(prop->integrated), &prop->integrated, NULL);\n" \
-                    "\tret |= clGetDeviceInfo(device, CL_DEVICE_ERROR_CORRECTION_SUPPORT, sizeof(prop->ECCEnabled), &prop->ECCEnabled, NULL);\n" \
-                    "\treturn ret;\n" \
-                    "}\n\n";
+                HostDecls += CL_DEVICE_PROP;
+                HostFunctions += CL_GET_DEVICE_PROPS;
                 UsesCUDADeviceProp = true;
             }
             TypeLoc tl = var->getTypeSourceInfo()->getTypeLoc();
             HostRewrite.ReplaceText(tl.getBeginLoc(),
                                     HostRewrite.getRangeSize(tl.getSourceRange()),
                                     "clDeviceProp");
+        }
+        else if (type == "cudaStream_t") {
+            TypeLoc tl = var->getTypeSourceInfo()->getTypeLoc();
+            HostRewrite.ReplaceText(tl.getBeginLoc(),
+                                    HostRewrite.getRangeSize(tl.getSourceRange()),
+                                    "cl_command_queue");
         }
         //TODO check other CUDA-only types to rewrite
     }
