@@ -26,17 +26,8 @@
 #include <sstream>
 #include <string>
 
-#define CL_MEMSET \
-    "cl_int clMemset(cl_mem devPtr, int value, size_t count) {\n" \
-    "    clSetKernelArg(clKernel_clMemset, 0, sizeof(cl_mem), &devPtr);\n" \
-    "    clSetKernelArg(clKernel_clMemset, 1, sizeof(int), &value);\n" \
-    "    clSetKernelArg(clKernel_clMemset, 2, sizeof(size_t), &count);\n" \
-    "    globalWorkSize[0] = count;\n" \
-    "    return clEnqueueNDRangeKernel(clCommandQueue, clKernel_clMemset, 1, NULL, globalWorkSize, NULL, 0, NULL, NULL);\n" \
-    "}\n\n"
-
 #define CL_DEVICE_PROP \
-    "struct clDeviceProp {\n" \
+    "struct __cu2cl_DeviceProp {\n" \
     "    char name[256];\n" \
     "    cl_ulong totalGlobalMem;\n" \
     "    cl_ulong sharedMemPerBlock;\n" \
@@ -70,12 +61,41 @@
     "    //int __cudaReserved[21];\n" \
     "};\n\n"
 
+#define LOAD_PROGRAM_SOURCE \
+    "size_t __cu2cl_loadProgramSource(char *filename, const char **progSrc) {\n" \
+    "\tFILE *f = fopen(filename, \"r\");\n" \
+    "\tfseek(f, 0, SEEK_END);\n" \
+    "\tsize_t len = (size_t) ftell(f);\n" \
+    "\t*progSrc = (const char *) malloc(sizeof(char)*len);\n" \
+    "\trewind(f);\n" \
+    "\tfread((void *) *progSrc, len, 1, f);\n" \
+    "\tfclose(f);\n" \
+    "\treturn len;\n" \
+    "}\n\n"
+
+#define CL_MEMSET \
+    "cl_int __cu2cl_Memset(cl_mem devPtr, int value, size_t count) {\n" \
+    "    clSetKernelArg(__cu2cl_Kernel___cu2cl_Memset, 0, sizeof(cl_mem), &devPtr);\n" \
+    "    clSetKernelArg(__cu2cl_Kernel___cu2cl_Memset, 1, sizeof(cl_uchar), &value);\n" \
+    "    clSetKernelArg(__cu2cl_Kernel___cu2cl_Memset, 2, sizeof(cl_uint), &count);\n" \
+    "    globalWorkSize[0] = count;\n" \
+    "    return clEnqueueNDRangeKernel(__cu2cl_CommandQueue, __cu2cl_Kernel___cu2cl_Memset, 1, NULL, globalWorkSize, NULL, 0, NULL, NULL);\n" \
+    "}\n\n"
+
+#define CL_MEMSET_KERNEL \
+    "__kernel void __cu2cl_Memset(__global uchar *ptr, uchar value, uint num) {\n" \
+    "    size_t id = get_global_id(0);\n" \
+    "    if (get_global_id(0) < num) {\n" \
+    "        ptr[id] = value;\n" \
+    "    }\n" \
+    "}\n\n"
+
 #define CL_GET_DEVICE_INFO(TYPE, NAME) \
     "    ret |= clGetDeviceInfo(device, CL_DEVICE_" #TYPE ", sizeof(prop->" \
     #NAME "), &prop->" #NAME ", NULL);\n"
 
 #define CL_GET_DEVICE_PROPS \
-    "cl_int clGetDeviceProperties(struct clDeviceProp *prop, cl_device_id device) {\n" \
+    "cl_int __cu2cl_GetDeviceProperties(struct __cu2cl_DeviceProp *prop, cl_device_id device) {\n" \
     "    cl_int ret = CL_SUCCESS;\n" \
     CL_GET_DEVICE_INFO(NAME, name) \
     CL_GET_DEVICE_INFO(GLOBAL_MEM_SIZE, totalGlobalMem) \
@@ -93,6 +113,14 @@
     CL_GET_DEVICE_INFO(INTEGRATED_MEMORY_NV, integrated) \
     CL_GET_DEVICE_INFO(ERROR_CORRECTION_SUPPORT, ECCEnabled) \
     "    return ret;\n" \
+    "}\n\n"
+
+#define CL_COMMAND_QUEUE_QUERY \
+    "cl_int __cu2cl_CommandQueueQuery(cl_command_queue commands) {\n" \
+    "   cl_int ret;\n" \
+    "   cl_event event;\n" \
+    "   clEnqueueMarker(commands, &event);\n" \
+    "   clGetEventInfo(commands, &event);\n" \
     "}\n\n"
 
 using namespace clang;
@@ -127,7 +155,7 @@ public:
 /**
  * An AST consumer made to rewrite CUDA to OpenCL.
  **/
-class RewriteCUDA : public ASTConsumer, public PPCallbacks {
+class RewriteCUDA : public ASTConsumer {
 private:
     typedef std::map<FileID, llvm::raw_ostream *> IDOutFileMap;
     typedef std::map<llvm::StringRef, std::list<llvm::StringRef> > StringRefListMap;
@@ -176,6 +204,7 @@ private:
     bool IncludingStringH;
     bool UsesCUDADeviceProp;
     bool UsesCUDAMemset;
+    bool UsesCUDAStreamQuery;
 
     void TraverseStmt(Stmt *e, unsigned int indent) {
         for (unsigned int i = 0; i < indent; i++)
@@ -286,7 +315,7 @@ private:
         llvm::StringRef r = stem(SM->getFileEntryForID(SM->getFileID(kernelFunc->getLocation()))->getName());
         std::list<llvm::StringRef> &l = Kernels[r];
         l.push_back(kernelFunc->getName());
-        HostKernels += "cl_kernel clKernel_" + kernelFunc->getName().str() + ";\n";
+        HostKernels += "cl_kernel __cu2cl_Kernel_" + kernelFunc->getName().str() + ";\n";
         //Rewrite kernel attributes
         if (kernelFunc->hasAttr<CUDAGlobalAttr>()) {
             SourceLocation loc = FindAttr(kernelFunc->getLocStart(), "__global__");
@@ -422,11 +451,11 @@ private:
         //Thread Management
         if (funcName == "cudaThreadExit") {
             //Replace with clReleaseContext
-            ReplaceStmtWithText(cudaCall, "clReleaseContext(clContext)", HostRewrite);
+            ReplaceStmtWithText(cudaCall, "clReleaseContext(__cu2cl_Context)", HostRewrite);
         }
         else if (funcName == "cudaThreadSynchronize") {
             //Replace with clFinish
-            ReplaceStmtWithText(cudaCall, "clFinish(clCommandQueue)", HostRewrite);
+            ReplaceStmtWithText(cudaCall, "clFinish(__cu2cl_CommandQueue)", HostRewrite);
         }
 
         //Device Management
@@ -441,25 +470,25 @@ private:
             HostRewrite.ReplaceText(tl.getBeginLoc(),
                                     HostRewrite.getRangeSize(tl.getSourceRange()),
                                     "cl_device_id");
-            ReplaceStmtWithText(cudaCall, var->getNameAsString() + " = clDevice", HostRewrite);
+            ReplaceStmtWithText(cudaCall, var->getNameAsString() + " = __cu2cl_Device", HostRewrite);
         }
         else if (funcName == "cudaGetDeviceCount") {
             //Replace with clGetDeviceIDs
             Expr *count = cudaCall->getArg(0);
-            ReplaceStmtWithText(cudaCall, "clGetDeviceIDs(clPlatform, CL_DEVICE_TYPE_GPU, 0, NULL, " + PrintStmtToString(count) + ")", HostRewrite);
+            ReplaceStmtWithText(cudaCall, "clGetDeviceIDs(__cu2cl_Platform, CL_DEVICE_TYPE_GPU, 0, NULL, " + PrintStmtToString(count) + ")", HostRewrite);
         }
         else if (funcName == "cudaSetDevice") {
             //Replace with clCreateContext and clCreateCommandQueue
             Expr *device = cudaCall->getArg(0);
             DeclRefExpr *dr = FindStmt<DeclRefExpr>(device);
             VarDecl *var = dyn_cast<VarDecl>(dr->getDecl());
-            std::string sub = "clContext = clCreateContext(NULL, 1, &" + var->getNameAsString() + ", NULL, NULL, NULL);\n";
-            sub += "clCommandQueue = clCreateCommandQueue(clContext, " + var->getNameAsString() +", 0, NULL);\n";
+            std::string sub = "__cu2cl_Context = clCreateContext(NULL, 1, &" + var->getNameAsString() + ", NULL, NULL, NULL);\n";
+            sub += "__cu2cl_CommandQueue = clCreateCommandQueue(__cu2cl_Context, " + var->getNameAsString() +", 0, NULL);\n";
             ReplaceStmtWithText(cudaCall, sub, HostRewrite);
         }
         else if (funcName == "cudaGetDeviceProperties") {
-            //Replace with clGetDeviceProperties
-            HostRewrite.ReplaceText(cudaCall->getLocStart(), funcName.length(), "clGetDeviceProperties");
+            //Replace with __cu2cl_GetDeviceProperties
+            HostRewrite.ReplaceText(cudaCall->getLocStart(), funcName.length(), "__cu2cl_GetDeviceProperties");
         }
 
         //Stream Management
@@ -468,25 +497,41 @@ private:
             Expr *pStream = cudaCall->getArg(0);
             DeclRefExpr *dr = FindStmt<DeclRefExpr>(pStream);
             VarDecl *var = dyn_cast<VarDecl>(dr->getDecl());
-            std::string sub = var->getNameAsString() + " = clCreateCommandQueue(clContext, clDevice, 0, NULL)";
+            std::string sub = var->getNameAsString() + " = clCreateCommandQueue(__cu2cl_Context, __cu2cl_Device, 0, NULL)";
 
             ReplaceStmtWithText(cudaCall, sub, HostRewrite);
         }
         else if (funcName == "cudaStreamDestroy") {
             //Replace with clReleaseCommandQueue
             Expr *stream = cudaCall->getArg(0);
-            DeclRefExpr *dr = FindStmt<DeclRefExpr>(stream);
-            VarDecl *var = dyn_cast<VarDecl>(dr->getDecl());
-            std::string sub = "clReleaseCommandQueue(" + var->getNameAsString() + ")";
+            std::string sub = "clReleaseCommandQueue(" + PrintStmtToString(stream) + ")";
+
+            ReplaceStmtWithText(cudaCall, sub, HostRewrite);
+        }
+        else if (funcName == "cudaStreamQuery") {
+            //Replace with __cu2cl_CommandQueueQuery
+            if (!UsesCUDAStreamQuery) {
+                HostFunctions += CL_COMMAND_QUEUE_QUERY;
+                UsesCUDAStreamQuery = true;
+            }
+
+            Expr *stream = cudaCall->getArg(0);
+            std::string sub = "__cu2cl_CommandQueueQuery(" + PrintStmtToString(stream) + ")";
 
             ReplaceStmtWithText(cudaCall, sub, HostRewrite);
         }
         else if (funcName == "cudaStreamSynchronize") {
             //Replace with clFinish
             Expr *stream = cudaCall->getArg(0);
-            DeclRefExpr *dr = FindStmt<DeclRefExpr>(stream);
-            VarDecl *var = dyn_cast<VarDecl>(dr->getDecl());
-            std::string sub = "clFinish(" + var->getNameAsString() + ")";
+            std::string sub = "clFinish(" + PrintStmtToString(stream) + ")";
+
+            ReplaceStmtWithText(cudaCall, sub, HostRewrite);
+        }
+        else if (funcName == "cudaStreamWaitEvent") {
+            //Replace with clEnqueueWaitForEvents
+            Expr *stream = cudaCall->getArg(0);
+            Expr *event = cudaCall->getArg(1);
+            std::string sub = "clEnqueueWaitForEvents(" + PrintStmtToString(stream) + ", 1, &" + PrintStmtToString(event) + ")";
 
             ReplaceStmtWithText(cudaCall, sub, HostRewrite);
         }
@@ -502,7 +547,7 @@ private:
             str = PrintStmtToString(size);
 
             //Replace with clCreateBuffer
-            std::string sub = varName.str() + " = clCreateBuffer(clContext, CL_MEM_READ_WRITE, " + str + ", NULL, NULL)";
+            std::string sub = varName.str() + " = clCreateBuffer(__cu2cl_Context, CL_MEM_READ_WRITE, " + str + ", NULL, NULL)";
             ReplaceStmtWithText(cudaCall, sub, HostRewrite);
 
             DeclGroupRef varDG(var);
@@ -532,6 +577,9 @@ private:
             //Replace with clReleaseMemObject
             ReplaceStmtWithText(cudaCall, "clReleaseMemObject(" + varName.str() + ")", HostRewrite);
         }
+        else if (funcName == "cudaMallocHost") {
+            //TODO implement
+        }
         else if (funcName == "cudaMemcpy") {
             std::string replace;
 
@@ -558,7 +606,7 @@ private:
             }
             else if (enumString == "cudaMemcpyHostToDevice") {
                 //clEnqueueWriteBuffer
-                replace += "clEnqueueWriteBuffer(clCommandQueue, ";
+                replace += "clEnqueueWriteBuffer(__cu2cl_CommandQueue, ";
                 replace += PrintStmtToString(dst) + ", CL_TRUE, 0, ";
                 replace += PrintStmtToString(count) + ", ";
                 replace += PrintStmtToString(src) + ", 0, NULL, NULL)";
@@ -566,7 +614,7 @@ private:
             }
             else if (enumString == "cudaMemcpyDeviceToHost") {
                 //clEnqueueReadBuffer
-                replace += "clEnqueueReadBuffer(clCommandQueue, ";
+                replace += "clEnqueueReadBuffer(__cu2cl_CommandQueue, ";
                 replace += PrintStmtToString(src) + ", CL_TRUE, 0, ";
                 replace += PrintStmtToString(count) + ", ";
                 replace += PrintStmtToString(dst) + ", 0, NULL, NULL)";
@@ -574,8 +622,8 @@ private:
             }
             else if (enumString == "cudaMemcpyDeviceToDevice") {
                 //TODO clEnqueueReadBuffer; clEnqueueWriteBuffer
-                ReplaceStmtWithText(cudaCall, "clEnqueueReadBuffer(clCommandQueue, src, CL_TRUE, 0, count, temp, 0, NULL, NULL)", HostRewrite);
-                ReplaceStmtWithText(cudaCall, "clEnqueueWriteBuffer(clCommandQueue, dst, CL_TRUE, 0, count, temp, 0, NULL, NULL)", HostRewrite);
+                ReplaceStmtWithText(cudaCall, "clEnqueueReadBuffer(__cu2cl_CommandQueue, src, CL_TRUE, 0, count, temp, 0, NULL, NULL)", HostRewrite);
+                ReplaceStmtWithText(cudaCall, "clEnqueueWriteBuffer(__cu2cl_CommandQueue, dst, CL_TRUE, 0, count, temp, 0, NULL, NULL)", HostRewrite);
             }
             else {
                 //TODO Use diagnostics to print pretty errors
@@ -585,21 +633,16 @@ private:
         else if (funcName == "cudaMemset") {
             if (!UsesCUDAMemset) {
                 HostFunctions += CL_MEMSET;
-                DevFunctions += "__kernel void clMemset(__global unsigned char *ptr, unsigned char value, size_t num) {\n" \
-                            "\tsize_t id = get_global_id(0);\n" \
-                            "\tif (get_global_id(0) < num) {\n" \
-                            "\t\tptr[id] = value;\n" \
-                            "\t}\n" \
-                            "}\n\n";
+                DevFunctions += CL_MEMSET_KERNEL;
                 llvm::StringRef r = stem(SM->getFileEntryForID(MainFileID)->getName());
                 std::list<llvm::StringRef> &l = Kernels[r];
-                l.push_back("clMemset");
-                HostKernels += "cl_kernel clKernel_clMemset;\n";
+                l.push_back("__cu2cl_Memset");
+                HostKernels += "cl_kernel __cu2cl_Kernel___cu2cl_Memset;\n";
                 UsesCUDAMemset = true;
             }
             //TODO follow Swan's example of setting via a kernel
 
-            HostRewrite.ReplaceText(cudaCall->getLocStart(), funcName.length(), "clMemset");
+            HostRewrite.ReplaceText(cudaCall->getLocStart(), funcName.length(), "__cu2cl_Memset");
         }
         else {
             //TODO Use diagnostics to print pretty errors
@@ -611,7 +654,7 @@ private:
         //llvm::errs() << "Rewriting CUDA kernel call\n";
         FunctionDecl *callee = kernelCall->getDirectCallee();
         CallExpr *kernelConfig = kernelCall->getConfig();
-        std::string kernelName = "clKernel_" + callee->getNameAsString();
+        std::string kernelName = "__cu2cl_Kernel_" + callee->getNameAsString();
         std::ostringstream args;
         unsigned int dims = 1;
         for (unsigned i = 0; i < kernelCall->getNumArgs(); i++) {
@@ -674,7 +717,7 @@ private:
             Expr *arg = cast->getSubExprAsWritten();
             args << "globalWorkSize[0] = (" << PrintStmtToString(arg) << ")*localWorkSize[0];\n";
         }
-        args << "clEnqueueNDRangeKernel(clCommandQueue, " << kernelName << ", " << dims << ", NULL, globalWorkSize, localWorkSize, 0, NULL, NULL)";
+        args << "clEnqueueNDRangeKernel(__cu2cl_CommandQueue, " << kernelName << ", " << dims << ", NULL, globalWorkSize, localWorkSize, 0, NULL, NULL)";
         ReplaceStmtWithText(kernelCall, args.str(), HostRewrite);
     }
 
@@ -732,7 +775,7 @@ private:
             TypeLoc tl = var->getTypeSourceInfo()->getTypeLoc();
             HostRewrite.ReplaceText(tl.getBeginLoc(),
                                     HostRewrite.getRangeSize(tl.getSourceRange()),
-                                    "clDeviceProp");
+                                    "__cu2cl_DeviceProp");
         }
         else if (type == "cudaStream_t") {
             TypeLoc tl = var->getTypeSourceInfo()->getTypeLoc();
@@ -912,23 +955,13 @@ public:
         HostIncludes += "#endif\n";
         HostIncludes += "#include <stdlib.h>\n";
         HostIncludes += "#include <stdio.h>\n";
-        HostGlobalVars += "cl_platform_id clPlatform;\n";
-        HostGlobalVars += "cl_device_id clDevice;\n";
-        HostGlobalVars += "cl_context clContext;\n";
-        HostGlobalVars += "cl_command_queue clCommandQueue;\n\n";
+        HostGlobalVars += "cl_platform_id __cu2cl_Platform;\n";
+        HostGlobalVars += "cl_device_id __cu2cl_Device;\n";
+        HostGlobalVars += "cl_context __cu2cl_Context;\n";
+        HostGlobalVars += "cl_command_queue __cu2cl_CommandQueue;\n\n";
         HostGlobalVars += "size_t globalWorkSize[3];\n";
         HostGlobalVars += "size_t localWorkSize[3];\n";
-        HostFunctions +=
-            "size_t loadProgramSource(char *filename, const char **progSrc) {\n" \
-            "\tFILE *f = fopen(filename, \"r\");\n" \
-            "\tfseek(f, 0, SEEK_END);\n" \
-            "\tsize_t len = (size_t) ftell(f);\n" \
-            "\t*progSrc = (const char *) malloc(sizeof(char)*len);\n" \
-            "\trewind(f);\n" \
-            "\tfread((void *) *progSrc, len, 1, f);\n" \
-            "\tfclose(f);\n" \
-            "\treturn len;\n" \
-            "}\n\n";
+        HostFunctions += LOAD_PROGRAM_SOURCE;
 
         IncludingStringH = false;
         UsesCUDADeviceProp = false;
@@ -991,7 +1024,7 @@ public:
         for (StringRefListMap::iterator i = Kernels.begin(),
              e = Kernels.end(); i != e; i++) {
             std::string r = idCharFilter((*i).first);
-            HostGlobalVars += "cl_program clProgram_" + r + ";\n";
+            HostGlobalVars += "cl_program __cu2cl_Program_" + r + ";\n";
         }
         //Insert host preamble at top of main file
         HostPreamble = HostIncludes + "\n" + HostDecls + "\n" + HostGlobalVars + "\n" + HostKernels + "\n" + HostFunctions;
@@ -1005,17 +1038,17 @@ public:
         CLInit += "\n";
         CLInit += "const char *progSrc;\n";
         CLInit += "size_t progLen;\n\n";
-        CLInit += "clGetPlatformIDs(1, &clPlatform, NULL);\n";
-        CLInit += "clGetDeviceIDs(clPlatform, CL_DEVICE_TYPE_GPU, 1, &clDevice, NULL);\n";
-        CLInit += "clContext = clCreateContext(NULL, 1, &clDevice, NULL, NULL, NULL);\n";
-        CLInit += "clCommandQueue = clCreateCommandQueue(clContext, clDevice, 0, NULL);\n";
+        CLInit += "clGetPlatformIDs(1, &__cu2cl_Platform, NULL);\n";
+        CLInit += "clGetDeviceIDs(__cu2cl_Platform, CL_DEVICE_TYPE_GPU, 1, &__cu2cl_Device, NULL);\n";
+        CLInit += "__cu2cl_Context = clCreateContext(NULL, 1, &__cu2cl_Device, NULL, NULL, NULL);\n";
+        CLInit += "__cu2cl_CommandQueue = clCreateCommandQueue(__cu2cl_Context, __cu2cl_Device, 0, NULL);\n";
         for (StringRefListMap::iterator i = Kernels.begin(),
              e = Kernels.end(); i != e; i++) {
             std::string r = idCharFilter((*i).first);
-            CLInit += "progLen = loadProgramSource(\"" + (*i).first.str() + "-cl.cl\", &progSrc);\n";
-            CLInit += "clProgram_" + r + " = clCreateProgramWithSource(clContext, 1, &progSrc, &progLen, NULL);\n";
+            CLInit += "progLen = __cu2cl_loadProgramSource(\"" + (*i).first.str() + "-cl.cl\", &progSrc);\n";
+            CLInit += "__cu2cl_Program_" + r + " = clCreateProgramWithSource(__cu2cl_Context, 1, &progSrc, &progLen, NULL);\n";
             CLInit += "free((void *) progSrc);\n";
-            CLInit += "clBuildProgram(clProgram_" + r + ", 1, &clDevice, \"-I .\", NULL, NULL);\n";
+            CLInit += "clBuildProgram(__cu2cl_Program_" + r + ", 1, &__cu2cl_Device, \"-I .\", NULL, NULL);\n";
         }
         for (StringRefListMap::iterator i = Kernels.begin(),
              e = Kernels.end(); i != e; i++) {
@@ -1024,7 +1057,7 @@ public:
                  li != le; li++) {
                 std::string r = idCharFilter((*i).first);
                 std::string kernelName = (*li).str();
-                CLInit += "clKernel_" + kernelName + " = clCreateKernel(clProgram_" + r + ", \"" + kernelName + "\", NULL);\n";
+                CLInit += "__cu2cl_Kernel_" + kernelName + " = clCreateKernel(__cu2cl_Program_" + r + ", \"" + kernelName + "\", NULL);\n";
             }
         }
         HostRewrite.InsertTextAfter(PP->getLocForEndOfToken(mainBody->getLBracLoc()), CLInit);
@@ -1037,16 +1070,16 @@ public:
             for (std::list<llvm::StringRef>::iterator li = l.begin(), le = l.end();
                  li != le; li++) {
                 std::string kernelName = (*li).str();
-                CLClean += "clReleaseKernel(clKernel_" + kernelName + ");\n";
+                CLClean += "clReleaseKernel(__cu2cl_Kernel_" + kernelName + ");\n";
             }
         }
         for (StringRefListMap::iterator i = Kernels.begin(),
              e = Kernels.end(); i != e; i++) {
             std::string r = idCharFilter((*i).first);
-            CLClean += "clReleaseProgram(clProgram_" + r + ");\n";
+            CLClean += "clReleaseProgram(__cu2cl_Program_" + r + ");\n";
         }
-        CLClean += "clReleaseCommandQueue(clCommandQueue);\n";
-        CLClean += "clReleaseContext(clContext);\n";
+        CLClean += "clReleaseCommandQueue(__cu2cl_CommandQueue);\n";
+        CLClean += "clReleaseContext(__cu2cl_Context);\n";
         HostRewrite.InsertTextBefore(mainBody->getRBracLoc(), CLClean);
 
         //Rewrite cl_mems in DeclGroups
@@ -1167,6 +1200,7 @@ protected:
         std::string filename = InFile.str();
         size_t dotPos = filename.rfind('.');
         filename = filename.substr(0, dotPos) + "-cl" + filename.substr(dotPos);
+        //std::string newName = stem(InFile).str() + "-cl" + extension(InFile).str();
         llvm::raw_ostream *hostOS = CI.createDefaultOutputFile(false, filename, "cpp");
         llvm::raw_ostream *kernelOS = CI.createDefaultOutputFile(false, filename, "cl");
         if (hostOS && kernelOS)
