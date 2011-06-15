@@ -62,7 +62,7 @@
     "};\n\n"
 
 #define LOAD_PROGRAM_SOURCE \
-    "size_t __cu2cl_loadProgramSource(char *filename, const char **progSrc) {\n" \
+    "size_t __cu2cl_LoadProgramSource(char *filename, const char **progSrc) {\n" \
     "\tFILE *f = fopen(filename, \"r\");\n" \
     "\tfseek(f, 0, SEEK_END);\n" \
     "\tsize_t len = (size_t) ftell(f);\n" \
@@ -121,6 +121,25 @@
     "   cl_event event;\n" \
     "   clEnqueueMarker(commands, &event);\n" \
     "   clGetEventInfo(commands, &event);\n" \
+    "}\n\n"
+
+#define CL_EVENT_ELAPSED_TIME \
+    "cl_int __cu2cl_EventElapsedTime(float *ms, cl_event start, cl_event end) {\n" \
+    "    cl_int ret;\n" \
+    "    cl_ulong s, e;\n" \
+    "    float fs, fe;\n" \
+    "    ret |= clGetEventProfilingInfo(start, CL_PROFILING_COMMAND_END, sizeof(cl_ulong), &s, NULL);\n" \
+    "    ret |= clGetEventProfilingInfo(e, CL_PROFILING_COMMAND_END, sizeof(cl_ulong), &e, NULL);\n" \
+    "    s = e - s;\n" \
+    "    *ms = ((float) s)/1000000.0;\n" \
+    "    return ret;\n" \
+    "}\n\n"
+
+#define CL_EVENT_QUERY \
+    "cl_int __cu2cl_EventQuery(cl_event event) {\n" \
+    "    cl_int ret;\n" \
+    "    clGetEventInfo(event, CL_EVENT_COMMAND_ EXECUTION_STATUS, sizeof(cl_int), &ret, NULL);\n" \
+    "    return ret;\n" \
     "}\n\n"
 
 using namespace clang;
@@ -182,6 +201,8 @@ private:
     std::set<DeclGroupRef, cmpDG> DeviceMemDGs;
     std::set<VarDecl *> DeviceMemVars;
 
+    TypeLoc LastLoc;
+
     std::string MainFuncName;
     FunctionDecl *MainDecl;
 
@@ -205,6 +226,8 @@ private:
     bool UsesCUDADeviceProp;
     bool UsesCUDAMemset;
     bool UsesCUDAStreamQuery;
+    bool UsesCUDAEventElapsedTime;
+    bool UsesCUDAEventQuery;
 
     void TraverseStmt(Stmt *e, unsigned int indent) {
         for (unsigned int i = 0; i < indent; i++)
@@ -536,6 +559,70 @@ private:
             ReplaceStmtWithText(cudaCall, sub, HostRewrite);
         }
 
+        //Event Management
+        else if (funcName == "cudaEventCreate") {
+            //Remove the call
+            ReplaceStmtWithText(cudaCall, "", HostRewrite);
+        }
+        else if (funcName == "cudaEventCreateWithFlags") {
+            //Remove the call
+            ReplaceStmtWithText(cudaCall, "", HostRewrite);
+        }
+        else if (funcName == "cudaEventDestroy") {
+            //Replace with clReleaseEvent
+            Expr *event = cudaCall->getArg(0);
+            std::string sub = "clReleaseEvent(" + PrintStmtToString(event) + ")";
+
+            ReplaceStmtWithText(cudaCall, sub, HostRewrite);
+        }
+        else if (funcName == "cudaEventElapsedTime") {
+            //TODO enable CL_QUEUE_PROFILING_ENABLE on the associated cl_command_queue
+            //Replace with __cu2cl_EventElapsedTime
+            if (!UsesCUDAEventElapsedTime) {
+                HostFunctions += CL_EVENT_ELAPSED_TIME;
+                UsesCUDAEventElapsedTime = true;
+            }
+
+            Expr *event = cudaCall->getArg(0);
+            std::string sub = "clReleaseEvent(" + PrintStmtToString(event) + ")";
+
+            ReplaceStmtWithText(cudaCall, sub, HostRewrite);
+        }
+        else if (funcName == "cudaEventQuery") {
+            //Replace with __cu2cl_EventQuery
+            if (!UsesCUDAEventQuery) {
+                HostFunctions += CL_EVENT_QUERY;
+                UsesCUDAEventQuery = true;
+            }
+
+            Expr *event = cudaCall->getArg(0);
+            std::string sub = "__cu2cl_EventQuery(" + PrintStmtToString(event) + ")";
+
+            ReplaceStmtWithText(cudaCall, sub, HostRewrite);
+        }
+        else if (funcName == "cudaEventRecord") {
+            //Replace with clEnqueueMarker
+            Expr *event = cudaCall->getArg(0);
+            Expr *stream = cudaCall->getArg(1);
+
+            //If stream == 0, then cl_command_queue == __cu2cl_CommandQueue
+            std::string streamVal = PrintStmtToString(stream);
+            if (streamVal == "0")
+                streamVal = "__cu2cl_CommandQueue";
+            //TODO remember which streamVals have had profiling set
+            std::string sub = "clSetCommandQueueProperty(" + streamVal + ", CL_QUEUE_PROFILING_ENABLE, CL_TRUE, NULL);\n";
+            sub += "clEnqueueMarker(" + streamVal + ", &" + PrintStmtToString(event) + ")";
+
+            ReplaceStmtWithText(cudaCall, sub, HostRewrite);
+        }
+        else if (funcName == "cudaEventSynchronize") {
+            //Replace with clWaitForEvents
+            Expr *event = cudaCall->getArg(0);
+            std::string sub = "clWaitForEvents(1, &" + PrintStmtToString(event) + ")";
+
+            ReplaceStmtWithText(cudaCall, sub, HostRewrite);
+        }
+
         //Memory Management
         else if (funcName == "cudaMalloc") {
             Expr *varExpr = cudaCall->getArg(0);
@@ -726,13 +813,27 @@ private:
     }
 
     void RewriteVarDecl(VarDecl *var) {
-        std::string type = var->getType().getAsString();
+        //TODO either break into this and RewriteConstructor, or put flag in that allows constructors to be rewritten (i.e. dim3)
+        TypeLoc tl = var->getTypeSourceInfo()->getTypeLoc();
+        if (!LastLoc.isNull() && tl.getBeginLoc() == LastLoc.getBeginLoc())
+            return;
+        LastLoc = tl;
+        QualType qt = var->getType();
+        std::string type = qt.getAsString();
+        llvm::errs() << type;
+        while (!tl.getNextTypeLoc().isNull()) {
+            tl = tl.getNextTypeLoc();
+            qt = tl.getType();
+            type = qt.getAsString();
+            llvm::errs() << " -> " << type;
+        }
+        llvm::errs() << "\n";
+
         if (type == "dim3") {
             //Rewrite to size_t array
             //TODO rewrite statement as a whole with a new string
-            TypeLoc tl = var->getTypeSourceInfo()->getTypeLoc();
             HostRewrite.ReplaceText(tl.getBeginLoc(),
-                                HostRewrite.getRangeSize(tl.getSourceRange()),
+                                HostRewrite.getRangeSize(tl.getLocalSourceRange()),
                                 "size_t");
             if (var->hasInit()) {
                 //Rewrite initial value
@@ -772,16 +873,19 @@ private:
                 HostFunctions += CL_GET_DEVICE_PROPS;
                 UsesCUDADeviceProp = true;
             }
-            TypeLoc tl = var->getTypeSourceInfo()->getTypeLoc();
             HostRewrite.ReplaceText(tl.getBeginLoc(),
-                                    HostRewrite.getRangeSize(tl.getSourceRange()),
+                                    HostRewrite.getRangeSize(tl.getLocalSourceRange()),
                                     "__cu2cl_DeviceProp");
         }
         else if (type == "cudaStream_t") {
-            TypeLoc tl = var->getTypeSourceInfo()->getTypeLoc();
             HostRewrite.ReplaceText(tl.getBeginLoc(),
-                                    HostRewrite.getRangeSize(tl.getSourceRange()),
+                                    HostRewrite.getRangeSize(tl.getLocalSourceRange()),
                                     "cl_command_queue");
+        }
+        else if (type == "cudaEvent_t") {
+            HostRewrite.ReplaceText(tl.getBeginLoc(),
+                                    HostRewrite.getRangeSize(tl.getLocalSourceRange()),
+                                    "cl_event");
         }
         //TODO check other CUDA-only types to rewrite
     }
@@ -1045,7 +1149,7 @@ public:
         for (StringRefListMap::iterator i = Kernels.begin(),
              e = Kernels.end(); i != e; i++) {
             std::string r = idCharFilter((*i).first);
-            CLInit += "progLen = __cu2cl_loadProgramSource(\"" + (*i).first.str() + "-cl.cl\", &progSrc);\n";
+            CLInit += "progLen = __cu2cl_LoadProgramSource(\"" + (*i).first.str() + "-cl.cl\", &progSrc);\n";
             CLInit += "__cu2cl_Program_" + r + " = clCreateProgramWithSource(__cu2cl_Context, 1, &progSrc, &progLen, NULL);\n";
             CLInit += "free((void *) progSrc);\n";
             CLInit += "clBuildProgram(__cu2cl_Program_" + r + ", 1, &__cu2cl_Device, \"-I .\", NULL, NULL);\n";
