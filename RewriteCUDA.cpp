@@ -272,19 +272,12 @@ private:
     }
 
     void RewriteHostStmt(Stmt *s) {
-        //Traverse children and recurse
-        for (Stmt::child_iterator CI = s->child_begin(), CE = s->child_end();
-             CI != CE; ++CI) {
-            if (*CI)
-                RewriteHostStmt(*CI);
-        }
         //Visit this node
-        if (CUDAKernelCallExpr *kce = dyn_cast<CUDAKernelCallExpr>(s)) {
-            RewriteCUDAKernelCall(kce);
-        }
-        else if (CallExpr *ce = dyn_cast<CallExpr>(s)) {
-            if (ce->getDirectCallee()->getNameAsString().find("cuda") == 0)
-                RewriteCUDACall(ce);
+        if (Expr *e = dyn_cast<Expr>(s)) {
+            std::string str;
+            if (RewriteHostExpr(e, str)) {
+                ReplaceStmtWithText(e, str, HostRewrite);
+            }
         }
         else if (DeclStmt *ds = dyn_cast<DeclStmt>(s)) {
             DeclGroupRef DG = ds->getDeclGroup();
@@ -293,42 +286,39 @@ private:
             if (firstDecl->getKind() == Decl::Var) {
                 CurVarDeclGroups.insert(DG);
             }
-            for(DeclGroupRef::iterator i = DG.begin(), e = DG.end(); i != e; ++i) {
+            for (DeclGroupRef::iterator i = DG.begin(), e = DG.end(); i != e; ++i) {
                 if (VarDecl *vd = dyn_cast<VarDecl>(*i)) {
                     RewriteVarDecl(vd);
                 }
                 //TODO other non-top level declarations??
             }
         }
-        else if (MemberExpr *me = dyn_cast<MemberExpr>(s)) {
-            //Check base Expr, if DeclRefExpr and a dim3, then rewrite
-            if (DeclRefExpr *dre = dyn_cast<DeclRefExpr>(me->getBase())) {
-                std::string type = dre->getDecl()->getType().getAsString();
-                if (type == "dim3") {
-                    std::string name = me->getMemberDecl()->getNameAsString();
-                    if (name == "x") {
-                        name = "[0]";
-                    }
-                    else if (name == "y") {
-                        name = "[1]";
-                    }
-                    else if (name == "z") {
-                        name = "[2]";
-                    }
-                    //TODO find location of arrow or dot and rewrite
-                    SourceRange sr = me->getSourceRange();
-                    HostRewrite.ReplaceText(sr.getBegin(), HostRewrite.getRangeSize(sr), PrintStmtToString(dre) + name);
-                }
-                else if (type == "cudaDeviceProp") {
-                    //TODO check what the reference is
-                    //TODO if unsupported, print a warning
-                }
+        //TODO rewrite any other Stmts?
+
+        else {
+            //Traverse children and recurse
+            for (Stmt::child_iterator CI = s->child_begin(), CE = s->child_end();
+                 CI != CE; ++CI) {
+                if (*CI)
+                    RewriteHostStmt(*CI);
             }
         }
     }
 
     bool RewriteHostExpr(Expr *e, std::string &newExpr) {
-        if (MemberExpr *me = dyn_cast<MemberExpr>(e)) {
+        if (e->getSourceRange().isInvalid())
+            return false;
+
+        //Return value determines whether or not a rewrite happened
+        if (CUDAKernelCallExpr *kce = dyn_cast<CUDAKernelCallExpr>(e)) {
+            newExpr = RewriteCUDAKernelCall(kce);
+            return true;
+        }
+        else if (CallExpr *ce = dyn_cast<CallExpr>(e)) {
+            if (ce->getDirectCallee()->getNameAsString().find("cuda") == 0)
+                return RewriteCUDACall(ce, newExpr);
+        }
+        else if (MemberExpr *me = dyn_cast<MemberExpr>(e)) {
             //Check base Expr, if DeclRefExpr and a dim3, then rewrite
             if (DeclRefExpr *dre = dyn_cast<DeclRefExpr>(me->getBase())) {
                 std::string type = dre->getDecl()->getType().getAsString();
@@ -356,20 +346,18 @@ private:
         }
 
         bool ret = false;
-        //TODO check why the length or locations would be wrong
-        //TODO check how to print out macro names (use SM->getInstantiationLoc)
+        //Instantiation locations are used to capture macros
         unsigned int len = FindRangeSize(e->getSourceRange());
         newExpr = std::string(SM->getCharacterData(SM->getInstantiationLoc(e->getLocStart())), len);
 
-        //TODO do a DFS, recursing into children, then rewriting this expression
-        //TODO handle normally, not a special case
-        //TODO for children, if rewrite happened, replace old sourcerange?
+        //Do a DFS, recursing into children, then rewriting this expression
+        //if rewrite happened, replace text at old sourcerange
         for (Stmt::child_iterator CI = e->child_begin(), CE = e->child_end();
              CI != CE; ++CI) {
             std::string s;
-            if (*CI && RewriteHostExpr((Expr *) *CI, s)) {
-                //TODO perform "rewrite"
-                Expr *child = (Expr *) *CI;
+            Expr *child = (Expr *) *CI;
+            if (child && RewriteHostExpr(child, s)) {
+                //Perform "rewrite", which is just a simple replace
                 newExpr.replace(FindRangeSize(e->getLocStart(), child->getLocStart(), false), FindRangeSize(child->getSourceRange()), s);
                 ret = true;
             }
@@ -388,6 +376,7 @@ private:
         std::list<llvm::StringRef> &l = Kernels[r];
         l.push_back(kernelFunc->getName());
         HostKernels += "cl_kernel __cu2cl_Kernel_" + kernelFunc->getName().str() + ";\n";
+
         //Rewrite kernel attributes
         if (kernelFunc->hasAttr<CUDAGlobalAttr>()) {
             SourceLocation loc = FindAttr(kernelFunc->getLocStart(), "__global__");
@@ -407,13 +396,15 @@ private:
             if (hasHost)
                 RewriteAttr("__host__", loc, HostRewrite);
         }
+
         //Rewrite arguments
         for (FunctionDecl::param_iterator PI = kernelFunc->param_begin(),
                                           PE = kernelFunc->param_end();
                                           PI != PE; ++PI) {
             RewriteKernelParam(*PI);
         }
-        //Rewirte kernel body
+
+        //Rewrite kernel body
         if (kernelFunc->hasBody()) {
             //TraverseStmt(kernelFunc->getBody(), 0);
             RewriteKernelStmt(kernelFunc->getBody());
@@ -491,7 +482,7 @@ private:
             if (firstDecl->getKind() == Decl::Var) {
                 CurVarDeclGroups.insert(DG);
             }
-            for(DeclGroupRef::iterator i = DG.begin(), e = DG.end(); i != e; ++i) {
+            for (DeclGroupRef::iterator i = DG.begin(), e = DG.end(); i != e; ++i) {
                 if (VarDecl *vd = dyn_cast<VarDecl>(*i)) {
                     if (vd->hasAttr<CUDADeviceAttr>()) {
                         SourceLocation loc = FindAttr(vd->getLocStart(), "__device__");
@@ -514,7 +505,7 @@ private:
     std::string RewriteKernelExpr(Expr *e) {
     }
 
-    void RewriteCUDACall(CallExpr *cudaCall) {
+    bool RewriteCUDACall(CallExpr *cudaCall, std::string &newExpr) {
         //TODO all CUDA calls return a cudaError_t, so need to find a way to keep that working
         //TODO check if the return value is being used somehow?
         //llvm::errs() << "Rewriting CUDA API call\n";
@@ -523,11 +514,11 @@ private:
         //Thread Management
         if (funcName == "cudaThreadExit") {
             //Replace with clReleaseContext
-            ReplaceStmtWithText(cudaCall, "clReleaseContext(__cu2cl_Context)", HostRewrite);
+            newExpr = "clReleaseContext(__cu2cl_Context)";
         }
         else if (funcName == "cudaThreadSynchronize") {
             //Replace with clFinish
-            ReplaceStmtWithText(cudaCall, "clFinish(__cu2cl_CommandQueue)", HostRewrite);
+            newExpr = "clFinish(__cu2cl_CommandQueue)";
         }
 
         //Device Management
@@ -536,31 +527,40 @@ private:
             Expr *device = cudaCall->getArg(0);
             DeclRefExpr *dr = FindStmt<DeclRefExpr>(device);
             VarDecl *var = dyn_cast<VarDecl>(dr->getDecl());
+
             //Rewrite var type to cl_device_id
             //TODO check if type already rewritten
             TypeLoc tl = var->getTypeSourceInfo()->getTypeLoc();
             HostRewrite.ReplaceText(tl.getBeginLoc(),
                                     HostRewrite.getRangeSize(tl.getSourceRange()),
                                     "cl_device_id");
-            ReplaceStmtWithText(cudaCall, var->getNameAsString() + " = __cu2cl_Device", HostRewrite);
+            newExpr = var->getNameAsString() + " = __cu2cl_Device";
         }
         else if (funcName == "cudaGetDeviceCount") {
             //Replace with clGetDeviceIDs
             Expr *count = cudaCall->getArg(0);
-            ReplaceStmtWithText(cudaCall, "clGetDeviceIDs(__cu2cl_Platform, CL_DEVICE_TYPE_GPU, 0, NULL, " + PrintStmtToString(count) + ")", HostRewrite);
+            std::string newCount;
+            RewriteHostExpr(count, newCount);
+            newExpr = "clGetDeviceIDs(__cu2cl_Platform, CL_DEVICE_TYPE_GPU, 0, NULL, " + newCount + ")";
         }
         else if (funcName == "cudaSetDevice") {
             //Replace with clCreateContext and clCreateCommandQueue
+            //TODO first, delete old queue and context
             Expr *device = cudaCall->getArg(0);
-            DeclRefExpr *dr = FindStmt<DeclRefExpr>(device);
-            VarDecl *var = dyn_cast<VarDecl>(dr->getDecl());
+            DeclRefExpr *dre = FindStmt<DeclRefExpr>(device);
+            VarDecl *var = dyn_cast<VarDecl>(dre->getDecl());
             std::string sub = "__cu2cl_Context = clCreateContext(NULL, 1, &" + var->getNameAsString() + ", NULL, NULL, NULL);\n";
-            sub += "__cu2cl_CommandQueue = clCreateCommandQueue(__cu2cl_Context, " + var->getNameAsString() +", 0, NULL);\n";
-            ReplaceStmtWithText(cudaCall, sub, HostRewrite);
+            sub += "__cu2cl_CommandQueue = clCreateCommandQueue(__cu2cl_Context, " + var->getNameAsString() +", 0, NULL)\n";
+            newExpr = sub;
         }
         else if (funcName == "cudaGetDeviceProperties") {
             //Replace with __cu2cl_GetDeviceProperties
-            HostRewrite.ReplaceText(cudaCall->getLocStart(), funcName.length(), "__cu2cl_GetDeviceProperties");
+            Expr *prop = cudaCall->getArg(0);
+            Expr *device = cudaCall->getArg(1);
+            std::string newProp, newDevice;
+            RewriteHostExpr(prop, newProp);
+            RewriteHostExpr(device, newDevice);
+            newExpr = "__cu2cl_GetDeviceProperties(" + newProp + ", " + newDevice + ")";
         }
 
         //Stream Management
@@ -571,14 +571,14 @@ private:
             VarDecl *var = dyn_cast<VarDecl>(dr->getDecl());
             std::string sub = var->getNameAsString() + " = clCreateCommandQueue(__cu2cl_Context, __cu2cl_Device, 0, NULL)";
 
-            ReplaceStmtWithText(cudaCall, sub, HostRewrite);
+            newExpr = sub;
         }
         else if (funcName == "cudaStreamDestroy") {
             //Replace with clReleaseCommandQueue
             Expr *stream = cudaCall->getArg(0);
-            std::string sub = "clReleaseCommandQueue(" + PrintStmtToString(stream) + ")";
-
-            ReplaceStmtWithText(cudaCall, sub, HostRewrite);
+            std::string newStream;
+            RewriteHostExpr(stream, newStream);
+            newExpr = "clReleaseCommandQueue(" + newStream + ")";
         }
         else if (funcName == "cudaStreamQuery") {
             //Replace with __cu2cl_CommandQueueQuery
@@ -588,41 +588,42 @@ private:
             }
 
             Expr *stream = cudaCall->getArg(0);
-            std::string sub = "__cu2cl_CommandQueueQuery(" + PrintStmtToString(stream) + ")";
-
-            ReplaceStmtWithText(cudaCall, sub, HostRewrite);
+            std::string newStream;
+            RewriteHostExpr(stream, newStream);
+            newExpr = "__cu2cl_CommandQueueQuery(" + newStream + ")";
         }
         else if (funcName == "cudaStreamSynchronize") {
             //Replace with clFinish
             Expr *stream = cudaCall->getArg(0);
-            std::string sub = "clFinish(" + PrintStmtToString(stream) + ")";
-
-            ReplaceStmtWithText(cudaCall, sub, HostRewrite);
+            std::string newStream;
+            RewriteHostExpr(stream, newStream);
+            newExpr = "clFinish(" + newStream + ")";
         }
         else if (funcName == "cudaStreamWaitEvent") {
             //Replace with clEnqueueWaitForEvents
             Expr *stream = cudaCall->getArg(0);
             Expr *event = cudaCall->getArg(1);
-            std::string sub = "clEnqueueWaitForEvents(" + PrintStmtToString(stream) + ", 1, &" + PrintStmtToString(event) + ")";
-
-            ReplaceStmtWithText(cudaCall, sub, HostRewrite);
+            std::string newStream, newEvent;
+            RewriteHostExpr(stream, newStream);
+            RewriteHostExpr(event, newEvent);
+            newExpr = "clEnqueueWaitForEvents(" + newStream + ", 1, &" + newEvent + ")";
         }
 
         //Event Management
         else if (funcName == "cudaEventCreate") {
             //Remove the call
-            ReplaceStmtWithText(cudaCall, "", HostRewrite);
+            newExpr = "";
         }
         else if (funcName == "cudaEventCreateWithFlags") {
             //Remove the call
-            ReplaceStmtWithText(cudaCall, "", HostRewrite);
+            newExpr = "";
         }
         else if (funcName == "cudaEventDestroy") {
             //Replace with clReleaseEvent
             Expr *event = cudaCall->getArg(0);
-            std::string sub = "clReleaseEvent(" + PrintStmtToString(event) + ")";
-
-            ReplaceStmtWithText(cudaCall, sub, HostRewrite);
+            std::string newEvent;
+            RewriteHostExpr(event, newEvent);
+            newExpr = "clReleaseEvent(" + newEvent + ")";
         }
         else if (funcName == "cudaEventElapsedTime") {
             //TODO enable CL_QUEUE_PROFILING_ENABLE on the associated cl_command_queue
@@ -633,9 +634,9 @@ private:
             }
 
             Expr *event = cudaCall->getArg(0);
-            std::string sub = "clReleaseEvent(" + PrintStmtToString(event) + ")";
-
-            ReplaceStmtWithText(cudaCall, sub, HostRewrite);
+            std::string newEvent;
+            RewriteHostExpr(event, newEvent);
+            newExpr = "clReleaseEvent(" + newEvent + ")";
         }
         else if (funcName == "cudaEventQuery") {
             //Replace with __cu2cl_EventQuery
@@ -645,46 +646,48 @@ private:
             }
 
             Expr *event = cudaCall->getArg(0);
-            std::string sub = "__cu2cl_EventQuery(" + PrintStmtToString(event) + ")";
-
-            ReplaceStmtWithText(cudaCall, sub, HostRewrite);
+            std::string newEvent;
+            RewriteHostExpr(event, newEvent);
+            newExpr = "__cu2cl_EventQuery(" + newEvent + ")";
         }
         else if (funcName == "cudaEventRecord") {
             //Replace with clEnqueueMarker
             Expr *event = cudaCall->getArg(0);
             Expr *stream = cudaCall->getArg(1);
+            std::string newStream, newEvent;
+            RewriteHostExpr(stream, newStream);
+            RewriteHostExpr(event, newEvent);
 
             //If stream == 0, then cl_command_queue == __cu2cl_CommandQueue
-            std::string streamVal = PrintStmtToString(stream);
-            if (streamVal == "0")
-                streamVal = "__cu2cl_CommandQueue";
+            if (newStream == "0")
+                newStream = "__cu2cl_CommandQueue";
             //TODO remember which streamVals have had profiling set
-            std::string sub = "clSetCommandQueueProperty(" + streamVal + ", CL_QUEUE_PROFILING_ENABLE, CL_TRUE, NULL);\n";
-            sub += "clEnqueueMarker(" + streamVal + ", &" + PrintStmtToString(event) + ")";
+            std::string sub = "clSetCommandQueueProperty(" + newStream + ", CL_QUEUE_PROFILING_ENABLE, CL_TRUE, NULL);\n";
+            sub += "clEnqueueMarker(" + newStream + ", &" + newEvent + ")";
 
-            ReplaceStmtWithText(cudaCall, sub, HostRewrite);
+            newExpr = sub;
         }
         else if (funcName == "cudaEventSynchronize") {
             //Replace with clWaitForEvents
             Expr *event = cudaCall->getArg(0);
-            std::string sub = "clWaitForEvents(1, &" + PrintStmtToString(event) + ")";
-
-            ReplaceStmtWithText(cudaCall, sub, HostRewrite);
+            std::string newEvent;
+            RewriteHostExpr(event, newEvent);
+            newExpr = "clWaitForEvents(1, &" + newEvent + ")";
         }
 
         //Memory Management
         else if (funcName == "cudaMalloc") {
-            Expr *varExpr = cudaCall->getArg(0);
+            Expr *devPtr = cudaCall->getArg(0);
             Expr *size = cudaCall->getArg(1);
-            DeclRefExpr *dr = FindStmt<DeclRefExpr>(varExpr);
+            DeclRefExpr *dr = FindStmt<DeclRefExpr>(devPtr);
             VarDecl *var = dyn_cast<VarDecl>(dr->getDecl());
             llvm::StringRef varName = var->getName();
-            std::string str;
-            str = PrintStmtToString(size);
+            std::string newSize;
+            RewriteHostExpr(size, newSize);
 
             //Replace with clCreateBuffer
-            std::string sub = varName.str() + " = clCreateBuffer(__cu2cl_Context, CL_MEM_READ_WRITE, " + str + ", NULL, NULL)";
-            ReplaceStmtWithText(cudaCall, sub, HostRewrite);
+            std::string sub = varName.str() + " = clCreateBuffer(__cu2cl_Context, CL_MEM_READ_WRITE, " + newSize + ", NULL, NULL)";
+            newExpr = sub;
 
             DeclGroupRef varDG(var);
             if (CurVarDeclGroups.find(varDG) != CurVarDeclGroups.end()) {
@@ -712,50 +715,44 @@ private:
             llvm::StringRef varName = dr->getDecl()->getName();
 
             //Replace with clReleaseMemObject
-            ReplaceStmtWithText(cudaCall, "clReleaseMemObject(" + varName.str() + ")", HostRewrite);
+            newExpr = "clReleaseMemObject(" + varName.str() + ")";
         }
         else if (funcName == "cudaMallocHost") {
             //TODO implement
         }
         else if (funcName == "cudaMemcpy") {
-            std::string replace;
-
+            //Inspect kind of memcpy and rewrite accordingly
             Expr *dst = cudaCall->getArg(0);
             Expr *src = cudaCall->getArg(1);
             Expr *count = cudaCall->getArg(2);
             Expr *kind = cudaCall->getArg(3);
+            std::string newDst, newSrc, newCount;
+            RewriteHostExpr(dst, newDst);
+            RewriteHostExpr(src, newSrc);
+            RewriteHostExpr(count, newCount);
+
+            //TODO simply dyn_cast to the DeclRefExpr here?
             DeclRefExpr *dr = FindStmt<DeclRefExpr>(kind);
             EnumConstantDecl *enumConst = dyn_cast<EnumConstantDecl>(dr->getDecl());
             std::string enumString = enumConst->getNameAsString();
-            //llvm::errs() << enumString << "\n";
+
             if (enumString == "cudaMemcpyHostToHost") {
                 //standard memcpy
-                //make sure to include <string.h>
+                //Make sure to include <string.h>
                 if (!IncludingStringH) {
                     HostIncludes += "#include <string.h>\n";
                     IncludingStringH = true;
                 }
-                replace += "memcpy(";
-                replace += PrintStmtToString(dst) + ", ";
-                replace += PrintStmtToString(src) + ", ";
-                replace += PrintStmtToString(count) + ")";
-                ReplaceStmtWithText(cudaCall, replace, HostRewrite);
+
+                newExpr = "memcpy(" + newDst + ", " + newSrc + ", " + newCount + ")";
             }
             else if (enumString == "cudaMemcpyHostToDevice") {
                 //clEnqueueWriteBuffer
-                replace += "clEnqueueWriteBuffer(__cu2cl_CommandQueue, ";
-                replace += PrintStmtToString(dst) + ", CL_TRUE, 0, ";
-                replace += PrintStmtToString(count) + ", ";
-                replace += PrintStmtToString(src) + ", 0, NULL, NULL)";
-                ReplaceStmtWithText(cudaCall, replace, HostRewrite);
+                newExpr = "clEnqueueWriteBuffer(__cu2cl_CommandQueue, " + newDst + ", CL_TRUE, 0, " + newCount + ", " + newSrc + ", 0, NULL, NULL)";
             }
             else if (enumString == "cudaMemcpyDeviceToHost") {
                 //clEnqueueReadBuffer
-                replace += "clEnqueueReadBuffer(__cu2cl_CommandQueue, ";
-                replace += PrintStmtToString(src) + ", CL_TRUE, 0, ";
-                replace += PrintStmtToString(count) + ", ";
-                replace += PrintStmtToString(dst) + ", 0, NULL, NULL)";
-                ReplaceStmtWithText(cudaCall, replace, HostRewrite);
+                newExpr = "clEnqueueReadBuffer(__cu2cl_CommandQueue, " + newSrc + ", CL_TRUE, 0, " + newCount + ", " + newDst + ", 0, NULL, NULL)";
             }
             else if (enumString == "cudaMemcpyDeviceToDevice") {
                 //TODO __cu2cl_MemcpyDevToDev
@@ -779,21 +776,32 @@ private:
             }
             //Follow Swan's example of setting via a kernel
 
-            HostRewrite.ReplaceText(cudaCall->getLocStart(), funcName.length(), "__cu2cl_Memset");
+            Expr *devPtr = cudaCall->getArg(0);
+            Expr *value = cudaCall->getArg(1);
+            Expr *count = cudaCall->getArg(2);
+            std::string newDevPtr, newValue, newCount;
+            RewriteHostExpr(devPtr, newDevPtr);
+            RewriteHostExpr(value, newValue);
+            RewriteHostExpr(count, newCount);
+            newExpr = "__cu2cl_Memset(" + newDevPtr + ", " + newValue + ", " + newCount + ")";
         }
         else {
             //TODO Use diagnostics to print pretty errors
             llvm::errs() << "Unsupported CUDA call: " << funcName << "\n";
+            return false;
         }
+        return true;
     }
 
-    void RewriteCUDAKernelCall(CUDAKernelCallExpr *kernelCall) {
+    std::string RewriteCUDAKernelCall(CUDAKernelCallExpr *kernelCall) {
         //llvm::errs() << "Rewriting CUDA kernel call\n";
         FunctionDecl *callee = kernelCall->getDirectCallee();
         CallExpr *kernelConfig = kernelCall->getConfig();
         std::string kernelName = "__cu2cl_Kernel_" + callee->getNameAsString();
         std::ostringstream args;
         unsigned int dims = 1;
+
+        //Set kernel arguments
         for (unsigned i = 0; i < kernelCall->getNumArgs(); i++) {
             Expr *arg = kernelCall->getArg(i);
             VarDecl *var = dyn_cast<VarDecl>(FindStmt<DeclRefExpr>(arg)->getDecl());
@@ -807,15 +815,16 @@ private:
             }
             args << "), &" << var->getNameAsString() << ");\n";
         }
+
+        //TODO handle passing in a new dim3? (i.e. dim3(1,2,3))
+        //Set work sizes
         //Guaranteed to be dim3s, so pull out their x,y,z values
         Expr *grid = kernelConfig->getArg(0);
         Expr *block = kernelConfig->getArg(1);
-        //TraverseStmt(grid, 0);
-        //TraverseStmt(block, 0);
         CXXConstructExpr *construct = dyn_cast<CXXConstructExpr>(block);
         ImplicitCastExpr *cast = dyn_cast<ImplicitCastExpr>(construct->getArg(0));
         if (DeclRefExpr *dre = dyn_cast<DeclRefExpr>(cast->getSubExprAsWritten())) {
-            //variable passed
+            //Variable passed
             ValueDecl *value = dre->getDecl();
             std::string type = value->getType().getAsString();
             if (type == "dim3") {
@@ -824,19 +833,22 @@ private:
                     args << "localWorkSize[" << i << "] = " << value->getNameAsString() << "[" << i << "];\n";
             }
             else {
-                //TODO ??
+                //Some integer type, likely
                 args << "localWorkSize[0] = " << PrintStmtToString(dre) << ";\n";
             }
         }
         else {
-            //constant passed to block
+            //Some other expression passed to block
             Expr *arg = cast->getSubExprAsWritten();
-            args << "localWorkSize[0] = " << PrintStmtToString(arg) << ";\n";
+            std::string s;
+            RewriteHostExpr(arg, s);
+            args << "localWorkSize[0] = " << s << ";\n";
         }
+
         construct = dyn_cast<CXXConstructExpr>(grid);
         cast = dyn_cast<ImplicitCastExpr>(construct->getArg(0));
         if (DeclRefExpr *dre = dyn_cast<DeclRefExpr>(cast->getSubExprAsWritten())) {
-            //variable passed
+            //Variable passed
             ValueDecl *value = dre->getDecl();
             std::string type = value->getType().getAsString();
             if (type == "dim3") {
@@ -845,17 +857,20 @@ private:
                     args << "globalWorkSize[" << i << "] = " << value->getNameAsString() << "[" << i << "]*localWorkSize[" << i << "];\n";
             }
             else {
-                //TODO ??
+                //Some integer type, likely
                 args << "globalWorkSize[0] = (" << PrintStmtToString(dre) << ")*localWorkSize[0];\n";
             }
         }
         else {
             //constant passed to grid
             Expr *arg = cast->getSubExprAsWritten();
-            args << "globalWorkSize[0] = (" << PrintStmtToString(arg) << ")*localWorkSize[0];\n";
+            std::string s;
+            RewriteHostExpr(arg, s);
+            args << "globalWorkSize[0] = (" << s << ")*localWorkSize[0];\n";
         }
         args << "clEnqueueNDRangeKernel(__cu2cl_CommandQueue, " << kernelName << ", " << dims << ", NULL, globalWorkSize, localWorkSize, 0, NULL, NULL)";
-        ReplaceStmtWithText(kernelCall, args.str(), HostRewrite);
+
+        return args.str();
     }
 
     void RewriteMain(FunctionDecl *mainDecl) {
@@ -1078,7 +1093,8 @@ private:
         return FindRangeSize(range.getBegin(), range.getEnd(), getCharRange);
     }
 
-    unsigned int FindRangeSize(SourceLocation start, SourceLocation end, bool getCharRange = true) {
+    unsigned int FindRangeSize(SourceLocation start, SourceLocation end,
+                               bool getCharRange = true) {
         std::pair<FileID, unsigned int> s = SM->getDecomposedInstantiationLoc(start);
         std::pair<FileID, unsigned int> e = SM->getDecomposedInstantiationLoc(end);
 
