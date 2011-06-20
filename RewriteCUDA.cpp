@@ -346,9 +346,9 @@ private:
         }
 
         bool ret = false;
+        Rewriter exprRewriter(*SM, *LO);
         //Instantiation locations are used to capture macros
-        unsigned int len = FindRangeSize(e->getSourceRange());
-        newExpr = std::string(SM->getCharacterData(SM->getInstantiationLoc(e->getLocStart())), len);
+        SourceRange realRange(SM->getInstantiationLoc(e->getLocStart()), SM->getInstantiationLoc(e->getLocEnd()));
 
         //Do a DFS, recursing into children, then rewriting this expression
         //if rewrite happened, replace text at old sourcerange
@@ -358,10 +358,11 @@ private:
             Expr *child = (Expr *) *CI;
             if (child && RewriteHostExpr(child, s)) {
                 //Perform "rewrite", which is just a simple replace
-                newExpr.replace(FindRangeSize(e->getLocStart(), child->getLocStart(), false), FindRangeSize(child->getSourceRange()), s);
+                ReplaceStmtWithText(child, s, exprRewriter);
                 ret = true;
             }
         }
+        newExpr = exprRewriter.getRewrittenText(realRange);
 
         return ret;
     }
@@ -1087,24 +1088,6 @@ private:
         return Rewrite.ReplaceText(OldStmt->getLocStart(),
                                    Rewrite.getRangeSize(OldStmt->getSourceRange()),
                                    NewStr);
-    }
-
-    unsigned int FindRangeSize(SourceRange range, bool getCharRange = true) {
-        return FindRangeSize(range.getBegin(), range.getEnd(), getCharRange);
-    }
-
-    unsigned int FindRangeSize(SourceLocation start, SourceLocation end,
-                               bool getCharRange = true) {
-        std::pair<FileID, unsigned int> s = SM->getDecomposedInstantiationLoc(start);
-        std::pair<FileID, unsigned int> e = SM->getDecomposedInstantiationLoc(end);
-
-        unsigned int startOff = s.second;
-        unsigned int endOff = e.second;
-
-        if (getCharRange)
-            endOff += Lexer::MeasureTokenLength(end, *SM, *LO);
-
-        return endOff - startOff;
     }
 
     std::string idCharFilter(llvm::StringRef ref) {
