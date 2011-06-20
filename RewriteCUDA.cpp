@@ -181,6 +181,7 @@ private:
 
     CompilerInstance *CI;
     SourceManager *SM;
+    LangOptions *LO;
     Preprocessor *PP;
 
     Rewriter HostRewrite;
@@ -326,7 +327,55 @@ private:
         }
     }
 
-    std::string RewriteHostExpr(Expr *e) {
+    bool RewriteHostExpr(Expr *e, std::string &newExpr) {
+        if (MemberExpr *me = dyn_cast<MemberExpr>(e)) {
+            //Check base Expr, if DeclRefExpr and a dim3, then rewrite
+            if (DeclRefExpr *dre = dyn_cast<DeclRefExpr>(me->getBase())) {
+                std::string type = dre->getDecl()->getType().getAsString();
+                if (type == "dim3") {
+                    std::string name = me->getMemberDecl()->getNameAsString();
+                    if (name == "x") {
+                        name = "[0]";
+                    }
+                    else if (name == "y") {
+                        name = "[1]";
+                    }
+                    else if (name == "z") {
+                        name = "[2]";
+                    }
+                    newExpr = PrintStmtToString(dre) + name;
+                    return true;
+                }
+                else if (type == "cudaDeviceProp") {
+                    //TODO check what the reference is
+                    //TODO if unsupported, print a warning
+
+                    return false;
+                }
+            }
+        }
+
+        bool ret = false;
+        //TODO check why the length or locations would be wrong
+        //TODO check how to print out macro names (use SM->getInstantiationLoc)
+        unsigned int len = FindRangeSize(e->getSourceRange());
+        newExpr = std::string(SM->getCharacterData(SM->getInstantiationLoc(e->getLocStart())), len);
+
+        //TODO do a DFS, recursing into children, then rewriting this expression
+        //TODO handle normally, not a special case
+        //TODO for children, if rewrite happened, replace old sourcerange?
+        for (Stmt::child_iterator CI = e->child_begin(), CE = e->child_end();
+             CI != CE; ++CI) {
+            std::string s;
+            if (*CI && RewriteHostExpr((Expr *) *CI, s)) {
+                //TODO perform "rewrite"
+                Expr *child = (Expr *) *CI;
+                newExpr.replace(FindRangeSize(e->getLocStart(), child->getLocStart(), false), FindRangeSize(child->getSourceRange()), s);
+                ret = true;
+            }
+        }
+
+        return ret;
     }
 
     void RewriteKernelFunction(FunctionDecl *kernelFunc) {
@@ -646,6 +695,7 @@ private:
             }
             else {
                 //TODO single decl, so rewrite now as before
+                //TODO check the type, if pointertype, rewrite as you have already
                 //Change variable's type to cl_mem
                 TypeLoc tl = var->getTypeSourceInfo()->getTypeLoc();
                 HostRewrite.ReplaceText(tl.getBeginLoc(),
@@ -708,7 +758,7 @@ private:
                 ReplaceStmtWithText(cudaCall, replace, HostRewrite);
             }
             else if (enumString == "cudaMemcpyDeviceToDevice") {
-                //TODO clEnqueueReadBuffer; clEnqueueWriteBuffer
+                //TODO __cu2cl_MemcpyDevToDev
                 ReplaceStmtWithText(cudaCall, "clEnqueueReadBuffer(__cu2cl_CommandQueue, src, CL_TRUE, 0, count, temp, 0, NULL, NULL)", HostRewrite);
                 ReplaceStmtWithText(cudaCall, "clEnqueueWriteBuffer(__cu2cl_CommandQueue, dst, CL_TRUE, 0, count, temp, 0, NULL, NULL)", HostRewrite);
             }
@@ -727,7 +777,7 @@ private:
                 HostKernels += "cl_kernel __cu2cl_Kernel___cu2cl_Memset;\n";
                 UsesCUDAMemset = true;
             }
-            //TODO follow Swan's example of setting via a kernel
+            //Follow Swan's example of setting via a kernel
 
             HostRewrite.ReplaceText(cudaCall->getLocStart(), funcName.length(), "__cu2cl_Memset");
         }
@@ -820,14 +870,14 @@ private:
         LastLoc = tl;
         QualType qt = var->getType();
         std::string type = qt.getAsString();
-        llvm::errs() << type;
+        //llvm::errs() << type;
         while (!tl.getNextTypeLoc().isNull()) {
             tl = tl.getNextTypeLoc();
             qt = tl.getType();
             type = qt.getAsString();
-            llvm::errs() << " -> " << type;
+            //llvm::errs() << " -> " << type;
         }
-        llvm::errs() << "\n";
+        //llvm::errs() << "\n";
 
         if (type == "dim3") {
             //Rewrite to size_t array
@@ -842,13 +892,15 @@ private:
                 for (CXXConstructExpr::arg_iterator i = ce->arg_begin(), e = ce->arg_end();
                      i != e; ++i) {
                     Expr *arg = *i;
+                    std::string s;
                     //TODO replace these prints with Rewrite{Host,Kernel}Expr
                     if (CXXDefaultArgExpr *defArg = dyn_cast<CXXDefaultArgExpr>(arg)) {
-                        args += PrintStmtToString(defArg->getExpr());
+                        RewriteHostExpr(defArg->getExpr(), s);
                     }
                     else {
-                        args += PrintStmtToString(arg);
+                        RewriteHostExpr(arg, s);
                     }
+                    args += s;
                     if (i + 1 != e)
                         args += ", ";
                 }
@@ -1005,7 +1057,7 @@ private:
     std::string PrintStmtToString(Stmt *s) {
         std::string SStr;
         llvm::raw_string_ostream S(SStr);
-        s->printPretty(S, 0, PrintingPolicy(HostRewrite.getLangOpts()));
+        s->printPretty(S, 0, PrintingPolicy(*LO));
         return S.str();
     }
 
@@ -1020,6 +1072,23 @@ private:
         return Rewrite.ReplaceText(OldStmt->getLocStart(),
                                    Rewrite.getRangeSize(OldStmt->getSourceRange()),
                                    NewStr);
+    }
+
+    unsigned int FindRangeSize(SourceRange range, bool getCharRange = true) {
+        return FindRangeSize(range.getBegin(), range.getEnd(), getCharRange);
+    }
+
+    unsigned int FindRangeSize(SourceLocation start, SourceLocation end, bool getCharRange = true) {
+        std::pair<FileID, unsigned int> s = SM->getDecomposedInstantiationLoc(start);
+        std::pair<FileID, unsigned int> e = SM->getDecomposedInstantiationLoc(end);
+
+        unsigned int startOff = s.second;
+        unsigned int endOff = e.second;
+
+        if (getCharRange)
+            endOff += Lexer::MeasureTokenLength(end, *SM, *LO);
+
+        return endOff - startOff;
     }
 
     std::string idCharFilter(llvm::StringRef ref) {
@@ -1041,13 +1110,14 @@ public:
 
     virtual void Initialize(ASTContext &Context) {
         SM = &Context.getSourceManager();
+        LO = &CI->getLangOpts();
         PP = &CI->getPreprocessor();
 
         PP->addPPCallbacks(new RewriteIncludesCallback(this));
 
-        HostRewrite.setSourceMgr(Context.getSourceManager(), Context.getLangOptions());
-        KernelRewrite.setSourceMgr(Context.getSourceManager(), Context.getLangOptions());
-        MainFileID = Context.getSourceManager().getMainFileID();
+        HostRewrite.setSourceMgr(*SM, *LO);
+        KernelRewrite.setSourceMgr(*SM, *LO);
+        MainFileID = SM->getMainFileID();
 
         if (MainFuncName == "")
             MainFuncName = "main";
@@ -1070,6 +1140,9 @@ public:
         IncludingStringH = false;
         UsesCUDADeviceProp = false;
         UsesCUDAMemset = false;
+        UsesCUDAStreamQuery = false;
+        UsesCUDAEventElapsedTime = false;
+        UsesCUDAEventQuery = false;
     }
 
     virtual void HandleTopLevelDecl(DeclGroupRef DG) {
