@@ -142,6 +142,22 @@
     "    return ret;\n" \
     "}\n\n"
 
+#define CL_MALLOC_HOST \
+    "cl_int __cu2cl_MallocHost(void **ptr, size_t size, cl_mem *clMem) {\n" \
+    "    cl_int ret;\n" \
+    "    *clMem = clCreateBuffer(__cu2cl_Context, CL_MEM_READ_WRITE, size, NULL, NULL);\n" \
+    "    *ptr = clEnqueueMapBuffer(__cu2cl_CommandQueue, *clMem, CL_TRUE, CL_MAP_READ | CL_MAP_WRITE, 0, size, 0, NULL, NULL, &ret);\n" \
+    "    return ret;\n" \
+    "}\n\n"
+
+#define CL_FREE_HOST \
+    "cl_int __cu2cl_FreeHost(void *ptr, cl_mem clMem) {\n" \
+    "    cl_int ret;\n" \
+    "    ret = clEnqueueUnmapMemObject(__cu2cl_CommandQueue, clMem, ptr, 0, NULL, NULL);\n" \
+    "    ret |= clReleaseMemObject(clMem);\n" \
+    "    return ret;\n" \
+    "}\n\n"
+
 using namespace clang;
 using namespace llvm::sys::path;
 
@@ -201,6 +217,7 @@ private:
     std::set<DeclGroupRef, cmpDG> CurVarDeclGroups;
     std::set<DeclGroupRef, cmpDG> DeviceMemDGs;
     std::set<VarDecl *> DeviceMemVars;
+    std::set<VarDecl *> HostMemVars;
 
     TypeLoc LastLoc;
 
@@ -229,6 +246,8 @@ private:
     bool UsesCUDAStreamQuery;
     bool UsesCUDAEventElapsedTime;
     bool UsesCUDAEventQuery;
+    bool UsesCUDAMallocHost;
+    bool UsesCUDAFreeHost;
 
     void TraverseStmt(Stmt *e, unsigned int indent) {
         for (unsigned int i = 0; i < indent; i++)
@@ -341,6 +360,74 @@ private:
                     //TODO if unsupported, print a warning
 
                     return false;
+                }
+            }
+        }
+        else if (ExplicitCastExpr *ece = dyn_cast<ExplicitCastExpr>(e)) {
+            TypeLoc tl = ece->getTypeInfoAsWritten()->getTypeLoc();
+            QualType qt = tl.getType();
+            std::string type = qt.getAsString();
+            //llvm::errs() << type;
+            while (!tl.getNextTypeLoc().isNull()) {
+                tl = tl.getNextTypeLoc();
+                qt = tl.getType();
+                type = qt.getAsString();
+                //llvm::errs() << " -> " << type;
+            }
+
+            if (type == "dim3") {
+                HostRewrite.ReplaceText(tl.getBeginLoc(),
+                                        HostRewrite.getRangeSize(tl.getLocalSourceRange()),
+                                        "size_t[3]");
+            }
+            else if (type == "struct cudaDeviceProp") {
+                HostRewrite.ReplaceText(tl.getBeginLoc(),
+                                        HostRewrite.getRangeSize(tl.getLocalSourceRange()),
+                                        "struct clDeviceProp");
+            }
+            else if (type == "cudaStream_t") {
+                HostRewrite.ReplaceText(tl.getBeginLoc(),
+                                        HostRewrite.getRangeSize(tl.getLocalSourceRange()),
+                                        "cl_command_queue");
+            }
+            else if (type == "cudaEvent_t") {
+                HostRewrite.ReplaceText(tl.getBeginLoc(),
+                                        HostRewrite.getRangeSize(tl.getLocalSourceRange()),
+                                        "cl_event");
+            }
+        }
+        else if (SizeOfAlignOfExpr *soe = dyn_cast<SizeOfAlignOfExpr>(e)) {
+            if (soe->isArgumentType()) {
+                TypeLoc tl = soe->getArgumentTypeInfo()->getTypeLoc();
+                QualType qt = tl.getType();
+                std::string type = qt.getAsString();
+                //llvm::errs() << type;
+                while (!tl.getNextTypeLoc().isNull()) {
+                    tl = tl.getNextTypeLoc();
+                    qt = tl.getType();
+                    type = qt.getAsString();
+                    //llvm::errs() << " -> " << type;
+                }
+
+                if (type == "dim3") {
+                    HostRewrite.ReplaceText(tl.getBeginLoc(),
+                                            HostRewrite.getRangeSize(tl.getLocalSourceRange()),
+                                            "size_t[3]");
+                }
+                else if (type == "struct cudaDeviceProp") {
+                    HostRewrite.ReplaceText(tl.getBeginLoc(),
+                                            HostRewrite.getRangeSize(tl.getLocalSourceRange()),
+                                            "struct clDeviceProp");
+                }
+                else if (type == "cudaStream_t") {
+                    HostRewrite.ReplaceText(tl.getBeginLoc(),
+                                            HostRewrite.getRangeSize(tl.getLocalSourceRange()),
+                                            "cl_command_queue");
+                }
+                else if (type == "cudaEvent_t") {
+                    HostRewrite.ReplaceText(tl.getBeginLoc(),
+                                            HostRewrite.getRangeSize(tl.getLocalSourceRange()),
+                                            "cl_event");
                 }
             }
         }
@@ -504,6 +591,7 @@ private:
     }
 
     std::string RewriteKernelExpr(Expr *e) {
+        //TODO implement this like you did host rewrites
     }
 
     bool RewriteCUDACall(CallExpr *cudaCall, std::string &newExpr) {
@@ -568,11 +656,10 @@ private:
         else if (funcName == "cudaStreamCreate") {
             //Replace with clCreateCommandQueue
             Expr *pStream = cudaCall->getArg(0);
-            DeclRefExpr *dr = FindStmt<DeclRefExpr>(pStream);
-            VarDecl *var = dyn_cast<VarDecl>(dr->getDecl());
-            std::string sub = var->getNameAsString() + " = clCreateCommandQueue(__cu2cl_Context, __cu2cl_Device, 0, NULL)";
+            std::string newPStream;
+            RewriteHostExpr(pStream, newPStream);
 
-            newExpr = sub;
+            newExpr = "*" + newPStream + " = clCreateCommandQueue(__cu2cl_Context, __cu2cl_Device, 0, NULL)";
         }
         else if (funcName == "cudaStreamDestroy") {
             //Replace with clReleaseCommandQueue
@@ -627,17 +714,20 @@ private:
             newExpr = "clReleaseEvent(" + newEvent + ")";
         }
         else if (funcName == "cudaEventElapsedTime") {
-            //TODO enable CL_QUEUE_PROFILING_ENABLE on the associated cl_command_queue
             //Replace with __cu2cl_EventElapsedTime
             if (!UsesCUDAEventElapsedTime) {
                 HostFunctions += CL_EVENT_ELAPSED_TIME;
                 UsesCUDAEventElapsedTime = true;
             }
 
-            Expr *event = cudaCall->getArg(0);
-            std::string newEvent;
-            RewriteHostExpr(event, newEvent);
-            newExpr = "clReleaseEvent(" + newEvent + ")";
+            Expr *ms = cudaCall->getArg(0);
+            Expr *start = cudaCall->getArg(1);
+            Expr *end = cudaCall->getArg(2);
+            std::string newMS, newStart, newEnd;
+            RewriteHostExpr(ms, newMS);
+            RewriteHostExpr(start, newStart);
+            RewriteHostExpr(end, newEnd);
+            newExpr = "__cu2cl_EventElapsedTime(" + newMS + ", " + newStart + ", " + newEnd + ")";
         }
         else if (funcName == "cudaEventQuery") {
             //Replace with __cu2cl_EventQuery
@@ -677,6 +767,31 @@ private:
         }
 
         //Memory Management
+        else if (funcName == "cudaFree") {
+            Expr *devPtr = cudaCall->getArg(0);
+            DeclRefExpr *dr = FindStmt<DeclRefExpr>(devPtr);
+            llvm::StringRef varName = dr->getDecl()->getName();
+
+            //Replace with clReleaseMemObject
+            newExpr = "clReleaseMemObject(" + varName.str() + ")";
+        }
+        else if (funcName == "cudaFreeHost") {
+            //Replace with __cu2cl_FreeHost
+            if (!UsesCUDAFreeHost) {
+                HostFunctions += CL_FREE_HOST;
+                UsesCUDAFreeHost = true;
+            }
+
+            Expr *ptr = cudaCall->getArg(0);
+            std::string newPtr;
+            RewriteHostExpr(ptr, newPtr);
+
+            DeclRefExpr *dr = FindStmt<DeclRefExpr>(ptr);
+            VarDecl *var = dyn_cast<VarDecl>(dr->getDecl());
+            llvm::StringRef varName = var->getName();
+
+            newExpr = "__cu2cl_FreeHost(" + newPtr + ", __cu2cl_Mem_" + varName.str() + ")";
+        }
         else if (funcName == "cudaMalloc") {
             Expr *devPtr = cudaCall->getArg(0);
             Expr *size = cudaCall->getArg(1);
@@ -710,18 +825,34 @@ private:
             //Add var to DeviceMemVars
             DeviceMemVars.insert(var);
         }
-        else if (funcName == "cudaFree") {
-            Expr *devPtr = cudaCall->getArg(0);
-            DeclRefExpr *dr = FindStmt<DeclRefExpr>(devPtr);
-            llvm::StringRef varName = dr->getDecl()->getName();
-
-            //Replace with clReleaseMemObject
-            newExpr = "clReleaseMemObject(" + varName.str() + ")";
-        }
         else if (funcName == "cudaMallocHost") {
-            //TODO implement
+            //Replace with __cu2cl_MallocHost
+            if (!UsesCUDAMallocHost) {
+                HostFunctions += CL_MALLOC_HOST;
+                UsesCUDAMallocHost = true;
+            }
+
+            Expr *ptr = cudaCall->getArg(0);
+            Expr *size = cudaCall->getArg(1);
+            std::string newPtr, newSize;
+            RewriteHostExpr(ptr, newPtr);
+            RewriteHostExpr(size, newSize);
+
+            DeclRefExpr *dr = FindStmt<DeclRefExpr>(ptr);
+            VarDecl *var = dyn_cast<VarDecl>(dr->getDecl());
+            llvm::StringRef varName = var->getName();
+
+            newExpr = "__cu2cl_MallocHost(" + newPtr + ", " + newSize + ", &__cu2cl_Mem_" + varName.str() + ")";
+
+            if (HostMemVars.find(var) == HostMemVars.end()) {
+                //Create new cl_mem for ptr
+                HostGlobalVars += "cl_mem __cu2cl_Mem_" + varName.str() + ";\n";
+                //Add var to HostMemVars
+                HostMemVars.insert(var);
+            }
         }
         else if (funcName == "cudaMemcpy") {
+            //TODO support offsets
             //Inspect kind of memcpy and rewrite accordingly
             Expr *dst = cudaCall->getArg(0);
             Expr *src = cudaCall->getArg(1);
@@ -756,14 +887,73 @@ private:
                 newExpr = "clEnqueueReadBuffer(__cu2cl_CommandQueue, " + newSrc + ", CL_TRUE, 0, " + newCount + ", " + newDst + ", 0, NULL, NULL)";
             }
             else if (enumString == "cudaMemcpyDeviceToDevice") {
-                //TODO __cu2cl_MemcpyDevToDev
+                //TODO implement __cu2cl_MemcpyDevToDev
                 ReplaceStmtWithText(cudaCall, "clEnqueueReadBuffer(__cu2cl_CommandQueue, src, CL_TRUE, 0, count, temp, 0, NULL, NULL)", HostRewrite);
                 ReplaceStmtWithText(cudaCall, "clEnqueueWriteBuffer(__cu2cl_CommandQueue, dst, CL_TRUE, 0, count, temp, 0, NULL, NULL)", HostRewrite);
             }
             else {
                 //TODO Use diagnostics to print pretty errors
-                llvm::errs() << "Unsupported cudaMemcpy type: " << enumString << "\n";
+                llvm::errs() << "Unsupported cudaMemcpyKind: " << enumString << "\n";
             }
+        }
+        else if (funcName == "cudaMemcpyAsync") {
+            //TODO support offsets
+            //Inspect kind of memcpy and rewrite accordingly
+            Expr *dst = cudaCall->getArg(0);
+            Expr *src = cudaCall->getArg(1);
+            Expr *count = cudaCall->getArg(2);
+            Expr *kind = cudaCall->getArg(3);
+            Expr *stream = cudaCall->getArg(4);
+            std::string newDst, newSrc, newCount, newStream;
+            RewriteHostExpr(dst, newDst);
+            RewriteHostExpr(src, newSrc);
+            RewriteHostExpr(count, newCount);
+            RewriteHostExpr(stream, newStream);
+            if (newStream == "0")
+                newStream = "__cu2cl_CommandQueue";
+
+            //TODO simply dyn_cast to the DeclRefExpr here?
+            DeclRefExpr *dr = FindStmt<DeclRefExpr>(kind);
+            EnumConstantDecl *enumConst = dyn_cast<EnumConstantDecl>(dr->getDecl());
+            std::string enumString = enumConst->getNameAsString();
+
+            if (enumString == "cudaMemcpyHostToHost") {
+                //standard memcpy
+                //Make sure to include <string.h>
+                if (!IncludingStringH) {
+                    HostIncludes += "#include <string.h>\n";
+                    IncludingStringH = true;
+                }
+
+                //dst and src are HostMemVars, so regular memcpy can be used
+                newExpr = "memcpy(" + newDst + ", " + newSrc + ", " + newCount + ")";
+            }
+            else if (enumString == "cudaMemcpyHostToDevice") {
+                //clEnqueueWriteBuffer, src is HostMemVar
+                dr = FindStmt<DeclRefExpr>(src);
+                VarDecl *var = dyn_cast<VarDecl>(dr->getDecl());
+                llvm::StringRef varName = var->getName();
+                newExpr = "clEnqueueWriteBuffer(" + newStream + ", " + newDst + ", CL_FALSE, 0, " + newCount + ", __cu2cl_Mem_" + varName.str() + ", 0, NULL, NULL)";
+            }
+            else if (enumString == "cudaMemcpyDeviceToHost") {
+                //clEnqueueReadBuffer, dst is HostMemVar
+                dr = FindStmt<DeclRefExpr>(dst);
+                VarDecl *var = dyn_cast<VarDecl>(dr->getDecl());
+                llvm::StringRef varName = var->getName();
+                newExpr = "clEnqueueReadBuffer(" + newStream + ", " + newSrc + ", CL_FALSE, 0, " + newCount + ", __cu2cl_Mem_" + varName.str() + ", 0, NULL, NULL)";
+            }
+            else if (enumString == "cudaMemcpyDeviceToDevice") {
+                //TODO implement __cu2cl_MemcpyDevToDev
+                ReplaceStmtWithText(cudaCall, "clEnqueueReadBuffer(__cu2cl_CommandQueue, src, CL_TRUE, 0, count, temp, 0, NULL, NULL)", HostRewrite);
+                ReplaceStmtWithText(cudaCall, "clEnqueueWriteBuffer(__cu2cl_CommandQueue, dst, CL_TRUE, 0, count, temp, 0, NULL, NULL)", HostRewrite);
+            }
+            else {
+                //TODO Use diagnostics to print pretty errors
+                llvm::errs() << "Unsupported cudaMemcpyKind: " << enumString << "\n";
+            }
+        }
+        else if (funcName == "cudaMemcpyToSymbol") {
+            //TODO implement
         }
         else if (funcName == "cudaMemset") {
             if (!UsesCUDAMemset) {
@@ -884,7 +1074,7 @@ private:
         if (!LastLoc.isNull() && tl.getBeginLoc() == LastLoc.getBeginLoc())
             return;
         LastLoc = tl;
-        QualType qt = var->getType();
+        QualType qt = tl.getType();
         std::string type = qt.getAsString();
         //llvm::errs() << type;
         while (!tl.getNextTypeLoc().isNull()) {
@@ -902,6 +1092,9 @@ private:
                                 HostRewrite.getRangeSize(tl.getLocalSourceRange()),
                                 "size_t");
             if (var->hasInit()) {
+                //TODO move this to RewriteHostExpr
+                //TODO pull the check outside of this, make it general for all VarDecls
+                //TODO support other types of inits (dim3 a = dim3(1, 2, 3))
                 //Rewrite initial value
                 CXXConstructExpr *ce = (CXXConstructExpr *) var->getInit();
                 std::string args = " = {";
@@ -944,16 +1137,35 @@ private:
             HostRewrite.ReplaceText(tl.getBeginLoc(),
                                     HostRewrite.getRangeSize(tl.getLocalSourceRange()),
                                     "__cu2cl_DeviceProp");
+
+            if (var->hasInit()) {
+                Expr *e = var->getInit();
+                std::string s;
+                if (RewriteHostExpr(e, s))
+                    ReplaceStmtWithText(e, s, HostRewrite);
+            }
         }
         else if (type == "cudaStream_t") {
             HostRewrite.ReplaceText(tl.getBeginLoc(),
                                     HostRewrite.getRangeSize(tl.getLocalSourceRange()),
                                     "cl_command_queue");
+            if (var->hasInit()) {
+                Expr *e = var->getInit();
+                std::string s;
+                if (RewriteHostExpr(e, s))
+                    ReplaceStmtWithText(e, s, HostRewrite);
+            }
         }
         else if (type == "cudaEvent_t") {
             HostRewrite.ReplaceText(tl.getBeginLoc(),
                                     HostRewrite.getRangeSize(tl.getLocalSourceRange()),
                                     "cl_event");
+            if (var->hasInit()) {
+                Expr *e = var->getInit();
+                std::string s;
+                if (RewriteHostExpr(e, s))
+                    ReplaceStmtWithText(e, s, HostRewrite);
+            }
         }
         //TODO check other CUDA-only types to rewrite
     }
