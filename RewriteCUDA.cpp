@@ -129,7 +129,7 @@
     "    cl_ulong s, e;\n" \
     "    float fs, fe;\n" \
     "    ret |= clGetEventProfilingInfo(start, CL_PROFILING_COMMAND_END, sizeof(cl_ulong), &s, NULL);\n" \
-    "    ret |= clGetEventProfilingInfo(e, CL_PROFILING_COMMAND_END, sizeof(cl_ulong), &e, NULL);\n" \
+    "    ret |= clGetEventProfilingInfo(end, CL_PROFILING_COMMAND_END, sizeof(cl_ulong), &e, NULL);\n" \
     "    s = e - s;\n" \
     "    *ms = ((float) s)/1000000.0;\n" \
     "    return ret;\n" \
@@ -457,6 +457,8 @@ private:
             }
         }
         else if (CXXTemporaryObjectExpr *cte = dyn_cast<CXXTemporaryObjectExpr>(e)) {
+            //TODO need to know if in constructor or not... if not in
+            //constructor, then need to assign each separately
             CXXConstructorDecl *ccd = cte->getConstructor();
             CXXRecordDecl *crd = ccd->getParent();
             const Type *t = crd->getTypeForDecl();
@@ -711,7 +713,7 @@ private:
             Expr *count = cudaCall->getArg(0);
             std::string newCount;
             RewriteHostExpr(count, newCount);
-            newExpr = "clGetDeviceIDs(__cu2cl_Platform, CL_DEVICE_TYPE_GPU, 0, NULL, " + newCount + ")";
+            newExpr = "clGetDeviceIDs(__cu2cl_Platform, CL_DEVICE_TYPE_GPU, 0, NULL, (cl_uint *) " + newCount + ")";
         }
         else if (funcName == "cudaSetDevice") {
             //Replace with clCreateContext and clCreateCommandQueue
@@ -1010,6 +1012,7 @@ private:
                 newExpr = "memcpy(" + newDst + ", " + newSrc + ", " + newCount + ")";
             }
             else if (enumString == "cudaMemcpyHostToDevice") {
+                //TODO figure out if you need the cl_mems of HostMemVars
                 //clEnqueueWriteBuffer, src is HostMemVar
                 dr = FindStmt<DeclRefExpr>(src);
                 VarDecl *var = dyn_cast<VarDecl>(dr->getDecl());
@@ -1017,6 +1020,7 @@ private:
                 newExpr = "clEnqueueWriteBuffer(" + newStream + ", " + newDst + ", CL_FALSE, 0, " + newCount + ", __cu2cl_Mem_" + varName.str() + ", 0, NULL, NULL)";
             }
             else if (enumString == "cudaMemcpyDeviceToHost") {
+                //TODO figure out if you need the cl_mems of HostMemVars
                 //clEnqueueReadBuffer, dst is HostMemVar
                 dr = FindStmt<DeclRefExpr>(dst);
                 VarDecl *var = dyn_cast<VarDecl>(dr->getDecl());
