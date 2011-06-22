@@ -325,10 +325,16 @@ private:
     }
 
     bool RewriteHostExpr(Expr *e, std::string &newExpr) {
+        //Return value specifies whether or not a rewrite occurred
         if (e->getSourceRange().isInvalid())
             return false;
 
-        //Return value determines whether or not a rewrite happened
+        //Rewriter used for rewriting subexpressions
+        Rewriter exprRewriter(*SM, *LO);
+        //Instantiation locations are used to capture macros
+        SourceRange realRange(SM->getInstantiationLoc(e->getLocStart()),
+                              SM->getInstantiationLoc(e->getLocEnd()));
+
         if (CUDAKernelCallExpr *kce = dyn_cast<CUDAKernelCallExpr>(e)) {
             newExpr = RewriteCUDAKernelCall(kce);
             return true;
@@ -364,79 +370,164 @@ private:
             }
         }
         else if (ExplicitCastExpr *ece = dyn_cast<ExplicitCastExpr>(e)) {
-            TypeLoc tl = ece->getTypeInfoAsWritten()->getTypeLoc();
-            QualType qt = tl.getType();
-            std::string type = qt.getAsString();
-            //llvm::errs() << type;
+            bool ret = true;
+
+            TypeLoc origTL = ece->getTypeInfoAsWritten()->getTypeLoc();
+            TypeLoc tl = origTL;
             while (!tl.getNextTypeLoc().isNull()) {
                 tl = tl.getNextTypeLoc();
-                qt = tl.getType();
-                type = qt.getAsString();
-                //llvm::errs() << " -> " << type;
             }
+            QualType qt = tl.getType();
+            std::string type = qt.getAsString();
 
             if (type == "dim3") {
-                HostRewrite.ReplaceText(tl.getBeginLoc(),
-                                        HostRewrite.getRangeSize(tl.getLocalSourceRange()),
-                                        "size_t[3]");
+                if (origTL.getTypePtr()->isPointerType())
+                exprRewriter.ReplaceText(
+                        tl.getBeginLoc(),
+                        exprRewriter.getRangeSize(tl.getLocalSourceRange()),
+                        "size_t *");
+                else
+                    exprRewriter.ReplaceText(
+                            tl.getBeginLoc(),
+                            exprRewriter.getRangeSize(tl.getLocalSourceRange()),
+                            "size_t[3]");
             }
             else if (type == "struct cudaDeviceProp") {
-                HostRewrite.ReplaceText(tl.getBeginLoc(),
-                                        HostRewrite.getRangeSize(tl.getLocalSourceRange()),
-                                        "struct clDeviceProp");
+                exprRewriter.ReplaceText(tl.getBeginLoc(),
+                                        exprRewriter.getRangeSize(tl.getLocalSourceRange()),
+                                        "struct __cu2cl_DeviceProp");
             }
             else if (type == "cudaStream_t") {
-                HostRewrite.ReplaceText(tl.getBeginLoc(),
-                                        HostRewrite.getRangeSize(tl.getLocalSourceRange()),
+                exprRewriter.ReplaceText(tl.getBeginLoc(),
+                                        exprRewriter.getRangeSize(tl.getLocalSourceRange()),
                                         "cl_command_queue");
             }
             else if (type == "cudaEvent_t") {
-                HostRewrite.ReplaceText(tl.getBeginLoc(),
-                                        HostRewrite.getRangeSize(tl.getLocalSourceRange()),
+                exprRewriter.ReplaceText(tl.getBeginLoc(),
+                                        exprRewriter.getRangeSize(tl.getLocalSourceRange()),
                                         "cl_event");
             }
+            else {
+                ret = false;
+            }
+
+            //Rewrite subexpression
+            std::string s;
+            if (RewriteHostExpr(ece->getSubExpr(), s)) {
+                ReplaceStmtWithText(ece->getSubExpr(), s, exprRewriter);
+                ret = true;
+            }
+            newExpr = exprRewriter.getRewrittenText(realRange);
+            return ret;
         }
         else if (SizeOfAlignOfExpr *soe = dyn_cast<SizeOfAlignOfExpr>(e)) {
             if (soe->isArgumentType()) {
+                bool ret = true;
                 TypeLoc tl = soe->getArgumentTypeInfo()->getTypeLoc();
-                QualType qt = tl.getType();
-                std::string type = qt.getAsString();
-                //llvm::errs() << type;
                 while (!tl.getNextTypeLoc().isNull()) {
                     tl = tl.getNextTypeLoc();
-                    qt = tl.getType();
-                    type = qt.getAsString();
-                    //llvm::errs() << " -> " << type;
                 }
+                QualType qt = tl.getType();
+                std::string type = qt.getAsString();
 
                 if (type == "dim3") {
-                    HostRewrite.ReplaceText(tl.getBeginLoc(),
-                                            HostRewrite.getRangeSize(tl.getLocalSourceRange()),
+                    exprRewriter.ReplaceText(tl.getBeginLoc(),
+                                            exprRewriter.getRangeSize(tl.getLocalSourceRange()),
                                             "size_t[3]");
                 }
                 else if (type == "struct cudaDeviceProp") {
-                    HostRewrite.ReplaceText(tl.getBeginLoc(),
-                                            HostRewrite.getRangeSize(tl.getLocalSourceRange()),
-                                            "struct clDeviceProp");
+                    exprRewriter.ReplaceText(tl.getBeginLoc(),
+                                            exprRewriter.getRangeSize(tl.getLocalSourceRange()),
+                                            "struct __cu2cl_DeviceProp");
                 }
                 else if (type == "cudaStream_t") {
-                    HostRewrite.ReplaceText(tl.getBeginLoc(),
-                                            HostRewrite.getRangeSize(tl.getLocalSourceRange()),
+                    exprRewriter.ReplaceText(tl.getBeginLoc(),
+                                            exprRewriter.getRangeSize(tl.getLocalSourceRange()),
                                             "cl_command_queue");
                 }
                 else if (type == "cudaEvent_t") {
-                    HostRewrite.ReplaceText(tl.getBeginLoc(),
-                                            HostRewrite.getRangeSize(tl.getLocalSourceRange()),
+                    exprRewriter.ReplaceText(tl.getBeginLoc(),
+                                            exprRewriter.getRangeSize(tl.getLocalSourceRange()),
                                             "cl_event");
                 }
+                else {
+                    ret = false;
+                }
+                newExpr = exprRewriter.getRewrittenText(realRange);
+                return ret;
+            }
+        }
+        else if (CXXTemporaryObjectExpr *cte = dyn_cast<CXXTemporaryObjectExpr>(e)) {
+            CXXConstructorDecl *ccd = cte->getConstructor();
+            CXXRecordDecl *crd = ccd->getParent();
+            const Type *t = crd->getTypeForDecl();
+            QualType qt = t->getCanonicalTypeInternal();
+            std::string type = qt.getAsString();
+
+            if (type == "struct dim3") {
+                std::string args = "{";
+                for (CXXConstructExpr::arg_iterator i = cte->arg_begin(),
+                     e = cte->arg_end(); i != e; ++i) {
+                    Expr *arg = *i;
+                    std::string s;
+                    if (CXXDefaultArgExpr *defArg = dyn_cast<CXXDefaultArgExpr>(arg)) {
+                        RewriteHostExpr(defArg->getExpr(), s);
+                    }
+                    else {
+                        RewriteHostExpr(arg, s);
+                    }
+                    args += s;
+                    if (i + 1 != e)
+                        args += ", ";
+                }
+                args += "}";
+                newExpr = args;
+                return true;
+            }
+        }
+        else if (CXXConstructExpr *cce = dyn_cast<CXXConstructExpr>(e)) {
+            CXXConstructorDecl *ccd = cce->getConstructor();
+            CXXRecordDecl *crd = ccd->getParent();
+            const Type *t = crd->getTypeForDecl();
+            QualType qt = t->getCanonicalTypeInternal();
+            std::string type = qt.getAsString();
+
+            if (type == "struct dim3") {
+                if (cce->getNumArgs() == 1) {
+                    //Rewrite subexpression
+                    bool ret = false;
+                    std::string s;
+                    if (RewriteHostExpr(cce->getArg(0), s)) {
+                        ReplaceStmtWithText(cce->getArg(0), s, exprRewriter);
+                        ret = true;
+                    }
+                    newExpr = exprRewriter.getRewrittenText(realRange);
+                    return ret;
+                }
+                else {
+                    std::string args = " = {";
+                    for (CXXConstructExpr::arg_iterator i = cce->arg_begin(),
+                         e = cce->arg_end(); i != e; ++i) {
+                        Expr *arg = *i;
+                        std::string s;
+                        if (CXXDefaultArgExpr *defArg = dyn_cast<CXXDefaultArgExpr>(arg)) {
+                            RewriteHostExpr(defArg->getExpr(), s);
+                        }
+                        else {
+                            RewriteHostExpr(arg, s);
+                        }
+                        args += s;
+                        if (i + 1 != e)
+                            args += ", ";
+                    }
+                    args += "}";
+                    newExpr = args;
+                }
+                return true;
             }
         }
 
         bool ret = false;
-        Rewriter exprRewriter(*SM, *LO);
-        //Instantiation locations are used to capture macros
-        SourceRange realRange(SM->getInstantiationLoc(e->getLocStart()), SM->getInstantiationLoc(e->getLocEnd()));
-
         //Do a DFS, recursing into children, then rewriting this expression
         //if rewrite happened, replace text at old sourcerange
         for (Stmt::child_iterator CI = e->child_begin(), CE = e->child_end();
@@ -450,7 +541,6 @@ private:
             }
         }
         newExpr = exprRewriter.getRewrittenText(realRange);
-
         return ret;
     }
 
@@ -1069,105 +1159,91 @@ private:
     }
 
     void RewriteVarDecl(VarDecl *var) {
-        //TODO either break into this and RewriteConstructor, or put flag in that allows constructors to be rewritten (i.e. dim3)
-        TypeLoc tl = var->getTypeSourceInfo()->getTypeLoc();
-        if (!LastLoc.isNull() && tl.getBeginLoc() == LastLoc.getBeginLoc())
-            return;
-        LastLoc = tl;
-        QualType qt = tl.getType();
-        std::string type = qt.getAsString();
-        //llvm::errs() << type;
+        TypeLoc origTL = var->getTypeSourceInfo()->getTypeLoc();
+
+        TypeLoc tl = origTL;
         while (!tl.getNextTypeLoc().isNull()) {
             tl = tl.getNextTypeLoc();
-            qt = tl.getType();
-            type = qt.getAsString();
-            //llvm::errs() << " -> " << type;
         }
-        //llvm::errs() << "\n";
+        QualType qt = tl.getType();
+        std::string type = qt.getAsString();
 
-        if (type == "dim3") {
-            //Rewrite to size_t array
-            //TODO rewrite statement as a whole with a new string
-            HostRewrite.ReplaceText(tl.getBeginLoc(),
-                                HostRewrite.getRangeSize(tl.getLocalSourceRange()),
-                                "size_t");
-            if (var->hasInit()) {
-                //TODO move this to RewriteHostExpr
-                //TODO pull the check outside of this, make it general for all VarDecls
-                //TODO support other types of inits (dim3 a = dim3(1, 2, 3))
-                //Rewrite initial value
-                CXXConstructExpr *ce = (CXXConstructExpr *) var->getInit();
-                std::string args = " = {";
-                for (CXXConstructExpr::arg_iterator i = ce->arg_begin(), e = ce->arg_end();
-                     i != e; ++i) {
-                    Expr *arg = *i;
-                    std::string s;
-                    //TODO replace these prints with Rewrite{Host,Kernel}Expr
-                    if (CXXDefaultArgExpr *defArg = dyn_cast<CXXDefaultArgExpr>(arg)) {
-                        RewriteHostExpr(defArg->getExpr(), s);
-                    }
-                    else {
-                        RewriteHostExpr(arg, s);
-                    }
-                    args += s;
-                    if (i + 1 != e)
-                        args += ", ";
-                }
-                args += "}";
-                SourceRange parenRange = ce->getParenRange();
-                if (parenRange.isValid()) {
-                    HostRewrite.ReplaceText(parenRange.getBegin(),
-                                        HostRewrite.getRangeSize(parenRange),
-                                        args);
-                    HostRewrite.InsertTextBefore(parenRange.getBegin(), "[3]");
-                }
-                else {
-                    HostRewrite.InsertTextAfter(PP->getLocForEndOfToken(var->getLocEnd()), "[3]");
-                    HostRewrite.InsertTextAfter(PP->getLocForEndOfToken(var->getLocEnd()),
-                                            args);
-                }
+        //Rewrite var type
+        if (LastLoc.isNull() || origTL.getBeginLoc() != LastLoc.getBeginLoc()) {
+            LastLoc = origTL;
+            if (type == "dim3") {
+                //Rewrite to size_t[3] array
+                HostRewrite.ReplaceText(
+                        tl.getBeginLoc(),
+                        HostRewrite.getRangeSize(tl.getLocalSourceRange()),
+                        "size_t");
             }
+            else if (type == "struct cudaDeviceProp") {
+                if (!UsesCUDADeviceProp) {
+                    HostDecls += CL_DEVICE_PROP;
+                    HostFunctions += CL_GET_DEVICE_PROPS;
+                    UsesCUDADeviceProp = true;
+                }
+                HostRewrite.ReplaceText(
+                        tl.getBeginLoc(),
+                        HostRewrite.getRangeSize(tl.getLocalSourceRange()),
+                        "__cu2cl_DeviceProp");
+            }
+            else if (type == "cudaStream_t") {
+                HostRewrite.ReplaceText(
+                        tl.getBeginLoc(),
+                        HostRewrite.getRangeSize(tl.getLocalSourceRange()),
+                        "cl_command_queue");
+            }
+            else if (type == "cudaEvent_t") {
+                HostRewrite.ReplaceText(
+                        tl.getBeginLoc(),
+                        HostRewrite.getRangeSize(tl.getLocalSourceRange()),
+                        "cl_event");
+            }
+            //TODO check other CUDA-only types to rewrite
         }
-        else if (type == "struct cudaDeviceProp") {
-            if (!UsesCUDADeviceProp) {
-                HostDecls += CL_DEVICE_PROP;
-                HostFunctions += CL_GET_DEVICE_PROPS;
-                UsesCUDADeviceProp = true;
-            }
-            HostRewrite.ReplaceText(tl.getBeginLoc(),
-                                    HostRewrite.getRangeSize(tl.getLocalSourceRange()),
-                                    "__cu2cl_DeviceProp");
 
-            if (var->hasInit()) {
-                Expr *e = var->getInit();
-                std::string s;
-                if (RewriteHostExpr(e, s))
+        //Rewrite initial value
+        if (var->hasInit()) {
+            Expr *e = var->getInit();
+            std::string s;
+            if (RewriteHostExpr(e, s)) {
+                //Special cases for dim3s
+                if (type == "dim3") {
+                    //TODO fix case of dim3 c = b;
+                    CXXConstructExpr *cce = dyn_cast<CXXConstructExpr>(e);
+                    if (cce && cce->getNumArgs() > 1) {
+                        SourceRange parenRange = cce->getParenRange();
+                        if (parenRange.isValid()) {
+                            HostRewrite.ReplaceText(
+                                    parenRange.getBegin(),
+                                    HostRewrite.getRangeSize(parenRange),
+                                    s);
+                        }
+                        else {
+                            HostRewrite.InsertTextAfter(
+                                    PP->getLocForEndOfToken(var->getLocation()),
+                                    s);
+                        }
+                    }
+                    else
+                        ReplaceStmtWithText(e, s, HostRewrite);
+
+                    //Add [3]/* to end/start of var identifier
+                    if (origTL.getTypePtr()->isPointerType())
+                        HostRewrite.InsertTextBefore(
+                                var->getLocation(),
+                                "*");
+                    else
+                        HostRewrite.InsertTextBefore(
+                                PP->getLocForEndOfToken(var->getLocation()),
+                                "[3]");
+                }
+                else
                     ReplaceStmtWithText(e, s, HostRewrite);
             }
         }
-        else if (type == "cudaStream_t") {
-            HostRewrite.ReplaceText(tl.getBeginLoc(),
-                                    HostRewrite.getRangeSize(tl.getLocalSourceRange()),
-                                    "cl_command_queue");
-            if (var->hasInit()) {
-                Expr *e = var->getInit();
-                std::string s;
-                if (RewriteHostExpr(e, s))
-                    ReplaceStmtWithText(e, s, HostRewrite);
-            }
-        }
-        else if (type == "cudaEvent_t") {
-            HostRewrite.ReplaceText(tl.getBeginLoc(),
-                                    HostRewrite.getRangeSize(tl.getLocalSourceRange()),
-                                    "cl_event");
-            if (var->hasInit()) {
-                Expr *e = var->getInit();
-                std::string s;
-                if (RewriteHostExpr(e, s))
-                    ReplaceStmtWithText(e, s, HostRewrite);
-            }
-        }
-        //TODO check other CUDA-only types to rewrite
     }
 
     void RewriteAttr(std::string attr, SourceLocation loc, Rewriter &Rewrite) {
