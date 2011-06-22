@@ -279,9 +279,8 @@ private:
         //Remove from KernelRewrite
         RemoveFunction(hostFunc, KernelRewrite);
         //Rewrite __host__ attribute
-        if (hostFunc->hasAttr<CUDAHostAttr>()) {
-            SourceLocation loc = FindAttr(hostFunc->getLocStart(), "__host__");
-            RewriteAttr("__host__", loc, HostRewrite);
+        if (CUDAHostAttr *attr = hostFunc->getAttr<CUDAHostAttr>()) {
+            RewriteCUDAAttr(attr, HostRewrite);
         }
         if (Stmt *body = hostFunc->getBody()) {
             //TraverseStmt(body, 0);
@@ -556,23 +555,21 @@ private:
         HostKernels += "cl_kernel __cu2cl_Kernel_" + kernelFunc->getName().str() + ";\n";
 
         //Rewrite kernel attributes
-        if (kernelFunc->hasAttr<CUDAGlobalAttr>()) {
-            SourceLocation loc = FindAttr(kernelFunc->getLocStart(), "__global__");
-            RewriteAttr("__global__", loc, KernelRewrite);
+        //TODO if have host, remove the attribute??
+        if (CUDAGlobalAttr *attr = kernelFunc->getAttr<CUDAGlobalAttr>()) {
+            RewriteCUDAAttr(attr, KernelRewrite);
             if (hasHost)
-                RewriteAttr("__global__", loc, HostRewrite);
+                RewriteCUDAAttr(attr, HostRewrite);
         }
-        if (kernelFunc->hasAttr<CUDADeviceAttr>()) {
-            SourceLocation loc = FindAttr(kernelFunc->getLocStart(), "__device__");
-            RewriteAttr("__device__", loc, KernelRewrite);
+        if (CUDADeviceAttr *attr = kernelFunc->getAttr<CUDADeviceAttr>()) {
+            RewriteCUDAAttr(attr, KernelRewrite);
             if (hasHost)
-                RewriteAttr("__device__", loc, HostRewrite);
+                RewriteCUDAAttr(attr, HostRewrite);
         }
-        if (kernelFunc->hasAttr<CUDAHostAttr>()) {
-            SourceLocation loc = FindAttr(kernelFunc->getLocStart(), "__host__");
-            RewriteAttr("__host__", loc, KernelRewrite);
+        if (CUDAHostAttr *attr = kernelFunc->getAttr<CUDAHostAttr>()) {
+            RewriteCUDAAttr(attr, KernelRewrite);
             if (hasHost)
-                RewriteAttr("__host__", loc, HostRewrite);
+                RewriteCUDAAttr(attr, HostRewrite);
         }
 
         //Rewrite arguments
@@ -590,17 +587,14 @@ private:
     }
 
     void RewriteKernelParam(ParmVarDecl *parmDecl) {
-        if (parmDecl->hasAttr<CUDADeviceAttr>()) {
-            SourceLocation loc = FindAttr(parmDecl->getLocStart(), "__device__");
-            RewriteAttr("__device__", loc, KernelRewrite);
+        if (CUDADeviceAttr *attr = parmDecl->getAttr<CUDADeviceAttr>()) {
+            RewriteCUDAAttr(attr, KernelRewrite);
         }
-        else if (parmDecl->hasAttr<CUDAConstantAttr>()) {
-            SourceLocation loc = FindAttr(parmDecl->getLocStart(), "__constant__");
-            RewriteAttr("__constant__", loc, KernelRewrite);
+        else if (CUDAConstantAttr *attr = parmDecl->getAttr<CUDAConstantAttr>()) {
+            RewriteCUDAAttr(attr, KernelRewrite);
         }
-        else if (parmDecl->hasAttr<CUDASharedAttr>()) {
-            SourceLocation loc = FindAttr(parmDecl->getLocStart(), "__shared__");
-            RewriteAttr("__shared__", loc, KernelRewrite);
+        else if (CUDASharedAttr *attr = parmDecl->getAttr<CUDASharedAttr>()) {
+            RewriteCUDAAttr(attr, KernelRewrite);
         }
         else if (parmDecl->getOriginalType().getTypePtr()->isPointerType()) {
             KernelRewrite.InsertTextBefore(
@@ -662,17 +656,14 @@ private:
             }
             for (DeclGroupRef::iterator i = DG.begin(), e = DG.end(); i != e; ++i) {
                 if (VarDecl *vd = dyn_cast<VarDecl>(*i)) {
-                    if (vd->hasAttr<CUDADeviceAttr>()) {
-                        SourceLocation loc = FindAttr(vd->getLocStart(), "__device__");
-                        RewriteAttr("__device__", loc, KernelRewrite);
+                    if (CUDADeviceAttr *attr = vd->getAttr<CUDADeviceAttr>()) {
+                        RewriteCUDAAttr(attr, KernelRewrite);
                     }
-                    else if (vd->hasAttr<CUDAConstantAttr>()) {
-                        SourceLocation loc = FindAttr(vd->getLocStart(), "__constant__");
-                        RewriteAttr("__constant__", loc, KernelRewrite);
+                    else if (CUDAConstantAttr *attr = vd->getAttr<CUDAConstantAttr>()) {
+                        RewriteCUDAAttr(attr, KernelRewrite);
                     }
-                    else if (vd->hasAttr<CUDASharedAttr>()) {
-                        SourceLocation loc = FindAttr(vd->getLocStart(), "__shared__");
-                        RewriteAttr("__shared__", loc, KernelRewrite);
+                    else if (CUDASharedAttr *attr = vd->getAttr<CUDASharedAttr>()) {
+                        RewriteCUDAAttr(attr, KernelRewrite);
                     }
                 }
                 //TODO other non-top level declarations??
@@ -1246,40 +1237,31 @@ private:
         }
     }
 
-    void RewriteAttr(std::string attr, SourceLocation loc, Rewriter &Rewrite) {
+    void RewriteCUDAAttr(Attr *attr, Rewriter &Rewrite) {
         std::string replace;
-        if (attr == "__global__") {
-            replace = "__kernel";
+        switch (attr->getKind()) {
+            case attr::CUDAGlobal:
+                replace = "__kernel";
+                break;
+            case attr::CUDADevice:
+                replace = "";
+                break;
+            case attr::CUDAHost:
+                replace = "";
+                break;
+            case attr::CUDAConstant:
+                replace = "__constant";
+                break;
+            case attr::CUDAShared:
+                replace = "__local";
+                break;
+            default:
+                break;
         }
-        else if (attr == "__device__") {
-            replace = "";
-        }
-        else if (attr == "__host__") {
-            replace = "";
-        }
-        else if (attr == "__constant__") {
-            replace = "__constant";
-        }
-        else if (attr == "__shared__") {
-            replace = "__local";
-        }
-        Rewrite.ReplaceText(loc, attr.length(), replace);
-    }
-
-    SourceLocation FindAttr(SourceLocation loc, std::string attr) {
-        //TODO inefficient... find optimizations
-        const char *s = attr.c_str();
-        size_t len = attr.length();
-        FileID fileID = SM->getFileID(loc);
-        SourceLocation locStart = SM->getLocForStartOfFile(fileID);
-        llvm::StringRef fileBuf = SM->getBufferData(fileID);
-        const char *fileBufStart = fileBuf.begin();
-        for (const char *bufPtr = fileBufStart + SM->getFileOffset(loc);
-             bufPtr >= fileBufStart; bufPtr--) {
-            if (strncmp(bufPtr, s, len) == 0)
-                return locStart.getFileLocWithOffset(bufPtr - fileBufStart);
-        }
-        return SourceLocation();
+        SourceLocation instLoc = SM->getInstantiationLoc(attr->getLocation());
+        SourceRange realRange(instLoc,
+                              PP->getLocForEndOfToken(instLoc));
+        Rewrite.ReplaceText(instLoc, Rewrite.getRangeSize(realRange), replace);
     }
 
     void RemoveFunction(FunctionDecl *func, Rewriter &Rewrite) {
@@ -1287,21 +1269,7 @@ private:
         //Find startLoc
         if (func->hasAttrs()) {
             Attr *attr = (func->getAttrs())[0];
-            std::string attrStr;
-            switch (attr->getKind()) {
-                case attr::CUDAGlobal:
-                    attrStr = "__global__";
-                    break;
-                case attr::CUDADevice:
-                    attrStr = "__device__";
-                    break;
-                case attr::CUDAHost:
-                    attrStr = "__host__";
-                    break;
-                default:
-                    break;
-            }
-            startLoc = FindAttr(func->getLocStart(), attrStr);
+            startLoc = SM->getInstantiationLoc(attr->getLocation());
         }
         else {
             //TODO find first specifier location
@@ -1325,21 +1293,7 @@ private:
         //Find startLoc
         if (var->hasAttrs()) {
             Attr *attr = (var->getAttrs())[0];
-            std::string attrStr;
-            switch (attr->getKind()) {
-                case attr::CUDAGlobal:
-                    attrStr = "__constant__";
-                    break;
-                case attr::CUDADevice:
-                    attrStr = "__device__";
-                    break;
-                case attr::CUDAHost:
-                    attrStr = "__shared__";
-                    break;
-                default:
-                    break;
-            }
-            startLoc = FindAttr(var->getLocStart(), attrStr);
+            startLoc = SM->getInstantiationLoc(attr->getLocation());
         }
         else {
             //TODO find first specifier location
