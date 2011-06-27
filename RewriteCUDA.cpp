@@ -63,14 +63,14 @@
 
 #define LOAD_PROGRAM_SOURCE \
     "size_t __cu2cl_LoadProgramSource(char *filename, const char **progSrc) {\n" \
-    "\tFILE *f = fopen(filename, \"r\");\n" \
-    "\tfseek(f, 0, SEEK_END);\n" \
-    "\tsize_t len = (size_t) ftell(f);\n" \
-    "\t*progSrc = (const char *) malloc(sizeof(char)*len);\n" \
-    "\trewind(f);\n" \
-    "\tfread((void *) *progSrc, len, 1, f);\n" \
-    "\tfclose(f);\n" \
-    "\treturn len;\n" \
+    "    FILE *f = fopen(filename, \"r\");\n" \
+    "    fseek(f, 0, SEEK_END);\n" \
+    "    size_t len = (size_t) ftell(f);\n" \
+    "    *progSrc = (const char *) malloc(sizeof(char)*len);\n" \
+    "    rewind(f);\n" \
+    "    fread((void *) *progSrc, len, 1, f);\n" \
+    "    fclose(f);\n" \
+    "    return len;\n" \
     "}\n\n"
 
 #define CL_MEMSET \
@@ -551,10 +551,13 @@ private:
         if (!hasHost) {
             RemoveFunction(kernelFunc, HostRewrite);
         }
-        llvm::StringRef r = stem(SM->getFileEntryForID(SM->getFileID(kernelFunc->getLocation()))->getName());
-        std::list<llvm::StringRef> &l = Kernels[r];
-        l.push_back(kernelFunc->getName());
-        HostKernels += "cl_kernel __cu2cl_Kernel_" + kernelFunc->getName().str() + ";\n";
+        if (kernelFunc->hasAttr<CUDAGlobalAttr>()) {
+            //If host-callable, get and store kernel filename
+            llvm::StringRef r = stem(SM->getFileEntryForID(SM->getFileID(kernelFunc->getLocation()))->getName());
+            std::list<llvm::StringRef> &l = Kernels[r];
+            l.push_back(kernelFunc->getName());
+            HostKernels += "cl_kernel __cu2cl_Kernel_" + kernelFunc->getName().str() + ";\n";
+        }
 
         //Rewrite kernel attributes
         //TODO if have host, remove the attribute??
@@ -720,10 +723,12 @@ private:
             //TODO first, delete old queue and context
             Expr *device = cudaCall->getArg(0);
             DeclRefExpr *dre = FindStmt<DeclRefExpr>(device);
-            VarDecl *var = dyn_cast<VarDecl>(dre->getDecl());
-            std::string sub = "__cu2cl_Context = clCreateContext(NULL, 1, &" + var->getNameAsString() + ", NULL, NULL, NULL);\n";
-            sub += "__cu2cl_CommandQueue = clCreateCommandQueue(__cu2cl_Context, " + var->getNameAsString() +", 0, NULL)\n";
-            newExpr = sub;
+            if (dre != NULL) {
+                VarDecl *var = dyn_cast<VarDecl>(dre->getDecl());
+                std::string sub = "__cu2cl_Context = clCreateContext(NULL, 1, &" + var->getNameAsString() + ", NULL, NULL, NULL);\n";
+                sub += "__cu2cl_CommandQueue = clCreateCommandQueue(__cu2cl_Context, " + var->getNameAsString() +", 0, NULL)\n";
+                newExpr = sub;
+            }
         }
         else if (funcName == "cudaGetDeviceProperties") {
             //Replace with __cu2cl_GetDeviceProperties
@@ -1515,15 +1520,18 @@ public:
                 if (iDG == DG.begin()) {
                     start = (*iDG)->getLocStart();
                 }
+                if (DeviceMemVars.find(vd) != DeviceMemVars.end()) {
+                    //Change variable's type to cl_mem
+                    replace += "cl_mem " + vd->getNameAsString();
+                }
+                else {
+                    replace += PrintDeclToString(vd);
+                }
                 if ((iDG + 1) == DG.end()) {
                     end = (*iDG)->getLocEnd();
                 }
-                if (DeviceMemVars.find(vd) != DeviceMemVars.end()) {
-                    //Change variable's type to cl_mem
-                    replace += "cl_mem " + vd->getNameAsString() + ";\n";
-                }
                 else {
-                    replace += PrintDeclToString(vd) + ";\n";
+                    replace += ";\n";
                 }
             }
             HostRewrite.ReplaceText(start, HostRewrite.getRangeSize(SourceRange(start, end)), replace);
