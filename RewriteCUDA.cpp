@@ -1240,17 +1240,25 @@ private:
         rewrite.ReplaceText(instLoc, rewrite.getRangeSize(realRange), replace);
     }
 
-    void RemoveFunction(FunctionDecl *func, Rewriter &Rewrite) {
-        SourceLocation startLoc, endLoc;
+    void RemoveFunction(FunctionDecl *func, Rewriter &rewrite) {
+        SourceLocation startLoc, endLoc, tempLoc;
+
         //Find startLoc
+        //TODO find first specifier location
+        startLoc = func->getTypeSourceInfo()->getTypeLoc().getBeginLoc();
+        /*if (func->getTemplatedKind() == FunctionDecl::TK_FunctionTemplate) {
+            FunctionTemplateDecl *ftd = func->getDescribedFunctionTemplate();
+            tempLoc = ftd->getSourceRange().getBegin();
+            if (SM->isBeforeInTranslationUnit(tempLoc, startLoc))
+                startLoc = tempLoc;
+        }*/
         if (func->hasAttrs()) {
             Attr *attr = (func->getAttrs())[0];
-            startLoc = SM->getInstantiationLoc(attr->getLocation());
+            tempLoc = SM->getInstantiationLoc(attr->getLocation());
+            if (SM->isBeforeInTranslationUnit(tempLoc, startLoc))
+                startLoc = tempLoc;
         }
-        else {
-            //TODO find first specifier location
-            startLoc = func->getTypeSourceInfo()->getTypeLoc().getBeginLoc();
-        }
+
         //Find endLoc
         if (func->hasBody()) {
             CompoundStmt *body = (CompoundStmt *) func->getBody();
@@ -1260,21 +1268,23 @@ private:
             //Find location of semi-colon
             endLoc = func->getSourceRange().getEnd();
         }
-        Rewrite.RemoveText(startLoc,
-                           Rewrite.getRangeSize(SourceRange(startLoc, endLoc)));
+        rewrite.RemoveText(startLoc,
+                           rewrite.getRangeSize(SourceRange(startLoc, endLoc)));
     }
 
-    void RemoveVar(VarDecl *var, Rewriter &Rewrite) {
-        SourceLocation startLoc, endLoc;
+    void RemoveVar(VarDecl *var, Rewriter &rewrite) {
+        SourceLocation startLoc, endLoc, tempLoc;
+
         //Find startLoc
+        //TODO find first specifier location
+        startLoc = var->getTypeSourceInfo()->getTypeLoc().getBeginLoc();
         if (var->hasAttrs()) {
             Attr *attr = (var->getAttrs())[0];
-            startLoc = SM->getInstantiationLoc(attr->getLocation());
+            tempLoc = SM->getInstantiationLoc(attr->getLocation());
+            if (SM->isBeforeInTranslationUnit(tempLoc, startLoc))
+                startLoc = tempLoc;
         }
-        else {
-            //TODO find first specifier location
-            startLoc = var->getTypeSourceInfo()->getTypeLoc().getBeginLoc();
-        }
+
         //Find endLoc
         if (var->hasInit()) {
             Expr *init = var->getInit();
@@ -1282,10 +1292,15 @@ private:
         }
         else {
             //Find location of semi-colon
-            endLoc = var->getSourceRange().getEnd();
+            TypeLoc tl = var->getTypeSourceInfo()->getTypeLoc();
+            if (ArrayTypeLoc *atl = dyn_cast<ArrayTypeLoc>(&tl)) {
+                endLoc = atl->getRBracketLoc();
+            }
+            else
+                endLoc = var->getSourceRange().getEnd();
         }
-        Rewrite.RemoveText(startLoc,
-                           Rewrite.getRangeSize(SourceRange(startLoc, endLoc)));
+        rewrite.RemoveText(startLoc,
+                           rewrite.getRangeSize(SourceRange(startLoc, endLoc)));
     }
 
     std::string PrintStmtToString(Stmt *s) {
