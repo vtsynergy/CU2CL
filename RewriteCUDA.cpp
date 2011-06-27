@@ -275,15 +275,16 @@ private:
     }
 
     void RewriteHostFunction(FunctionDecl *hostFunc) {
-        //llvm::errs() << "Rewriting host function: " << hostFunc->getName() << "\n";
-        //Remove from KernelRewrite
-        RemoveFunction(hostFunc, KernelRewrite);
-        //Rewrite __host__ attribute
+        //Remove any CUDA function attributes
         if (CUDAHostAttr *attr = hostFunc->getAttr<CUDAHostAttr>()) {
-            RewriteCUDAAttr(attr, HostRewrite);
+            RewriteAttr(attr, "", HostRewrite);
         }
+        if (CUDADeviceAttr *attr = hostFunc->getAttr<CUDADeviceAttr>()) {
+            RewriteAttr(attr, "", HostRewrite);
+        }
+
+        //Rewrite the body
         if (Stmt *body = hostFunc->getBody()) {
-            //TraverseStmt(body, 0);
             RewriteHostStmt(body);
         }
         CurVarDeclGroups.clear();
@@ -306,7 +307,7 @@ private:
             }
             for (DeclGroupRef::iterator i = DG.begin(), e = DG.end(); i != e; ++i) {
                 if (VarDecl *vd = dyn_cast<VarDecl>(*i)) {
-                    RewriteVarDecl(vd);
+                    RewriteHostVarDecl(vd);
                 }
                 //TODO other non-top level declarations??
             }
@@ -546,11 +547,6 @@ private:
     }
 
     void RewriteKernelFunction(FunctionDecl *kernelFunc) {
-        //llvm::errs() << "Rewriting CUDA kernel\n";
-        bool hasHost = kernelFunc->hasAttr<CUDAHostAttr>();
-        if (!hasHost) {
-            RemoveFunction(kernelFunc, HostRewrite);
-        }
         if (kernelFunc->hasAttr<CUDAGlobalAttr>()) {
             //If host-callable, get and store kernel filename
             llvm::StringRef r = stem(SM->getFileEntryForID(SM->getFileID(kernelFunc->getLocation()))->getName());
@@ -560,46 +556,41 @@ private:
         }
 
         //Rewrite kernel attributes
-        //TODO if have host, remove the attribute??
         if (CUDAGlobalAttr *attr = kernelFunc->getAttr<CUDAGlobalAttr>()) {
-            RewriteCUDAAttr(attr, KernelRewrite);
-            if (hasHost)
-                RewriteCUDAAttr(attr, HostRewrite);
+            RewriteAttr(attr, "__kernel", KernelRewrite);
         }
         if (CUDADeviceAttr *attr = kernelFunc->getAttr<CUDADeviceAttr>()) {
-            RewriteCUDAAttr(attr, KernelRewrite);
-            if (hasHost)
-                RewriteCUDAAttr(attr, HostRewrite);
+            RewriteAttr(attr, "", KernelRewrite);
         }
         if (CUDAHostAttr *attr = kernelFunc->getAttr<CUDAHostAttr>()) {
-            RewriteCUDAAttr(attr, KernelRewrite);
-            if (hasHost)
-                RewriteCUDAAttr(attr, HostRewrite);
+            RewriteAttr(attr, "", KernelRewrite);
         }
 
-        //Rewrite arguments
+#if 0
+        if (kernelFunc->isInlineSpecified()) {
+            //Remove inline keyword
+        }
+#endif
+
+        //Rewrite formal parameters
         for (FunctionDecl::param_iterator PI = kernelFunc->param_begin(),
                                           PE = kernelFunc->param_end();
                                           PI != PE; ++PI) {
             RewriteKernelParam(*PI);
         }
 
-        //Rewrite kernel body
+        //Rewrite the body
         if (kernelFunc->hasBody()) {
-            //TraverseStmt(kernelFunc->getBody(), 0);
             RewriteKernelStmt(kernelFunc->getBody());
         }
     }
 
     void RewriteKernelParam(ParmVarDecl *parmDecl) {
         if (CUDADeviceAttr *attr = parmDecl->getAttr<CUDADeviceAttr>()) {
-            RewriteCUDAAttr(attr, KernelRewrite);
-        }
-        else if (CUDAConstantAttr *attr = parmDecl->getAttr<CUDAConstantAttr>()) {
-            RewriteCUDAAttr(attr, KernelRewrite);
+            RewriteAttr(attr, "", KernelRewrite);
         }
         else if (CUDASharedAttr *attr = parmDecl->getAttr<CUDASharedAttr>()) {
-            RewriteCUDAAttr(attr, KernelRewrite);
+            RewriteAttr(attr, "__local", KernelRewrite);
         }
         else if (parmDecl->getOriginalType().getTypePtr()->isPointerType()) {
             KernelRewrite.InsertTextBefore(
@@ -609,6 +600,7 @@ private:
     }
 
     void RewriteKernelStmt(Stmt *ks) {
+        //TODO if kernel makes reference to outside var, add arg
         //Traverse children and recurse
         for (Stmt::child_iterator CI = ks->child_begin(), CE = ks->child_end();
              CI != CE; ++CI) {
@@ -661,14 +653,8 @@ private:
             }
             for (DeclGroupRef::iterator i = DG.begin(), e = DG.end(); i != e; ++i) {
                 if (VarDecl *vd = dyn_cast<VarDecl>(*i)) {
-                    if (CUDADeviceAttr *attr = vd->getAttr<CUDADeviceAttr>()) {
-                        RewriteCUDAAttr(attr, KernelRewrite);
-                    }
-                    else if (CUDAConstantAttr *attr = vd->getAttr<CUDAConstantAttr>()) {
-                        RewriteCUDAAttr(attr, KernelRewrite);
-                    }
-                    else if (CUDASharedAttr *attr = vd->getAttr<CUDASharedAttr>()) {
-                        RewriteCUDAAttr(attr, KernelRewrite);
+                    if (CUDASharedAttr *attr = vd->getAttr<CUDASharedAttr>()) {
+                        RewriteAttr(attr, "__local", KernelRewrite);
                     }
                 }
                 //TODO other non-top level declarations??
@@ -676,7 +662,7 @@ private:
         }
     }
 
-    std::string RewriteKernelExpr(Expr *e) {
+    bool RewriteKernelExpr(Expr *e, std::string newExpr) {
         //TODO implement this like you did host rewrites
     }
 
@@ -1158,7 +1144,8 @@ private:
         MainDecl = mainDecl;
     }
 
-    void RewriteVarDecl(VarDecl *var) {
+    void RewriteHostVarDecl(VarDecl *var) {
+        //TODO handle __constant__ memory
         TypeLoc origTL = var->getTypeSourceInfo()->getTypeLoc();
 
         TypeLoc tl = origTL;
@@ -1246,31 +1233,11 @@ private:
         }
     }
 
-    void RewriteCUDAAttr(Attr *attr, Rewriter &Rewrite) {
-        std::string replace;
-        switch (attr->getKind()) {
-            case attr::CUDAGlobal:
-                replace = "__kernel";
-                break;
-            case attr::CUDADevice:
-                replace = "";
-                break;
-            case attr::CUDAHost:
-                replace = "";
-                break;
-            case attr::CUDAConstant:
-                replace = "__constant";
-                break;
-            case attr::CUDAShared:
-                replace = "__local";
-                break;
-            default:
-                break;
-        }
+    void RewriteAttr(Attr *attr, std::string replace, Rewriter &rewrite) {
         SourceLocation instLoc = SM->getInstantiationLoc(attr->getLocation());
         SourceRange realRange(instLoc,
                               PP->getLocForEndOfToken(instLoc));
-        Rewrite.ReplaceText(instLoc, Rewrite.getRangeSize(realRange), replace);
+        rewrite.ReplaceText(instLoc, rewrite.getRangeSize(realRange), replace);
     }
 
     void RemoveFunction(FunctionDecl *func, Rewriter &Rewrite) {
@@ -1401,6 +1368,7 @@ public:
         SourceLocation loc = firstDecl->getLocation();
         if (!SM->isFromMainFile(loc)) {
             if (strstr(SM->getPresumedLoc(loc).getFilename(), ".cu") != NULL) {
+                //If #included and a .cu file, rewrite
                 if (OutFiles.find(SM->getFileID(loc)) == OutFiles.end()) {
                     //Create new files
                     FileID fileid = SM->getFileID(loc);
@@ -1430,19 +1398,31 @@ public:
         for (DeclGroupRef::iterator i = DG.begin(), e = DG.end(); i != e; ++i) {
             if (FunctionDecl *fd = dyn_cast<FunctionDecl>(*i)) {
                 if (fd->hasAttr<CUDAGlobalAttr>() || fd->hasAttr<CUDADeviceAttr>()) {
+                    //Device function, so rewrite kernel
                     RewriteKernelFunction(fd);
+                    if (fd->hasAttr<CUDAHostAttr>())
+                        //Also a host function, so rewrite host
+                        RewriteHostFunction(fd);
+                    else
+                        //Simply a device function, so remove from host
+                        RemoveFunction(fd, HostRewrite);
                 }
                 else {
+                    //Simply a host function, so rewrite
                     RewriteHostFunction(fd);
-                }
-                if (fd->getNameAsString() == MainFuncName) {
-                    RewriteMain(fd);
+                    //and remove from kernel
+                    RemoveFunction(fd, KernelRewrite);
+
+                    if (fd->getNameAsString() == MainFuncName) {
+                        RewriteMain(fd);
+                    }
                 }
             }
             else if (VarDecl *vd = dyn_cast<VarDecl>(*i)) {
                 RemoveVar(vd, KernelRewrite);
-                RewriteVarDecl(vd);
+                RewriteHostVarDecl(vd);
             }
+            //TODO rewrite type declarations
         }
     }
 
