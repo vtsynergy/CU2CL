@@ -546,126 +546,6 @@ private:
         return ret;
     }
 
-    void RewriteKernelFunction(FunctionDecl *kernelFunc) {
-        if (kernelFunc->hasAttr<CUDAGlobalAttr>()) {
-            //If host-callable, get and store kernel filename
-            llvm::StringRef r = stem(SM->getFileEntryForID(SM->getFileID(kernelFunc->getLocation()))->getName());
-            std::list<llvm::StringRef> &l = Kernels[r];
-            l.push_back(kernelFunc->getName());
-            HostKernels += "cl_kernel __cu2cl_Kernel_" + kernelFunc->getName().str() + ";\n";
-        }
-
-        //Rewrite kernel attributes
-        if (CUDAGlobalAttr *attr = kernelFunc->getAttr<CUDAGlobalAttr>()) {
-            RewriteAttr(attr, "__kernel", KernelRewrite);
-        }
-        if (CUDADeviceAttr *attr = kernelFunc->getAttr<CUDADeviceAttr>()) {
-            RewriteAttr(attr, "", KernelRewrite);
-        }
-        if (CUDAHostAttr *attr = kernelFunc->getAttr<CUDAHostAttr>()) {
-            RewriteAttr(attr, "", KernelRewrite);
-        }
-
-#if 0
-        if (kernelFunc->isInlineSpecified()) {
-            //Remove inline keyword
-        }
-#endif
-
-        //Rewrite formal parameters
-        for (FunctionDecl::param_iterator PI = kernelFunc->param_begin(),
-                                          PE = kernelFunc->param_end();
-                                          PI != PE; ++PI) {
-            RewriteKernelParam(*PI);
-        }
-
-        //Rewrite the body
-        if (kernelFunc->hasBody()) {
-            RewriteKernelStmt(kernelFunc->getBody());
-        }
-    }
-
-    void RewriteKernelParam(ParmVarDecl *parmDecl) {
-        if (CUDADeviceAttr *attr = parmDecl->getAttr<CUDADeviceAttr>()) {
-            RewriteAttr(attr, "", KernelRewrite);
-        }
-        else if (CUDASharedAttr *attr = parmDecl->getAttr<CUDASharedAttr>()) {
-            RewriteAttr(attr, "__local", KernelRewrite);
-        }
-        else if (parmDecl->getOriginalType().getTypePtr()->isPointerType()) {
-            KernelRewrite.InsertTextBefore(
-                    parmDecl->getTypeSourceInfo()->getTypeLoc().getBeginLoc(),
-                    "__global ");
-        }
-    }
-
-    void RewriteKernelStmt(Stmt *ks) {
-        //TODO if kernel makes reference to outside var, add arg
-        //Traverse children and recurse
-        for (Stmt::child_iterator CI = ks->child_begin(), CE = ks->child_end();
-             CI != CE; ++CI) {
-            if (*CI)
-                RewriteKernelStmt(*CI);
-        }
-
-        //Visit this node
-        std::string str;
-        if (MemberExpr *me = dyn_cast<MemberExpr>(ks)) {
-            //Check base expr, if DeclRefExpr and a dim3, then rewrite
-            if (DeclRefExpr *dre = dyn_cast<DeclRefExpr>(me->getBase())) {
-                std::string type = dre->getDecl()->getType().getAsString();
-                if (type == "dim3" || type == "const uint3") {
-                    std::string name = dre->getDecl()->getNameAsString();
-                    if (name == "threadIdx")
-                        str = "get_local_id";
-                    else if (name == "blockIdx")
-                        str = "get_group_id";
-                    else if (name == "blockDim")
-                        str = "get_local_size";
-                    else if (name == "gridDim")
-                        str = "get_num_groups";
-
-                    name = me->getMemberDecl()->getNameAsString();
-                    if (name == "x")
-                        str += "(0)";
-                    else if (name == "y")
-                        str += "(1)";
-                    else if (name == "z")
-                        str += "(2)";
-                    //TODO find location of arrow or dot and rewrite
-                    ReplaceStmtWithText(ks, str, KernelRewrite);
-                }
-            }
-        }
-        /*else if (DeclRefExpr *dre = dyn_cast<DeclRefExpr>(ks)) {
-        }*/
-        else if (CallExpr *ce = dyn_cast<CallExpr>(ks)) {
-            str = PrintStmtToString(ce);
-            if (str == "__syncthreads()")
-                ReplaceStmtWithText(ks, "barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE)", KernelRewrite);
-        }
-        else if (DeclStmt *ds = dyn_cast<DeclStmt>(ks)) {
-            DeclGroupRef DG = ds->getDeclGroup();
-            Decl *firstDecl = DG.isSingleDecl() ? DG.getSingleDecl() : DG.getDeclGroup()[0];
-            //Store VarDecl DeclGroupRefs
-            if (firstDecl->getKind() == Decl::Var) {
-                CurVarDeclGroups.insert(DG);
-            }
-            for (DeclGroupRef::iterator i = DG.begin(), e = DG.end(); i != e; ++i) {
-                if (VarDecl *vd = dyn_cast<VarDecl>(*i)) {
-                    if (CUDASharedAttr *attr = vd->getAttr<CUDASharedAttr>()) {
-                        RewriteAttr(attr, "__local", KernelRewrite);
-                    }
-                }
-                //TODO other non-top level declarations??
-            }
-        }
-    }
-
-    bool RewriteKernelExpr(Expr *e, std::string newExpr) {
-        //TODO implement this like you did host rewrites
-    }
-
     bool RewriteCUDACall(CallExpr *cudaCall, std::string &newExpr) {
         //TODO all CUDA calls return a cudaError_t, so need to find a way to keep that working
         //TODO check if the return value is being used somehow?
@@ -1140,10 +1020,6 @@ private:
         return args.str();
     }
 
-    void RewriteMain(FunctionDecl *mainDecl) {
-        MainDecl = mainDecl;
-    }
-
     void RewriteHostVarDecl(VarDecl *var) {
         //TODO handle __constant__ memory
         TypeLoc origTL = var->getTypeSourceInfo()->getTypeLoc();
@@ -1229,6 +1105,254 @@ private:
                 }
                 else
                     ReplaceStmtWithText(e, s, HostRewrite);
+            }
+        }
+    }
+
+    void RewriteMain(FunctionDecl *mainDecl) {
+        MainDecl = mainDecl;
+    }
+
+    void RewriteKernelFunction(FunctionDecl *kernelFunc) {
+        if (kernelFunc->hasAttr<CUDAGlobalAttr>()) {
+            //If host-callable, get and store kernel filename
+            llvm::StringRef r = stem(SM->getFileEntryForID(SM->getFileID(kernelFunc->getLocation()))->getName());
+            std::list<llvm::StringRef> &l = Kernels[r];
+            l.push_back(kernelFunc->getName());
+            HostKernels += "cl_kernel __cu2cl_Kernel_" + kernelFunc->getName().str() + ";\n";
+        }
+
+        //Rewrite kernel attributes
+        if (CUDAGlobalAttr *attr = kernelFunc->getAttr<CUDAGlobalAttr>()) {
+            RewriteAttr(attr, "__kernel", KernelRewrite);
+        }
+        if (CUDADeviceAttr *attr = kernelFunc->getAttr<CUDADeviceAttr>()) {
+            RewriteAttr(attr, "", KernelRewrite);
+        }
+        if (CUDAHostAttr *attr = kernelFunc->getAttr<CUDAHostAttr>()) {
+            RewriteAttr(attr, "", KernelRewrite);
+        }
+
+        //Rewrite formal parameters
+        for (FunctionDecl::param_iterator PI = kernelFunc->param_begin(),
+                                          PE = kernelFunc->param_end();
+                                          PI != PE; ++PI) {
+            RewriteKernelParam(*PI);
+        }
+
+        //Rewrite the body
+        if (kernelFunc->hasBody()) {
+            RewriteKernelStmt(kernelFunc->getBody());
+        }
+    }
+
+    void RewriteKernelParam(ParmVarDecl *parmDecl) {
+        if (CUDADeviceAttr *attr = parmDecl->getAttr<CUDADeviceAttr>()) {
+            RewriteAttr(attr, "", KernelRewrite);
+        }
+        else if (CUDASharedAttr *attr = parmDecl->getAttr<CUDASharedAttr>()) {
+            RewriteAttr(attr, "__local", KernelRewrite);
+        }
+        else if (parmDecl->getOriginalType().getTypePtr()->isPointerType()) {
+            KernelRewrite.InsertTextBefore(
+                    parmDecl->getTypeSourceInfo()->getTypeLoc().getBeginLoc(),
+                    "__global ");
+        }
+    }
+
+    void RewriteKernelStmt(Stmt *ks) {
+        //Visit this node
+        if (Expr *e = dyn_cast<Expr>(ks)) {
+            std::string str;
+            if (RewriteKernelExpr(e, str)) {
+                ReplaceStmtWithText(e, str, KernelRewrite);
+            }
+        }
+        else if (DeclStmt *ds = dyn_cast<DeclStmt>(ks)) {
+            DeclGroupRef DG = ds->getDeclGroup();
+            for (DeclGroupRef::iterator i = DG.begin(), e = DG.end(); i != e; ++i) {
+                if (VarDecl *vd = dyn_cast<VarDecl>(*i)) {
+                    RewriteKernelVarDecl(vd);
+                }
+                //TODO other non-top level declarations??
+            }
+        }
+        //TODO rewrite any other Stmts?
+
+        else {
+            //Traverse children and recurse
+            for (Stmt::child_iterator CI = ks->child_begin(), CE = ks->child_end();
+                 CI != CE; ++CI) {
+                if (*CI)
+                    RewriteKernelStmt(*CI);
+            }
+        }
+    }
+
+    bool RewriteKernelExpr(Expr *e, std::string &newExpr) {
+        //Return value specifies whether or not a rewrite occurred
+        if (e->getSourceRange().isInvalid())
+            return false;
+
+        //Rewriter used for rewriting subexpressions
+        Rewriter exprRewriter(*SM, *LO);
+        //Instantiation locations are used to capture macros
+        SourceRange realRange(SM->getInstantiationLoc(e->getLocStart()),
+                              SM->getInstantiationLoc(e->getLocEnd()));
+
+        if (MemberExpr *me = dyn_cast<MemberExpr>(e)) {
+            //Check base expr, if DeclRefExpr and a dim3, then rewrite
+            if (DeclRefExpr *dre = dyn_cast<DeclRefExpr>(me->getBase())) {
+                //TODO check type properly to remove qualifiers
+                std::string type = dre->getDecl()->getType().getAsString();
+                if (type == "dim3") {
+                    std::string name = dre->getDecl()->getNameAsString();
+                    if (name == "blockDim")
+                        newExpr = "get_local_size";
+                    else if (name == "gridDim")
+                        newExpr = "get_num_groups";
+                    else
+                        newExpr = PrintStmtToString(dre);
+
+                    name = me->getMemberDecl()->getNameAsString();
+                    if (newExpr != dre->getDecl()->getNameAsString()) {
+                        if (name == "x")
+                            name = "(0)";
+                        else if (name == "y")
+                            name = "(1)";
+                        else if (name == "z")
+                            name = "(2)";
+                    }
+                    else {
+                        if (name == "x")
+                            name = "[0]";
+                        else if (name == "y")
+                            name = "[1]";
+                        else if (name == "z")
+                            name = "[2]";
+                    }
+                    newExpr += name;
+                    return true;
+                }
+                if (type == "const uint3") {
+                    std::string name = dre->getDecl()->getNameAsString();
+                    if (name == "threadIdx")
+                        newExpr = "get_local_id";
+                    else if (name == "blockIdx")
+                        newExpr = "get_group_id";
+                    else
+                        newExpr = PrintStmtToString(dre);
+
+                    name = me->getMemberDecl()->getNameAsString();
+                    if (newExpr != dre->getDecl()->getNameAsString()) {
+                        if (name == "x")
+                            name = "(0)";
+                        else if (name == "y")
+                            name = "(1)";
+                        else if (name == "z")
+                            name = "(2)";
+                        newExpr += name;
+                        return true;
+                    }
+                    return false;
+                }
+            }
+        }
+        /*else if (DeclRefExpr *dre = dyn_cast<DeclRefExpr>(ks)) {
+            //TODO if kernel makes reference to outside var, add arg
+            //TODO if references warpSize, print warning
+        }*/
+        else if (CallExpr *ce = dyn_cast<CallExpr>(e)) {
+            std::string funcName = ce->getDirectCallee()->getNameAsString();
+            if (funcName == "__syncthreads") {
+                newExpr = "barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE)";
+                return true;
+            }
+        }
+
+        bool ret = false;
+        //Do a DFS, recursing into children, then rewriting this expression
+        //if rewrite happened, replace text at old sourcerange
+        for (Stmt::child_iterator CI = e->child_begin(), CE = e->child_end();
+             CI != CE; ++CI) {
+            std::string s;
+            Expr *child = (Expr *) *CI;
+            if (child && RewriteKernelExpr(child, s)) {
+                //Perform "rewrite", which is just a simple replace
+                ReplaceStmtWithText(child, s, exprRewriter);
+                ret = true;
+            }
+        }
+        newExpr = exprRewriter.getRewrittenText(realRange);
+        return ret;
+    }
+
+    void RewriteKernelVarDecl(VarDecl *var) {
+        //TODO handle __shared__ memory
+        if (CUDASharedAttr *attr = var->getAttr<CUDASharedAttr>()) {
+            RewriteAttr(attr, "__local", KernelRewrite);
+        }
+
+        TypeLoc origTL = var->getTypeSourceInfo()->getTypeLoc();
+
+        TypeLoc tl = origTL;
+        while (!tl.getNextTypeLoc().isNull()) {
+            tl = tl.getNextTypeLoc();
+        }
+        QualType qt = tl.getType();
+        std::string type = qt.getAsString();
+
+        //Rewrite var type
+        if (LastLoc.isNull() || origTL.getBeginLoc() != LastLoc.getBeginLoc()) {
+            LastLoc = origTL;
+            if (type == "dim3") {
+                //Rewrite to size_t[3] array
+                KernelRewrite.ReplaceText(
+                        tl.getBeginLoc(),
+                        KernelRewrite.getRangeSize(tl.getLocalSourceRange()),
+                        "size_t");
+            }
+            //TODO check other CUDA-only types to rewrite
+        }
+
+        //Rewrite initial value
+        if (var->hasInit()) {
+            Expr *e = var->getInit();
+            std::string s;
+            if (RewriteKernelExpr(e, s)) {
+                //Special cases for dim3s
+                if (type == "dim3") {
+                    //TODO fix case of dim3 c = b;
+                    CXXConstructExpr *cce = dyn_cast<CXXConstructExpr>(e);
+                    if (cce && cce->getNumArgs() > 1) {
+                        SourceRange parenRange = cce->getParenRange();
+                        if (parenRange.isValid()) {
+                            KernelRewrite.ReplaceText(
+                                    parenRange.getBegin(),
+                                    KernelRewrite.getRangeSize(parenRange),
+                                    s);
+                        }
+                        else {
+                            KernelRewrite.InsertTextAfter(
+                                    PP->getLocForEndOfToken(var->getLocation()),
+                                    s);
+                        }
+                    }
+                    else
+                        ReplaceStmtWithText(e, s, KernelRewrite);
+
+                    //Add [3]/* to end/start of var identifier
+                    if (origTL.getTypePtr()->isPointerType())
+                        KernelRewrite.InsertTextBefore(
+                                var->getLocation(),
+                                "*");
+                    else
+                        KernelRewrite.InsertTextBefore(
+                                PP->getLocForEndOfToken(var->getLocation()),
+                                "[3]");
+                }
+                else
+                    ReplaceStmtWithText(e, s, KernelRewrite);
             }
         }
     }
