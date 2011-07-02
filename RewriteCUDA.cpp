@@ -1590,20 +1590,16 @@ public:
         CLInit += "__cu2cl_CommandQueue = clCreateCommandQueue(__cu2cl_Context, __cu2cl_Device, 0, NULL);\n";
         for (StringRefListMap::iterator i = Kernels.begin(),
              e = Kernels.end(); i != e; i++) {
-            std::string r = idCharFilter((*i).first);
-            CLInit += "progLen = __cu2cl_LoadProgramSource(\"" + (*i).first.str() + "-cl.cl\", &progSrc);\n";
-            CLInit += "__cu2cl_Program_" + r + " = clCreateProgramWithSource(__cu2cl_Context, 1, &progSrc, &progLen, NULL);\n";
-            CLInit += "free((void *) progSrc);\n";
-            CLInit += "clBuildProgram(__cu2cl_Program_" + r + ", 1, &__cu2cl_Device, \"-I .\", NULL, NULL);\n";
-        }
-        for (StringRefListMap::iterator i = Kernels.begin(),
-             e = Kernels.end(); i != e; i++) {
+            std::string file = idCharFilter((*i).first);
             std::list<llvm::StringRef> &l = (*i).second;
+            CLInit += "progLen = __cu2cl_LoadProgramSource(\"" + (*i).first.str() + "-cl.cl\", &progSrc);\n";
+            CLInit += "__cu2cl_Program_" + file + " = clCreateProgramWithSource(__cu2cl_Context, 1, &progSrc, &progLen, NULL);\n";
+            CLInit += "free((void *) progSrc);\n";
+            CLInit += "clBuildProgram(__cu2cl_Program_" + file + ", 1, &__cu2cl_Device, \"-I .\", NULL, NULL);\n";
             for (std::list<llvm::StringRef>::iterator li = l.begin(), le = l.end();
                  li != le; li++) {
-                std::string r = idCharFilter((*i).first);
                 std::string kernelName = (*li).str();
-                CLInit += "__cu2cl_Kernel_" + kernelName + " = clCreateKernel(__cu2cl_Program_" + r + ", \"" + kernelName + "\", NULL);\n";
+                CLInit += "__cu2cl_Kernel_" + kernelName + " = clCreateKernel(__cu2cl_Program_" + file + ", \"" + kernelName + "\", NULL);\n";
             }
         }
         HostRewrite.InsertTextAfter(PP->getLocForEndOfToken(mainBody->getLBracLoc()), CLInit);
@@ -1613,16 +1609,16 @@ public:
         for (StringRefListMap::iterator i = Kernels.begin(),
              e = Kernels.end(); i != e; i++) {
             std::list<llvm::StringRef> &l = (*i).second;
+            std::string file = idCharFilter((*i).first);
             for (std::list<llvm::StringRef>::iterator li = l.begin(), le = l.end();
                  li != le; li++) {
                 std::string kernelName = (*li).str();
                 CLClean += "clReleaseKernel(__cu2cl_Kernel_" + kernelName + ");\n";
             }
+            CLClean += "clReleaseProgram(__cu2cl_Program_" + file + ");\n";
         }
         for (StringRefListMap::iterator i = Kernels.begin(),
              e = Kernels.end(); i != e; i++) {
-            std::string r = idCharFilter((*i).first);
-            CLClean += "clReleaseProgram(__cu2cl_Program_" + r + ");\n";
         }
         CLClean += "clReleaseCommandQueue(__cu2cl_CommandQueue);\n";
         CLClean += "clReleaseContext(__cu2cl_Context);\n";
