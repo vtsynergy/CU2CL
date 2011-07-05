@@ -1146,6 +1146,16 @@ private:
                     parmDecl->getTypeSourceInfo()->getTypeLoc().getBeginLoc(),
                     "__global ");
         }
+        TypeLoc tl = parmDecl->getTypeSourceInfo()->getTypeLoc();
+        while (!tl.getNextTypeLoc().isNull()) {
+            tl = tl.getNextTypeLoc();
+        }
+        QualType qt = tl.getType();
+        std::string type = qt.getAsString();
+
+        std::string newType = RewriteVectorType(type, false);
+        if (newType != "")
+            RewriteType(tl, newType, KernelRewrite);
     }
 
     void RewriteKernelStmt(Stmt *ks) {
@@ -1191,8 +1201,14 @@ private:
         if (MemberExpr *me = dyn_cast<MemberExpr>(e)) {
             //Check base expr, if DeclRefExpr and a dim3, then rewrite
             if (DeclRefExpr *dre = dyn_cast<DeclRefExpr>(me->getBase())) {
-                //TODO check type properly to remove qualifiers
-                std::string type = dre->getDecl()->getType().getAsString();
+                DeclaratorDecl *dd = dyn_cast<DeclaratorDecl>(dre->getDecl());
+                TypeLoc tl = dd->getTypeSourceInfo()->getTypeLoc();
+                while (!tl.getNextTypeLoc().isNull()) {
+                    tl = tl.getNextTypeLoc();
+                }
+                QualType qt = tl.getType();
+                std::string type = qt.getAsString();
+
                 if (type == "dim3") {
                     std::string name = dre->getDecl()->getNameAsString();
                     if (name == "blockDim")
@@ -1222,7 +1238,7 @@ private:
                     newExpr += name;
                     return true;
                 }
-                if (type == "const uint3") {
+                if (type == "uint3") {
                     std::string name = dre->getDecl()->getNameAsString();
                     if (name == "threadIdx")
                         newExpr = "get_local_id";
@@ -1304,6 +1320,11 @@ private:
             if (type == "dim3") {
                 //Rewrite to size_t[3] array
                 RewriteType(tl, "size_t", KernelRewrite);
+            }
+            else {
+                std::string newType = RewriteVectorType(type, false);
+                if (newType != "")
+                    RewriteType(tl, newType, KernelRewrite);
             }
             //TODO check other CUDA-only types to rewrite
         }
