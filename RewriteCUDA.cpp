@@ -19,6 +19,7 @@
 
 #include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/Regex.h"
 
 #include <list>
 #include <map>
@@ -384,30 +385,18 @@ private:
 
             if (type == "dim3") {
                 if (origTL.getTypePtr()->isPointerType())
-                exprRewriter.ReplaceText(
-                        tl.getBeginLoc(),
-                        exprRewriter.getRangeSize(tl.getLocalSourceRange()),
-                        "size_t *");
+                    RewriteType(tl, "size_t *", exprRewriter);
                 else
-                    exprRewriter.ReplaceText(
-                            tl.getBeginLoc(),
-                            exprRewriter.getRangeSize(tl.getLocalSourceRange()),
-                            "size_t[3]");
+                    RewriteType(tl, "size_t[3]", exprRewriter);
             }
             else if (type == "struct cudaDeviceProp") {
-                exprRewriter.ReplaceText(tl.getBeginLoc(),
-                                        exprRewriter.getRangeSize(tl.getLocalSourceRange()),
-                                        "struct __cu2cl_DeviceProp");
+                RewriteType(tl, "struct __cu2cl_DeviceProp", exprRewriter);
             }
             else if (type == "cudaStream_t") {
-                exprRewriter.ReplaceText(tl.getBeginLoc(),
-                                        exprRewriter.getRangeSize(tl.getLocalSourceRange()),
-                                        "cl_command_queue");
+                RewriteType(tl, "cl_command_queue", exprRewriter);
             }
             else if (type == "cudaEvent_t") {
-                exprRewriter.ReplaceText(tl.getBeginLoc(),
-                                        exprRewriter.getRangeSize(tl.getLocalSourceRange()),
-                                        "cl_event");
+                RewriteType(tl, "cl_event", exprRewriter);
             }
             else {
                 ret = false;
@@ -433,24 +422,16 @@ private:
                 std::string type = qt.getAsString();
 
                 if (type == "dim3") {
-                    exprRewriter.ReplaceText(tl.getBeginLoc(),
-                                            exprRewriter.getRangeSize(tl.getLocalSourceRange()),
-                                            "size_t[3]");
+                    RewriteType(tl, "size_t[3]", exprRewriter);
                 }
                 else if (type == "struct cudaDeviceProp") {
-                    exprRewriter.ReplaceText(tl.getBeginLoc(),
-                                            exprRewriter.getRangeSize(tl.getLocalSourceRange()),
-                                            "struct __cu2cl_DeviceProp");
+                    RewriteType(tl, "struct __cu2cl_DeviceProp", exprRewriter);
                 }
                 else if (type == "cudaStream_t") {
-                    exprRewriter.ReplaceText(tl.getBeginLoc(),
-                                            exprRewriter.getRangeSize(tl.getLocalSourceRange()),
-                                            "cl_command_queue");
+                    RewriteType(tl, "cl_command_queue", exprRewriter);
                 }
                 else if (type == "cudaEvent_t") {
-                    exprRewriter.ReplaceText(tl.getBeginLoc(),
-                                            exprRewriter.getRangeSize(tl.getLocalSourceRange()),
-                                            "cl_event");
+                    RewriteType(tl, "cl_event", exprRewriter);
                 }
                 else {
                     ret = false;
@@ -574,9 +555,7 @@ private:
             //Rewrite var type to cl_device_id
             //TODO check if type already rewritten
             TypeLoc tl = var->getTypeSourceInfo()->getTypeLoc();
-            HostRewrite.ReplaceText(tl.getBeginLoc(),
-                                    HostRewrite.getRangeSize(tl.getSourceRange()),
-                                    "cl_device_id");
+            RewriteType(tl, "cl_device_id", HostRewrite);
             newExpr = var->getNameAsString() + " = __cu2cl_Device";
         }
         else if (funcName == "cudaGetDeviceCount") {
@@ -773,9 +752,7 @@ private:
                 //TODO check the type, if pointertype, rewrite as you have already
                 //Change variable's type to cl_mem
                 TypeLoc tl = var->getTypeSourceInfo()->getTypeLoc();
-                HostRewrite.ReplaceText(tl.getBeginLoc(),
-                                        HostRewrite.getRangeSize(tl.getSourceRange()),
-                                        "cl_mem ");
+                RewriteType(tl, "cl_mem ", HostRewrite);
             }
 
             //Add var to DeviceMemVars
@@ -1060,10 +1037,7 @@ private:
             LastLoc = origTL;
             if (type == "dim3") {
                 //Rewrite to size_t[3] array
-                HostRewrite.ReplaceText(
-                        tl.getBeginLoc(),
-                        HostRewrite.getRangeSize(tl.getLocalSourceRange()),
-                        "size_t");
+                RewriteType(tl, "size_t", HostRewrite);
             }
             else if (type == "struct cudaDeviceProp") {
                 if (!UsesCUDADeviceProp) {
@@ -1071,22 +1045,18 @@ private:
                     HostFunctions += CL_GET_DEVICE_PROPS;
                     UsesCUDADeviceProp = true;
                 }
-                HostRewrite.ReplaceText(
-                        tl.getBeginLoc(),
-                        HostRewrite.getRangeSize(tl.getLocalSourceRange()),
-                        "__cu2cl_DeviceProp");
+                RewriteType(tl, "__cu2cl_DeviceProp", HostRewrite);
             }
             else if (type == "cudaStream_t") {
-                HostRewrite.ReplaceText(
-                        tl.getBeginLoc(),
-                        HostRewrite.getRangeSize(tl.getLocalSourceRange()),
-                        "cl_command_queue");
+                RewriteType(tl, "cl_command_queue", HostRewrite);
             }
             else if (type == "cudaEvent_t") {
-                HostRewrite.ReplaceText(
-                        tl.getBeginLoc(),
-                        HostRewrite.getRangeSize(tl.getLocalSourceRange()),
-                        "cl_event");
+                RewriteType(tl, "cl_event", HostRewrite);
+            }
+            else {
+                std::string newType = RewriteVectorType(type, true);
+                if (newType != "")
+                    RewriteType(tl, newType, HostRewrite);
             }
             //TODO check other CUDA-only types to rewrite
         }
@@ -1333,10 +1303,7 @@ private:
             LastLoc = origTL;
             if (type == "dim3") {
                 //Rewrite to size_t[3] array
-                KernelRewrite.ReplaceText(
-                        tl.getBeginLoc(),
-                        KernelRewrite.getRangeSize(tl.getLocalSourceRange()),
-                        "size_t");
+                RewriteType(tl, "size_t", KernelRewrite);
             }
             //TODO check other CUDA-only types to rewrite
         }
@@ -1381,6 +1348,63 @@ private:
                     ReplaceStmtWithText(e, s, KernelRewrite);
             }
         }
+    }
+
+    std::string RewriteVectorType(std::string type, bool addCL) {
+        std::string prepend, append, ret;
+        char size = type[type.length() - 1];
+        switch (size) {
+            case '1':
+            case '2':
+            case '3':
+            case '4':
+                break;
+            default:
+                return "";
+        }
+
+        if (addCL)
+            prepend = "cl_";
+        if (type[0] == 'u')
+            prepend += "u";
+        if (size == '3')
+            append = '4';
+        else if (size != '1')
+            append = size;
+
+        llvm::Regex *regex = new llvm::Regex("^u?char[1-4]$");
+        if (regex->match(type)) {
+            ret = prepend + "char" + append;
+        }
+        delete regex;
+        regex = new llvm::Regex("^u?short[1-4]$");
+        if (regex->match(type)) {
+            ret = prepend + "short" + append;
+        }
+        delete regex;
+        regex = new llvm::Regex("^u?int[1-4]$");
+        if (regex->match(type)) {
+            ret = prepend + "int" + append;
+        }
+        delete regex;
+        regex = new llvm::Regex("^u?long[1-4]$");
+        if (regex->match(type)) {
+            ret = prepend + "long" + append;
+        }
+        delete regex;
+        regex = new llvm::Regex("^u?float[1-4]$");
+        if (regex->match(type)) {
+            ret = prepend + "float" + append;
+        }
+        delete regex;
+        return ret;
+    }
+
+    void RewriteType(TypeLoc tl, std::string replace, Rewriter &rewrite) {
+        rewrite.ReplaceText(
+                tl.getBeginLoc(),
+                rewrite.getRangeSize(tl.getLocalSourceRange()),
+                replace);
     }
 
     void RewriteAttr(Attr *attr, std::string replace, Rewriter &rewrite) {
