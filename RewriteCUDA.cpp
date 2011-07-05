@@ -218,6 +218,8 @@ private:
     std::set<DeclGroupRef, cmpDG> DeviceMemDGs;
     std::set<VarDecl *> DeviceMemVars;
     std::set<VarDecl *> HostMemVars;
+    std::set<VarDecl *> ConstMemVars;
+    std::set<VarDecl *> SharedMemVars;
 
     TypeLoc LastLoc;
 
@@ -1021,7 +1023,29 @@ private:
     }
 
     void RewriteHostVarDecl(VarDecl *var) {
-        //TODO handle __constant__ memory
+        if (CUDAConstantAttr *constAttr = var->getAttr<CUDAConstantAttr>()) {
+            //Handle __constant__ memory declarations
+            RewriteAttr(constAttr, "", HostRewrite);
+            if (CUDADeviceAttr *devAttr = var->getAttr<CUDADeviceAttr>())
+                RewriteAttr(devAttr, "", HostRewrite);
+            ConstMemVars.insert(var);
+        }
+        else if (CUDASharedAttr *sharedAttr = var->getAttr<CUDASharedAttr>()) {
+            //Handle __shared__ memory declarations
+            RewriteAttr(sharedAttr, "", HostRewrite);
+            if (CUDADeviceAttr *devAttr = var->getAttr<CUDADeviceAttr>())
+                RewriteAttr(devAttr, "", HostRewrite);
+            //TODO rewrite shared mem
+            //If extern, remove extern keyword and make into pointer
+            //if (var->isExtern())
+            SharedMemVars.insert(var);
+        }
+        else if (CUDADeviceAttr *attr = var->getAttr<CUDADeviceAttr>()) {
+            //Handle __device__ memory declarations
+            RewriteAttr(attr, "", HostRewrite);
+            //TODO add to devmems, rewrite type
+        }
+
         TypeLoc origTL = var->getTypeSourceInfo()->getTypeLoc();
 
         TypeLoc tl = origTL;
@@ -1147,13 +1171,7 @@ private:
     }
 
     void RewriteKernelParam(ParmVarDecl *parmDecl) {
-        if (CUDADeviceAttr *attr = parmDecl->getAttr<CUDADeviceAttr>()) {
-            RewriteAttr(attr, "", KernelRewrite);
-        }
-        else if (CUDASharedAttr *attr = parmDecl->getAttr<CUDASharedAttr>()) {
-            RewriteAttr(attr, "__local", KernelRewrite);
-        }
-        else if (parmDecl->getOriginalType().getTypePtr()->isPointerType()) {
+        if (parmDecl->getOriginalType().getTypePtr()->isPointerType()) {
             KernelRewrite.InsertTextBefore(
                     parmDecl->getTypeSourceInfo()->getTypeLoc().getBeginLoc(),
                     "__global ");
@@ -1289,6 +1307,14 @@ private:
 
     void RewriteKernelVarDecl(VarDecl *var) {
         //TODO handle __shared__ memory
+        if (CUDASharedAttr *sharedAttr = var->getAttr<CUDASharedAttr>()) {
+            RewriteAttr(sharedAttr, "__local", KernelRewrite);
+            if (CUDADeviceAttr *devAttr = var->getAttr<CUDADeviceAttr>())
+                RewriteAttr(devAttr, "", KernelRewrite);
+            //TODO rewrite shared mem
+            //if (var->isExtern())
+            //ConstMemVars.insert(var);
+        }
         if (CUDASharedAttr *attr = var->getAttr<CUDASharedAttr>()) {
             RewriteAttr(attr, "__local", KernelRewrite);
         }
@@ -1367,15 +1393,20 @@ private:
     void RemoveFunction(FunctionDecl *func, Rewriter &rewrite) {
         SourceLocation startLoc, endLoc, tempLoc;
 
+        FunctionDecl::TemplatedKind tk = func->getTemplatedKind();
+        if (tk != FunctionDecl::TK_NonTemplate &&
+            tk != FunctionDecl::TK_FunctionTemplate)
+            return;
+
         //Find startLoc
         //TODO find first specifier location
         startLoc = func->getTypeSourceInfo()->getTypeLoc().getBeginLoc();
-        /*if (func->getTemplatedKind() == FunctionDecl::TK_FunctionTemplate) {
+        if (tk == FunctionDecl::TK_FunctionTemplate) {
             FunctionTemplateDecl *ftd = func->getDescribedFunctionTemplate();
             tempLoc = ftd->getSourceRange().getBegin();
             if (SM->isBeforeInTranslationUnit(tempLoc, startLoc))
                 startLoc = tempLoc;
-        }*/
+        }
         if (func->hasAttrs()) {
             Attr *attr = (func->getAttrs())[0];
             tempLoc = SM->getInstantiationLoc(attr->getLocation());
