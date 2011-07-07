@@ -343,6 +343,7 @@ private:
             return true;
         }
         else if (CallExpr *ce = dyn_cast<CallExpr>(e)) {
+            //TODO fix case where non-API call starts with "cuda"
             if (ce->getDirectCallee()->getNameAsString().find("cuda") == 0)
                 return RewriteCUDACall(ce, newExpr);
         }
@@ -1303,6 +1304,7 @@ private:
         }
         if (CUDASharedAttr *attr = var->getAttr<CUDASharedAttr>()) {
             RewriteAttr(attr, "__local", KernelRewrite);
+            //if (var->isExtern())
         }
 
         TypeLoc origTL = var->getTypeSourceInfo()->getTypeLoc();
@@ -1611,6 +1613,19 @@ public:
         }
         //Walk declarations in group and rewrite
         for (DeclGroupRef::iterator i = DG.begin(), e = DG.end(); i != e; ++i) {
+            if (DeclContext *dc = dyn_cast<DeclContext>(*i)) {
+                for (DeclContext::decl_iterator di = dc->decls_begin(), de = dc->decls_end();
+                     di != de; ++di) {
+                    if (FunctionDecl *fd = dyn_cast<FunctionDecl>(*di)) {
+                        RewriteHostFunction(fd);
+                        RemoveFunction(fd, KernelRewrite);
+
+                        if (fd->getNameAsString() == MainFuncName) {
+                            RewriteMain(fd);
+                        }
+                    }
+                }
+            }
             if (FunctionDecl *fd = dyn_cast<FunctionDecl>(*i)) {
                 if (fd->hasAttr<CUDAGlobalAttr>() || fd->hasAttr<CUDADeviceAttr>()) {
                     //Device function, so rewrite kernel
