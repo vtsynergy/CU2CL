@@ -221,6 +221,7 @@ private:
     std::set<VarDecl *> HostMemVars;
     std::set<VarDecl *> ConstMemVars;
     std::set<VarDecl *> SharedMemVars;
+    std::set<ParmVarDecl *> CurRefParmVars;
 
     TypeLoc LastLoc;
 
@@ -1137,22 +1138,31 @@ private:
         for (FunctionDecl::param_iterator PI = kernelFunc->param_begin(),
                                           PE = kernelFunc->param_end();
                                           PI != PE; ++PI) {
-            RewriteKernelParam(*PI);
+            RewriteKernelParam(*PI, kernelFunc->hasAttr<CUDAGlobalAttr>());
         }
 
         //Rewrite the body
         if (kernelFunc->hasBody()) {
             RewriteKernelStmt(kernelFunc->getBody());
         }
+        CurRefParmVars.clear();
     }
 
-    void RewriteKernelParam(ParmVarDecl *parmDecl) {
-        if (parmDecl->getOriginalType().getTypePtr()->isPointerType()) {
+    void RewriteKernelParam(ParmVarDecl *parmDecl, bool isFuncGlobal) {
+        TypeLoc tl = parmDecl->getTypeSourceInfo()->getTypeLoc();
+        if (isFuncGlobal && tl.getTypePtr()->isPointerType()) {
             KernelRewrite.InsertTextBefore(
-                    parmDecl->getTypeSourceInfo()->getTypeLoc().getBeginLoc(),
+                    tl.getBeginLoc(),
                     "__global ");
         }
-        TypeLoc tl = parmDecl->getTypeSourceInfo()->getTypeLoc();
+        else if (ReferenceTypeLoc *rtl = dyn_cast<ReferenceTypeLoc>(&tl)) {
+            KernelRewrite.ReplaceText(
+                    rtl->getSigilLoc(),
+                    KernelRewrite.getRangeSize(rtl->getLocalSourceRange()),
+                    "*");
+            CurRefParmVars.insert(parmDecl);
+        }
+
         while (!tl.getNextTypeLoc().isNull()) {
             tl = tl.getNextTypeLoc();
         }
@@ -1268,14 +1278,28 @@ private:
                 }
             }
         }
-        /*else if (DeclRefExpr *dre = dyn_cast<DeclRefExpr>(ks)) {
+        else if (DeclRefExpr *dre = dyn_cast<DeclRefExpr>(e)) {
             //TODO if kernel makes reference to outside var, add arg
             //TODO if references warpSize, print warning
-        }*/
+            if (ParmVarDecl *pvd = dyn_cast<ParmVarDecl>(dre->getDecl())) {
+                if (CurRefParmVars.find(pvd) != CurRefParmVars.end()) {
+                    //TODO check bug that happens when an inserted character
+                    //ends the new range
+                    newExpr = "(*" + exprRewriter.getRewrittenText(realRange) + ")";
+                    return true;
+                }
+            }
+        }
         else if (CallExpr *ce = dyn_cast<CallExpr>(e)) {
             std::string funcName = ce->getDirectCallee()->getNameAsString();
             if (funcName == "__syncthreads") {
                 newExpr = "barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE)";
+            }
+            else if (funcName == "sqrtf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "sqrt(" + newX + ")";
             }
             else if (funcName == "__log2f") {
                 Expr *x = ce->getArg(0);
@@ -1294,6 +1318,21 @@ private:
             else {
                 return false;
             }
+            return true;
+        }
+        else if (CXXFunctionalCastExpr *cfce = dyn_cast<CXXFunctionalCastExpr>(e)) {
+            //TODO rewrite type before wrapping it
+            TypeLoc tl = cfce->getTypeInfoAsWritten()->getTypeLoc();
+            exprRewriter.ReplaceText(
+                    tl.getBeginLoc(),
+                    exprRewriter.getRangeSize(tl.getSourceRange()),
+                    "(" + tl.getType().getAsString() + ")");
+
+            //Rewrite subexpression
+            std::string s;
+            if (RewriteHostExpr(cfce->getSubExpr(), s))
+                ReplaceStmtWithText(cfce->getSubExpr(), s, exprRewriter);
+            newExpr = exprRewriter.getRewrittenText(realRange);
             return true;
         }
 
