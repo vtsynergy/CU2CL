@@ -63,7 +63,7 @@
     "};\n\n"
 
 #define LOAD_PROGRAM_SOURCE \
-    "size_t __cu2cl_LoadProgramSource(char *filename, const char **progSrc) {\n" \
+    "size_t __cu2cl_LoadProgramSource(const char *filename, const char **progSrc) {\n" \
     "    FILE *f = fopen(filename, \"r\");\n" \
     "    fseek(f, 0, SEEK_END);\n" \
     "    size_t len = (size_t) ftell(f);\n" \
@@ -139,7 +139,7 @@
 #define CL_EVENT_QUERY \
     "cl_int __cu2cl_EventQuery(cl_event event) {\n" \
     "    cl_int ret;\n" \
-    "    clGetEventInfo(event, CL_EVENT_COMMAND_ EXECUTION_STATUS, sizeof(cl_int), &ret, NULL);\n" \
+    "    clGetEventInfo(event, CL_EVENT_COMMAND_EXECUTION_STATUS, sizeof(cl_int), &ret, NULL);\n" \
     "    return ret;\n" \
     "}\n\n"
 
@@ -580,7 +580,7 @@ private:
                 //TODO also rewrite type as in cudaGetDevice
                 //VarDecl *var = dyn_cast<VarDecl>(dre->getDecl());
                 newExpr = "__cu2cl_Context = clCreateContext(NULL, 1, &" + newDevice + ", NULL, NULL, NULL);\n";
-                newExpr += "__cu2cl_CommandQueue = clCreateCommandQueue(__cu2cl_Context, " + newDevice + ", 0, NULL)\n";
+                newExpr += "__cu2cl_CommandQueue = clCreateCommandQueue(__cu2cl_Context, " + newDevice + ", CL_QUEUE_PROFILING_ENABLE, NULL)\n";
             }
         }
         else if (funcName == "cudaGetDeviceProperties") {
@@ -600,7 +600,7 @@ private:
             std::string newPStream;
             RewriteHostExpr(pStream, newPStream);
 
-            newExpr = "*" + newPStream + " = clCreateCommandQueue(__cu2cl_Context, __cu2cl_Device, 0, NULL)";
+            newExpr = "*" + newPStream + " = clCreateCommandQueue(__cu2cl_Context, __cu2cl_Device, CL_QUEUE_PROFILING_ENABLE, NULL)";
         }
         else if (funcName == "cudaStreamDestroy") {
             //Replace with clReleaseCommandQueue
@@ -693,11 +693,7 @@ private:
             //If stream == 0, then cl_command_queue == __cu2cl_CommandQueue
             if (newStream == "0")
                 newStream = "__cu2cl_CommandQueue";
-            //TODO remember which streamVals have had profiling set
-            std::string sub = "clSetCommandQueueProperty(" + newStream + ", CL_QUEUE_PROFILING_ENABLE, CL_TRUE, NULL);\n";
-            sub += "clEnqueueMarker(" + newStream + ", &" + newEvent + ")";
-
-            newExpr = sub;
+            newExpr = "clEnqueueMarker(" + newStream + ", &" + newEvent + ")";
         }
         else if (funcName == "cudaEventSynchronize") {
             //Replace with clWaitForEvents
@@ -1739,7 +1735,7 @@ public:
         CLInit += "clGetPlatformIDs(1, &__cu2cl_Platform, NULL);\n";
         CLInit += "clGetDeviceIDs(__cu2cl_Platform, CL_DEVICE_TYPE_GPU, 1, &__cu2cl_Device, NULL);\n";
         CLInit += "__cu2cl_Context = clCreateContext(NULL, 1, &__cu2cl_Device, NULL, NULL, NULL);\n";
-        CLInit += "__cu2cl_CommandQueue = clCreateCommandQueue(__cu2cl_Context, __cu2cl_Device, 0, NULL);\n";
+        CLInit += "__cu2cl_CommandQueue = clCreateCommandQueue(__cu2cl_Context, __cu2cl_Device, CL_QUEUE_PROFILING_ENABLE, NULL);\n";
         for (StringRefListMap::iterator i = Kernels.begin(),
              e = Kernels.end(); i != e; i++) {
             std::string file = idCharFilter((*i).first);
