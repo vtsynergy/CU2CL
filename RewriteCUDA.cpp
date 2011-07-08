@@ -1301,11 +1301,29 @@ private:
             if (funcName == "__syncthreads") {
                 newExpr = "barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE)";
             }
+            else if (funcName == "fabsf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "fabs(" + newX + ")";
+            }
             else if (funcName == "sqrtf") {
                 Expr *x = ce->getArg(0);
                 std::string newX;
                 RewriteKernelExpr(x, newX);
                 newExpr = "sqrt(" + newX + ")";
+            }
+            else if (funcName == "__expf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "native_exp(" + newX + ")";
+            }
+            else if (funcName == "__logf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "native_log(" + newX + ")";
             }
             else if (funcName == "__log2f") {
                 Expr *x = ce->getArg(0);
@@ -1552,16 +1570,16 @@ private:
         //Find endLoc
         if (var->hasInit()) {
             Expr *init = var->getInit();
-            endLoc = init->getLocEnd();;
+            endLoc = SM->getInstantiationLoc(init->getLocEnd());
         }
         else {
             //Find location of semi-colon
             TypeLoc tl = var->getTypeSourceInfo()->getTypeLoc();
             if (ArrayTypeLoc *atl = dyn_cast<ArrayTypeLoc>(&tl)) {
-                endLoc = atl->getRBracketLoc();
+                endLoc = SM->getInstantiationLoc(atl->getRBracketLoc());
             }
             else
-                endLoc = var->getSourceRange().getEnd();
+                endLoc = SM->getInstantiationLoc(var->getSourceRange().getEnd());
         }
         rewrite.RemoveText(startLoc,
                            rewrite.getRangeSize(SourceRange(startLoc, endLoc)));
@@ -1582,8 +1600,11 @@ private:
     }
 
     bool ReplaceStmtWithText(Stmt *OldStmt, llvm::StringRef NewStr, Rewriter &Rewrite) {
+        SourceRange origRange = OldStmt->getSourceRange();
+        SourceLocation s = SM->getInstantiationLoc(origRange.getBegin());
+        SourceLocation e = SM->getInstantiationLoc(origRange.getEnd());
         return Rewrite.ReplaceText(OldStmt->getLocStart(),
-                                   Rewrite.getRangeSize(OldStmt->getSourceRange()),
+                                   Rewrite.getRangeSize(SourceRange(s, e)),
                                    NewStr);
     }
 
