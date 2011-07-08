@@ -550,14 +550,16 @@ private:
         else if (funcName == "cudaGetDevice") {
             //Replace by assigning current value of clDevice to arg
             Expr *device = cudaCall->getArg(0);
+            std::string newDevice;
+            RewriteHostExpr(device, newDevice);
             DeclRefExpr *dr = FindStmt<DeclRefExpr>(device);
             VarDecl *var = dyn_cast<VarDecl>(dr->getDecl());
 
             //Rewrite var type to cl_device_id
-            //TODO check if type already rewritten
+            //TODO properly rewrite and check if type already rewritten
             TypeLoc tl = var->getTypeSourceInfo()->getTypeLoc();
             RewriteType(tl, "cl_device_id", HostRewrite);
-            newExpr = var->getNameAsString() + " = __cu2cl_Device";
+            newExpr = "*" + newDevice + " = __cu2cl_Device";
         }
         else if (funcName == "cudaGetDeviceCount") {
             //Replace with clGetDeviceIDs
@@ -572,10 +574,12 @@ private:
             Expr *device = cudaCall->getArg(0);
             DeclRefExpr *dre = FindStmt<DeclRefExpr>(device);
             if (dre != NULL) {
-                VarDecl *var = dyn_cast<VarDecl>(dre->getDecl());
-                std::string sub = "__cu2cl_Context = clCreateContext(NULL, 1, &" + var->getNameAsString() + ", NULL, NULL, NULL);\n";
-                sub += "__cu2cl_CommandQueue = clCreateCommandQueue(__cu2cl_Context, " + var->getNameAsString() +", 0, NULL)\n";
-                newExpr = sub;
+                std::string newDevice;
+                RewriteHostExpr(device, newDevice);
+                //TODO also rewrite type as in cudaGetDevice
+                //VarDecl *var = dyn_cast<VarDecl>(dre->getDecl());
+                newExpr = "__cu2cl_Context = clCreateContext(NULL, 1, &" + newDevice + ", NULL, NULL, NULL);\n";
+                newExpr += "__cu2cl_CommandQueue = clCreateCommandQueue(__cu2cl_Context, " + newDevice + ", 0, NULL)\n";
             }
         }
         else if (funcName == "cudaGetDeviceProperties") {
@@ -705,11 +709,11 @@ private:
         //Memory Management
         else if (funcName == "cudaFree") {
             Expr *devPtr = cudaCall->getArg(0);
-            DeclRefExpr *dr = FindStmt<DeclRefExpr>(devPtr);
-            llvm::StringRef varName = dr->getDecl()->getName();
+            std::string newDevPtr;
+            RewriteHostExpr(devPtr, newDevPtr);
 
             //Replace with clReleaseMemObject
-            newExpr = "clReleaseMemObject(" + varName.str() + ")";
+            newExpr = "clReleaseMemObject(" + newDevPtr + ")";
         }
         else if (funcName == "cudaFreeHost") {
             //Replace with __cu2cl_FreeHost
@@ -731,15 +735,14 @@ private:
         else if (funcName == "cudaMalloc") {
             Expr *devPtr = cudaCall->getArg(0);
             Expr *size = cudaCall->getArg(1);
+            std::string newDevPtr, newSize;
+            RewriteHostExpr(size, newSize);
+            RewriteHostExpr(devPtr, newDevPtr);
             DeclRefExpr *dr = FindStmt<DeclRefExpr>(devPtr);
             VarDecl *var = dyn_cast<VarDecl>(dr->getDecl());
-            llvm::StringRef varName = var->getName();
-            std::string newSize;
-            RewriteHostExpr(size, newSize);
 
             //Replace with clCreateBuffer
-            std::string sub = varName.str() + " = clCreateBuffer(__cu2cl_Context, CL_MEM_READ_WRITE, " + newSize + ", NULL, NULL)";
-            newExpr = sub;
+            newExpr = "*" + newDevPtr + " = clCreateBuffer(__cu2cl_Context, CL_MEM_READ_WRITE, " + newSize + ", NULL, NULL)";
 
             DeclGroupRef varDG(var);
             if (CurVarDeclGroups.find(varDG) != CurVarDeclGroups.end()) {
@@ -931,6 +934,8 @@ private:
         //Set kernel arguments
         for (unsigned i = 0; i < kernelCall->getNumArgs(); i++) {
             Expr *arg = kernelCall->getArg(i);
+            std::string newArg;
+            RewriteHostExpr(arg, newArg);
             VarDecl *var = dyn_cast<VarDecl>(FindStmt<DeclRefExpr>(arg)->getDecl());
             args << "clSetKernelArg(" << kernelName << ", " << i << ", sizeof(";
             if (DeviceMemVars.find(var) != DeviceMemVars.end()) {
@@ -938,9 +943,9 @@ private:
                 args << "cl_mem";
             }
             else {
-                args << var->getType().getAsString();
+                args << arg->getType().getAsString();
             }
-            args << "), &" << var->getNameAsString() << ");\n";
+            args << "), &" << newArg << ");\n";
         }
 
         //TODO handle passing in a new dim3? (i.e. dim3(1,2,3))
@@ -1271,8 +1276,25 @@ private:
             std::string funcName = ce->getDirectCallee()->getNameAsString();
             if (funcName == "__syncthreads") {
                 newExpr = "barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE)";
-                return true;
             }
+            else if (funcName == "__log2f") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "native_log2(" + newX + ")";
+            }
+            else if (funcName == "__powf") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "native_powr(" + newX + ", " + newY + ")";
+            }
+            else {
+                return false;
+            }
+            return true;
         }
 
         bool ret = false;
