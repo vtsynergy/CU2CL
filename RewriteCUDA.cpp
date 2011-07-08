@@ -945,6 +945,8 @@ private:
             args << "), &" << newArg << ");\n";
         }
 
+        //TODO add constant memory arguments
+
         //TODO handle passing in a new dim3? (i.e. dim3(1,2,3))
         //Set work sizes
         //Guaranteed to be dim3s, so pull out their x,y,z values
@@ -1008,7 +1010,15 @@ private:
             RewriteAttr(constAttr, "", HostRewrite);
             if (CUDADeviceAttr *devAttr = var->getAttr<CUDADeviceAttr>())
                 RewriteAttr(devAttr, "", HostRewrite);
+            //DeviceMemVars.insert(var);
             ConstMemVars.insert(var);
+
+            TypeLoc origTL = var->getTypeSourceInfo()->getTypeLoc();
+            if (LastLoc.isNull() || origTL.getBeginLoc() != LastLoc.getBeginLoc()) {
+                LastLoc = origTL;
+                RewriteType(origTL, "cl_mem", HostRewrite);
+            }
+            return;
         }
         else if (CUDASharedAttr *sharedAttr = var->getAttr<CUDASharedAttr>()) {
             //Handle __shared__ memory declarations
@@ -1357,11 +1367,6 @@ private:
                 RewriteAttr(devAttr, "", KernelRewrite);
             //TODO rewrite shared mem
             //if (var->isExtern())
-            //ConstMemVars.insert(var);
-        }
-        if (CUDASharedAttr *attr = var->getAttr<CUDASharedAttr>()) {
-            RewriteAttr(attr, "__local", KernelRewrite);
-            //if (var->isExtern())
         }
 
         TypeLoc origTL = var->getTypeSourceInfo()->getTypeLoc();
@@ -1641,8 +1646,9 @@ public:
         Decl *firstDecl = DG.isSingleDecl() ? DG.getSingleDecl() : DG.getDeclGroup()[0];
         SourceLocation loc = firstDecl->getLocation();
         if (!SM->isFromMainFile(loc)) {
-            if (strstr(SM->getPresumedLoc(loc).getFilename(), ".cu") != NULL) {
-                //If #included and a .cu file, rewrite
+            llvm::StringRef fileExt = extension(SM->getPresumedLoc(loc).getFilename());
+            if (fileExt.equals(".cu") || fileExt.equals(".cuh")) {
+                //If #included and a .cu or .cuh file, rewrite
                 if (OutFiles.find(SM->getFileID(loc)) == OutFiles.end()) {
                     //Create new files
                     FileID fileid = SM->getFileID(loc);
@@ -1856,26 +1862,28 @@ public:
                         llvm::StringRef FileName, bool IsAngled,
                         const FileEntry *File, SourceLocation EndLoc/*,
                         const llvm::SmallVectorImpl<char> &RawPath*/) {
+        llvm::StringRef fileExt = extension(SM->getPresumedLoc(HashLoc).getFilename());
+        llvm::StringRef includedFile = filename(FileName);
+        llvm::StringRef includedExt = extension(includedFile);
         if (SM->isFromMainFile(HashLoc) ||
-            extension(SM->getPresumedLoc(HashLoc).getFilename()).str() == ".cu") {
+            fileExt.equals(".cu") || fileExt.equals(".cuh")) {
             if (IsAngled) {
                 KernelRewrite.RemoveText(HashLoc, KernelRewrite.getRangeSize(SourceRange(HashLoc, EndLoc)));
-                if (filename(FileName).str() == "cuda.h")
+                if (includedFile.equals("cuda.h"))
                     HostRewrite.RemoveText(HashLoc, HostRewrite.getRangeSize(SourceRange(HashLoc, EndLoc)));
             }
-            else if (filename(FileName).str() == "cuda.h") {
+            else if (includedFile.equals("cuda.h")) {
                 HostRewrite.RemoveText(HashLoc, HostRewrite.getRangeSize(SourceRange(HashLoc, EndLoc)));
                 KernelRewrite.RemoveText(HashLoc, KernelRewrite.getRangeSize(SourceRange(HashLoc, EndLoc)));
             }
-            else if (extension(FileName).str() == ".cu") {
+            else if (includedExt.equals(".cu") || includedExt.equals(".cuh")) {
                 FileID fileID = SM->getFileID(HashLoc);
                 SourceLocation fileStartLoc = SM->getLocForStartOfFile(fileID);
                 llvm::StringRef fileBuf = SM->getBufferData(fileID);
                 const char *fileBufStart = fileBuf.begin();
 
-                llvm::StringRef ext = extension(FileName);
-                SourceLocation start = fileStartLoc.getFileLocWithOffset(ext.begin() - fileBufStart);
-                SourceLocation end = fileStartLoc.getFileLocWithOffset((ext.end()-1) - fileBufStart);
+                SourceLocation start = fileStartLoc.getFileLocWithOffset(includedExt.begin() - fileBufStart);
+                SourceLocation end = fileStartLoc.getFileLocWithOffset((includedExt.end()-1) - fileBufStart);
                 HostRewrite.ReplaceText(start, HostRewrite.getRangeSize(SourceRange(start, end)), "-cl.h");
                 KernelRewrite.ReplaceText(start, KernelRewrite.getRangeSize(SourceRange(start, end)), "-cl.cl");
             }
