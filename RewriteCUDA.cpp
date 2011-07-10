@@ -579,7 +579,8 @@ private:
                 RewriteHostExpr(device, newDevice);
                 //TODO also rewrite type as in cudaGetDevice
                 //VarDecl *var = dyn_cast<VarDecl>(dre->getDecl());
-                newExpr = "__cu2cl_Context = clCreateContext(NULL, 1, &" + newDevice + ", NULL, NULL, NULL);\n";
+                newExpr = "clReleaseContext(__cu2cl_Context);\n";
+                newExpr += "__cu2cl_Context = clCreateContext(NULL, 1, &" + newDevice + ", NULL, NULL, NULL);\n";
                 newExpr += "__cu2cl_CommandQueue = clCreateCommandQueue(__cu2cl_Context, " + newDevice + ", CL_QUEUE_PROFILING_ENABLE, NULL)\n";
             }
         }
@@ -898,7 +899,7 @@ private:
                 dr = FindStmt<DeclRefExpr>(src);
                 VarDecl *var = dyn_cast<VarDecl>(dr->getDecl());
                 llvm::StringRef varName = var->getName();
-                newExpr = "clEnqueueWriteBuffer(" + newStream + ", " + newDst + ", CL_FALSE, 0, " + newCount + ", __cu2cl_Mem_" + varName.str() + ", 0, NULL, NULL)";
+                newExpr = "clEnqueueWriteBuffer(" + newStream + ", " + newDst + ", CL_FALSE, 0, " + newCount + ", " + newSrc + ", 0, NULL, NULL)";
             }
             else if (enumString == "cudaMemcpyDeviceToHost") {
                 //TODO figure out if you need the cl_mems of HostMemVars
@@ -906,7 +907,7 @@ private:
                 dr = FindStmt<DeclRefExpr>(dst);
                 VarDecl *var = dyn_cast<VarDecl>(dr->getDecl());
                 llvm::StringRef varName = var->getName();
-                newExpr = "clEnqueueReadBuffer(" + newStream + ", " + newSrc + ", CL_FALSE, 0, " + newCount + ", __cu2cl_Mem_" + varName.str() + ", 0, NULL, NULL)";
+                newExpr = "clEnqueueReadBuffer(" + newStream + ", " + newSrc + ", CL_FALSE, 0, " + newCount + ", " + newDst + ", 0, NULL, NULL)";
             }
             else if (enumString == "cudaMemcpyDeviceToDevice") {
                 //TODO implement __cu2cl_MemcpyDevToDev
