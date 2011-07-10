@@ -583,6 +583,10 @@ private:
                 newExpr += "__cu2cl_CommandQueue = clCreateCommandQueue(__cu2cl_Context, " + newDevice + ", CL_QUEUE_PROFILING_ENABLE, NULL)\n";
             }
         }
+        else if (funcName == "cudaSetDeviceFlags") {
+            //Remove for now, as OpenCL has no device flags to set
+            newExpr = "";
+        }
         else if (funcName == "cudaGetDeviceProperties") {
             //Replace with __cu2cl_GetDeviceProperties
             Expr *prop = cudaCall->getArg(0);
@@ -704,6 +708,32 @@ private:
         }
 
         //Memory Management
+        else if (funcName == "cudaHostAlloc") {
+            //Replace with __cu2cl_MallocHost
+            if (!UsesCUDAMallocHost) {
+                HostFunctions += CL_MALLOC_HOST;
+                UsesCUDAMallocHost = true;
+            }
+
+            Expr *ptr = cudaCall->getArg(0);
+            Expr *size = cudaCall->getArg(1);
+            std::string newPtr, newSize;
+            RewriteHostExpr(ptr, newPtr);
+            RewriteHostExpr(size, newSize);
+
+            DeclRefExpr *dr = FindStmt<DeclRefExpr>(ptr);
+            VarDecl *var = dyn_cast<VarDecl>(dr->getDecl());
+            llvm::StringRef varName = var->getName();
+
+            newExpr = "__cu2cl_MallocHost(" + newPtr + ", " + newSize + ", &__cu2cl_Mem_" + varName.str() + ")";
+
+            if (HostMemVars.find(var) == HostMemVars.end()) {
+                //Create new cl_mem for ptr
+                HostGlobalVars += "cl_mem __cu2cl_Mem_" + varName.str() + ";\n";
+                //Add var to HostMemVars
+                HostMemVars.insert(var);
+            }
+        }
         else if (funcName == "cudaFree") {
             Expr *devPtr = cudaCall->getArg(0);
             std::string newDevPtr;
@@ -1527,6 +1557,7 @@ private:
 
         //Find startLoc
         //TODO find first specifier location
+        //TODO find storage class specifier
         startLoc = func->getTypeSourceInfo()->getTypeLoc().getBeginLoc();
         if (tk == FunctionDecl::TK_FunctionTemplate) {
             FunctionTemplateDecl *ftd = func->getDescribedFunctionTemplate();
@@ -1559,6 +1590,7 @@ private:
 
         //Find startLoc
         //TODO find first specifier location
+        //TODO find storage class specifier
         startLoc = var->getTypeSourceInfo()->getTypeLoc().getBeginLoc();
         if (var->hasAttrs()) {
             Attr *attr = (var->getAttrs())[0];
@@ -1603,7 +1635,7 @@ private:
         SourceRange origRange = OldStmt->getSourceRange();
         SourceLocation s = SM->getInstantiationLoc(origRange.getBegin());
         SourceLocation e = SM->getInstantiationLoc(origRange.getEnd());
-        return Rewrite.ReplaceText(OldStmt->getLocStart(),
+        return Rewrite.ReplaceText(s,
                                    Rewrite.getRangeSize(SourceRange(s, e)),
                                    NewStr);
     }
