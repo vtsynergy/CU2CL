@@ -1,19 +1,15 @@
 #include "clang/AST/AST.h"
 #include "clang/AST/ASTConsumer.h"
-#include "clang/AST/Expr.h"
-#include "clang/AST/ExprCXX.h"
-#include "clang/AST/Stmt.h"
 
 #include "clang/Basic/Diagnostic.h"
 #include "clang/Basic/FileManager.h"
 #include "clang/Basic/SourceManager.h"
 
-#include "clang/Lex/PPCallbacks.h"
-
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Frontend/FrontendPluginRegistry.h"
 
 #include "clang/Lex/Preprocessor.h"
+#include "clang/Lex/PPCallbacks.h"
 
 #include "clang/Rewrite/Rewriter.h"
 

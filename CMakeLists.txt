@@ -1,37 +1,79 @@
-set(MODULE TRUE)
+project(CU2CL)
+cmake_minimum_required(VERSION 2.8)
 
-set( LLVM_USED_LIBS
-  clangFrontendTool
-  clangFrontend
-  clangDriver
-  clangSerialization
-  clangCodeGen
-  clangParse
-  clangSema
-  clangStaticAnalyzerCheckers
-  clangStaticAnalyzerCore
-  clangAnalysis
-  clangIndex
-  clangRewrite
-  clangAST
-  clangLex
-  clangBasic
-  )
+set(CU2CL_PATH_TO_LLVM_SRC "" CACHE PATH
+    "Path to LLVM source code. Not necessary if using an installed LLVM.")
+set(CU2CL_PATH_TO_LLVM_BUILD "" CACHE PATH
+    "Path to the directory where LLVM was built or installed.")
 
-# Why do we have to link to all this just to print out function names?
-set( LLVM_LINK_COMPONENTS
-  ${LLVM_TARGETS_TO_BUILD}
-  asmparser
-  bitreader
-  bitwriter
-  codegen
-  ipo
-  selectiondag
-  )
+set(CU2CL_PATH_TO_CLANG_SRC "" CACHE PATH
+    "Path to Clang source code. Not necessary if using an installed Clang.")
+set(CU2CL_PATH_TO_CLANG_BUILD "" CACHE PATH
+    "Path to the directory where Clang was built or installed.")
 
-add_clang_library(RewriteCUDA RewriteCUDA.cpp)
+if(CU2CL_PATH_TO_LLVM_SRC)
+    if(NOT EXISTS "${CU2CL_PATH_TO_LLVM_SRC}/cmake/config-ix.cmake")
+        message(FATAL_ERROR
+                "Please set CU2CL_PATH_TO_LLVM_SRC to the root directory of LLVM source code.")
+    else()
+        get_filename_component(LLVM_SRC_DIR ${CU2CL_PATH_TO_LLVM_SRC}
+                               ABSOLUTE)
+        list(APPEND CMAKE_MODULE_PATH "${LLVM_SRC_DIR}/cmake/modules")
+    endif()
+endif()
+if(CU2CL_PATH_TO_CLANG_SRC)
+    if(NOT EXISTS "${CU2CL_PATH_TO_CLANG_SRC}/CMakeLists.txt")
+        message(FATAL_ERROR
+            "Please set CU2CL_PATH_TO_CLANG_SRC to the root directory of Clang source code.")
+    else()
+        get_filename_component(CLANG_SRC_DIR ${CU2CL_PATH_TO_CLANG_SRC}
+                               ABSOLUTE)
+    endif()
+endif()
+
+if(NOT EXISTS "${CU2CL_PATH_TO_LLVM_BUILD}/bin/tblgen${CMAKE_EXECUTABLE_SUFFIX}" )
+    message(FATAL_ERROR
+            "Please set CU2CL_PATH_TO_LLVM_BUILD to a directory containing an LLVM build.")
+endif()
+get_filename_component(LLVM_BUILD_DIR ${CU2CL_PATH_TO_LLVM_BUILD}
+                       ABSOLUTE)
+if(NOT EXISTS "${CU2CL_PATH_TO_CLANG_BUILD}/bin/clang${CMAKE_EXECUTABLE_SUFFIX}" )
+    message(FATAL_ERROR
+            "Please set CU2CL_PATH_TO_CLANG_BUILD to a directory containing a Clang build.")
+endif()
+get_filename_component(CLANG_BUILD_DIR ${CU2CL_PATH_TO_CLANG_BUILD}
+                       ABSOLUTE)
+
+list(APPEND CMAKE_MODULE_PATH "${LLVM_BUILD_DIR}/share/llvm/cmake")
+
+include(AddLLVM)
+include(HandleLLVMOptions)
+include("${LLVM_BUILD_DIR}/share/llvm/cmake/LLVM.cmake")
+
+set(CMAKE_INCLUDE_CURRENT_DIR ON)
+include_directories("${LLVM_BUILD_DIR}/include" "${LLVM_SRC_DIR}/include")
+include_directories("${CLANG_BUILD_DIR}/include" "${CLANG_SRC_DIR}/include")
+link_directories("${LLVM_BUILD_DIR}/lib")
+link_directories("${CLANG_BUILD_DIR}/lib")
+
+llvm_process_sources(srcs RewriteCUDA.cpp)
+
+add_library(RewriteCUDA MODULE ${srcs})
+
+set(LLVM_USED_LIBS
+    clangFrontend
+    clangRewrite
+    clangAST
+    clangLex
+    clangBasic
+)
+
+foreach(lib ${LLVM_USED_LIBS})
+    target_link_libraries(RewriteCUDA ${lib})
+endforeach(lib)
 
 set_target_properties(RewriteCUDA
-  PROPERTIES
-  LINKER_LANGUAGE CXX
-  PREFIX "")
+    PROPERTIES
+    LINKER_LANGUAGE CXX
+    PREFIX ""
+)
