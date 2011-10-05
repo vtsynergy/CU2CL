@@ -1,0 +1,11 @@
+--- a/lib/Lex/PPDirectives.cpp	2011-07-26 13:49:00.964745447 -0400
++++ b/lib/Lex/PPDirectives.cpp	2011-07-25 09:13:06.459600825 -0400
+@@ -1127,7 +1127,7 @@
+   case tok::angle_string_literal:
+   case tok::string_literal:
+     Filename = getSpelling(FilenameTok, FilenameBuffer);
+-    End = FilenameTok.getLocation();
++    End = FilenameTok.getLocation().getFileLocWithOffset(FilenameTok.getLength());
+     break;
+ 
+   case tok::less:

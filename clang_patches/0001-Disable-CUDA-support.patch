@@ -1,0 +1,288 @@
+>From 17a4e54fc8fb7abc1ff742960f627ffdb19bc9bc Mon Sep 17 00:00:00 2001
+From: Peter Collingbourne <peter@pcc.me.uk>
+Date: Wed, 23 Mar 2011 02:50:15 +0000
+Subject: [PATCH] Disable CUDA support
+
+---
+ include/clang/Driver/Types.def           |    1 -
+ include/clang/Frontend/FrontendAction.h  |    1 -
+ include/clang/Frontend/LangStandards.def |    5 -----
+ lib/Driver/Types.cpp                     |    2 --
+ lib/Frontend/CompilerInvocation.cpp      |    8 --------
+ lib/Frontend/FrontendActions.cpp         |    1 -
+ lib/Frontend/FrontendOptions.cpp         |    1 -
+ test/CMakeLists.txt                      |    1 -
+ test/PCH/cuda-kernel-call.cu             |   25 -------------------------
+ test/Parser/cuda-kernel-call.cu          |    9 ---------
+ test/SemaCUDA/config-type.cu             |    3 ---
+ test/SemaCUDA/cuda.h                     |   19 -------------------
+ test/SemaCUDA/kernel-call.cu             |   23 -----------------------
+ test/SemaCUDA/qualifiers.cu              |    8 --------
+ 14 files changed, 0 insertions(+), 107 deletions(-)
+ delete mode 100644 test/PCH/cuda-kernel-call.cu
+ delete mode 100644 test/Parser/cuda-kernel-call.cu
+ delete mode 100644 test/SemaCUDA/config-type.cu
+ delete mode 100644 test/SemaCUDA/cuda.h
+ delete mode 100644 test/SemaCUDA/kernel-call.cu
+ delete mode 100644 test/SemaCUDA/qualifiers.cu
+
+diff --git a/include/clang/Driver/Types.def b/include/clang/Driver/Types.def
+index f09a1dc..06a8690 100644
+--- a/include/clang/Driver/Types.def
++++ b/include/clang/Driver/Types.def
+@@ -42,7 +42,6 @@
+ TYPE("cpp-output",               PP_C,         INVALID,         "i",     "u")
+ TYPE("c",                        C,            PP_C,            0,       "u")
+ TYPE("cl",                       CL,           PP_C,            0,       "u")
+-TYPE("cuda",                     CUDA,         PP_CXX,          0,       "u")
+ TYPE("objective-c-cpp-output",   PP_ObjC,      INVALID,         "mi",    "u")
+ TYPE("objective-c",              ObjC,         PP_ObjC,         0,       "u")
+ TYPE("c++-cpp-output",           PP_CXX,       INVALID,         "ii",    "u")
+diff --git a/include/clang/Frontend/FrontendAction.h b/include/clang/Frontend/FrontendAction.h
+index ee0863a..2cab2bf 100644
+--- a/include/clang/Frontend/FrontendAction.h
++++ b/include/clang/Frontend/FrontendAction.h
+@@ -37,7 +37,6 @@ enum InputKind {
+   IK_PreprocessedObjC,
+   IK_PreprocessedObjCXX,
+   IK_OpenCL,
+-  IK_CUDA,
+   IK_AST,
+   IK_LLVM_IR
+ };
+diff --git a/include/clang/Frontend/LangStandards.def b/include/clang/Frontend/LangStandards.def
+index d4046b3..52aa463 100644
+--- a/include/clang/Frontend/LangStandards.def
++++ b/include/clang/Frontend/LangStandards.def
+@@ -80,9 +80,4 @@ LANGSTANDARD(opencl, "cl",
+              "OpenCL 1.0",
+              BCPLComment | C99 | Digraphs | HexFloat)
+ 
+-// CUDA
+-LANGSTANDARD(cuda, "cuda",
+-             "NVIDIA CUDA(tm)",
+-             BCPLComment | CPlusPlus | Digraphs)
+-
+ #undef LANGSTANDARD
+diff --git a/lib/Driver/Types.cpp b/lib/Driver/Types.cpp
+index 4a4312b..5ddbc58 100644
+--- a/lib/Driver/Types.cpp
++++ b/lib/Driver/Types.cpp
+@@ -78,7 +78,6 @@ bool types::isAcceptedByClang(ID Id) {
+   case TY_Asm:
+   case TY_C: case TY_PP_C:
+   case TY_CL:
+-  case TY_CUDA:
+   case TY_ObjC: case TY_PP_ObjC:
+   case TY_CXX: case TY_PP_CXX:
+   case TY_ObjCXX: case TY_PP_ObjCXX:
+@@ -152,7 +151,6 @@ types::ID types::lookupTypeForExtension(const char *Ext) {
+            .Case("CC", TY_CXX)
+            .Case("cl", TY_CL)
+            .Case("cp", TY_CXX)
+-           .Case("cu", TY_CUDA)
+            .Case("hh", TY_CXXHeader)
+            .Case("ll", TY_LLVM_IR)
+            .Case("hpp", TY_CXXHeader)
+diff --git a/lib/Frontend/CompilerInvocation.cpp b/lib/Frontend/CompilerInvocation.cpp
+index 8f99403..49df274 100644
+--- a/lib/Frontend/CompilerInvocation.cpp
++++ b/lib/Frontend/CompilerInvocation.cpp
+@@ -303,7 +303,6 @@ static const char *getInputKindName(InputKind Kind) {
+   case IK_ObjC:              return "objective-c";
+   case IK_ObjCXX:            return "objective-c++";
+   case IK_OpenCL:            return "cl";
+-  case IK_CUDA:              return "cuda";
+   case IK_PreprocessedC:     return "cpp-output";
+   case IK_PreprocessedCXX:   return "c++-cpp-output";
+   case IK_PreprocessedObjC:  return "objective-c-cpp-output";
+@@ -1150,7 +1149,6 @@ static InputKind ParseFrontendArgs(FrontendOptions &Opts, ArgList &Args,
+       .Case("cl", IK_OpenCL)
+       .Case("c", IK_C)
+       .Case("cl", IK_OpenCL)
+-      .Case("cuda", IK_CUDA)
+       .Case("c++", IK_CXX)
+       .Case("objective-c", IK_ObjC)
+       .Case("objective-c++", IK_ObjCXX)
+@@ -1279,9 +1277,6 @@ void CompilerInvocation::setLangDefaults(LangOptions &Opts, InputKind IK,
+     case IK_OpenCL:
+       LangStd = LangStandard::lang_opencl;
+       break;
+-    case IK_CUDA:
+-      LangStd = LangStandard::lang_cuda;
+-      break;
+     case IK_Asm:
+     case IK_C:
+     case IK_PreprocessedC:
+@@ -1318,9 +1313,6 @@ void CompilerInvocation::setLangDefaults(LangOptions &Opts, InputKind IK,
+     Opts.DefaultFPContract = 1;
+   }
+ 
+-  if (LangStd == LangStandard::lang_cuda)
+-    Opts.CUDA = 1;
+-
+   // OpenCL and C++ both have bool, true, false keywords.
+   Opts.Bool = Opts.OpenCL || Opts.CPlusPlus;
+ 
+diff --git a/lib/Frontend/FrontendActions.cpp b/lib/Frontend/FrontendActions.cpp
+index 7b06c7e..b316304 100644
+--- a/lib/Frontend/FrontendActions.cpp
++++ b/lib/Frontend/FrontendActions.cpp
+@@ -198,7 +198,6 @@ void PrintPreambleAction::ExecuteAction() {
+   case IK_ObjC:
+   case IK_ObjCXX:
+   case IK_OpenCL:
+-  case IK_CUDA:
+     break;
+       
+   case IK_None:
+diff --git a/lib/Frontend/FrontendOptions.cpp b/lib/Frontend/FrontendOptions.cpp
+index 0a20051..9dfee24 100644
+--- a/lib/Frontend/FrontendOptions.cpp
++++ b/lib/Frontend/FrontendOptions.cpp
+@@ -26,7 +26,6 @@ InputKind FrontendOptions::getInputKindForExtension(llvm::StringRef Extension) {
+     .Cases("C", "cc", "cp", IK_CXX)
+     .Cases("cpp", "CPP", "c++", "cxx", "hpp", IK_CXX)
+     .Case("cl", IK_OpenCL)
+-    .Case("cu", IK_CUDA)
+     .Cases("ll", "bc", IK_LLVM_IR)
+     .Default(IK_C);
+ }
+diff --git a/test/CMakeLists.txt b/test/CMakeLists.txt
+index 544ed3d..1090564 100644
+--- a/test/CMakeLists.txt
++++ b/test/CMakeLists.txt
+@@ -19,7 +19,6 @@ set(CLANG_TEST_DIRECTORIES
+   "Preprocessor"
+   "Rewriter"
+   "Sema"
+-  "SemaCUDA"
+   "SemaCXX"
+   "SemaObjC"
+   "SemaObjCXX"
+diff --git a/test/PCH/cuda-kernel-call.cu b/test/PCH/cuda-kernel-call.cu
+deleted file mode 100644
+index ef12c59..0000000
+--- a/test/PCH/cuda-kernel-call.cu
++++ /dev/null
+@@ -1,25 +0,0 @@
+-// RUN: %clang_cc1 -emit-pch -o %t %s
+-// RUN: %clang_cc1 -include-pch %t -fsyntax-only %s 
+-
+-#ifndef HEADER
+-#define HEADER
+-// Header.
+-
+-#include "../SemaCUDA/cuda.h"
+-
+-void kcall(void (*kp)()) {
+-  kp<<<1, 1>>>();
+-}
+-
+-__global__ void kern() {
+-}
+-
+-#else
+-// Using the header.
+-
+-void test() {
+-  kcall(kern);
+-  kern<<<1, 1>>>();
+-}
+-
+-#endif
+diff --git a/test/Parser/cuda-kernel-call.cu b/test/Parser/cuda-kernel-call.cu
+deleted file mode 100644
+index f95ae9e..0000000
+--- a/test/Parser/cuda-kernel-call.cu
++++ /dev/null
+@@ -1,9 +0,0 @@
+-// RUN: %clang_cc1 -fsyntax-only -verify %s
+-
+-void foo(void) {
+-  foo<<<1;      // expected-error {{expected '>>>'}} expected-note {{to match this '<<<'}}
+-
+-  foo<<<1,1>>>; // expected-error {{expected '('}}
+-
+-  foo<<<>>>();  // expected-error {{expected expression}}
+-}
+diff --git a/test/SemaCUDA/config-type.cu b/test/SemaCUDA/config-type.cu
+deleted file mode 100644
+index a469d38..0000000
+--- a/test/SemaCUDA/config-type.cu
++++ /dev/null
+@@ -1,3 +0,0 @@
+-// RUN: %clang_cc1 -fsyntax-only -verify %s
+-
+-void cudaConfigureCall(unsigned gridSize, unsigned blockSize); // expected-error {{must have scalar return type}}
+diff --git a/test/SemaCUDA/cuda.h b/test/SemaCUDA/cuda.h
+deleted file mode 100644
+index e3aeb99..0000000
+--- a/test/SemaCUDA/cuda.h
++++ /dev/null
+@@ -1,19 +0,0 @@
+-/* Minimal declarations for CUDA support.  Testing purposes only. */
+-
+-#include <stddef.h>
+-
+-#define __constant__ __attribute__((constant))
+-#define __device__ __attribute__((device))
+-#define __global__ __attribute__((global))
+-#define __host__ __attribute__((host))
+-#define __shared__ __attribute__((shared))
+-
+-struct dim3 {
+-  unsigned x, y, z;
+-  dim3(unsigned x, unsigned y = 1, unsigned z = 1) : x(x), y(y), z(z) {}
+-};
+-
+-typedef struct cudaStream *cudaStream_t;
+-
+-int cudaConfigureCall(dim3 gridSize, dim3 blockSize, size_t sharedSize = 0,
+-                      cudaStream_t stream = 0);
+diff --git a/test/SemaCUDA/kernel-call.cu b/test/SemaCUDA/kernel-call.cu
+deleted file mode 100644
+index 7bc7ae1..0000000
+--- a/test/SemaCUDA/kernel-call.cu
++++ /dev/null
+@@ -1,23 +0,0 @@
+-// RUN: %clang_cc1 -fsyntax-only -verify %s
+-
+-#include "cuda.h"
+-
+-__global__ void g1(int x) {}
+-
+-template <typename T> void t1(T arg) {
+-  g1<<<arg, arg>>>(1);
+-}
+-
+-void h1(int x) {}
+-int h2(int x) { return 1; }
+-
+-int main(void) {
+-  g1<<<1, 1>>>(42);
+-
+-  t1(1);
+-
+-  h1<<<1, 1>>>(42); // expected-error {{kernel call to non-global function h1}}
+-
+-  int (*fp)(int) = h2;
+-  fp<<<1, 1>>>(42); // expected-error {{must have void return type}}
+-}
+diff --git a/test/SemaCUDA/qualifiers.cu b/test/SemaCUDA/qualifiers.cu
+deleted file mode 100644
+index 1346d65..0000000
+--- a/test/SemaCUDA/qualifiers.cu
++++ /dev/null
+@@ -1,8 +0,0 @@
+-// RUN: %clang_cc1 -fsyntax-only -verify %s
+-
+-#include "cuda.h"
+-
+-__global__ void g1(int x) {}
+-__global__ int g2(int x) { // expected-error {{must have void return type}}
+-  return 1;
+-}
+-- 
+1.7.1
+
