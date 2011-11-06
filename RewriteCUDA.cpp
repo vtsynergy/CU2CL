@@ -1340,6 +1340,400 @@ private:
                 RewriteKernelExpr(x, newX);
                 newExpr = "sqrt(" + newX + ")";
             }
+            else if (funcName == "cbrtf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "cbrt(" + newX + ")";
+            }
+            else if (funcName == "expf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "exp(" + newX + ")";
+            }
+            else if (funcName == "exp2f") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "exp2f(" + newX + ")";
+            }
+            else if (funcName == "exp10f") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "exp10(" + newX + ")";
+            }
+            else if (funcName == "expm1f") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "expm1(" + newX + ")";
+            }
+            else if (funcName == "logf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "log(" + newX + ")";
+            }
+            else if (funcName == "log2f") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "log2(" + newX + ")";
+            }
+            else if (funcName == "log10f") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "log10(" + newX + ")";
+            }
+            else if (funcName == "log1pf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "log1p(" + newX + ")";
+            }
+            else if (funcName == "sinf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "sin(" + newX + ")";
+            }
+            else if (funcName == "cosf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "cos(" + newX + ")";
+            }
+            else if (funcName == "tanf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "tan(" + newX + ")";
+            }
+            else if (funcName == "sincosf") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                Expr *z = ce->getArg(2);
+                std::string newX, newY, newZ;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                RewriteKernelExpr(z, newZ);
+//TODO - Paul ensure this pointer dereferencing is valid
+                newExpr = "(*" + newY + " = sincos(" + newX + ", " + newZ +"))";
+            }
+            else if (funcName == "asinf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "asin(" + newX + ")";
+            }
+            else if (funcName == "acosf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "acos(" + newX + ")";
+            }
+            else if (funcName == "atanf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "atan(" + newX + ")";
+            }
+            else if (funcName == "atan2f") {
+                Expr *x = ce->getArg(1);
+                Expr *y = ce->getArg(0);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "atan2(" + newY + ", " + newX + ")";
+            }
+            else if (funcName == "sinhf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "sinh(" + newX + ")";
+            }
+            else if (funcName == "coshf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "cosh(" + newX + ")";
+            }
+            else if (funcName == "tanhf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "tanh(" + newX + ")";
+            }
+            else if (funcName == "asinhf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "asinh(" + newX + ")";
+            }
+            else if (funcName == "acoshf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "acosh(" + newX + ")";
+            }
+            else if (funcName == "atanhf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "atanh(" + newX + ")";
+            }
+            else if (funcName == "powf") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "pow(" + newX + ", " + newY + ")";
+            }
+            else if (funcName == "erff") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "erf(" + newX + ")";
+            }
+            else if (funcName == "erfinvf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "(1 / erf(" + newX + "))";
+            }
+            else if (funcName == "erfcinvf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "(1 / erfc(" + newX + "))";
+            }
+            else if (funcName == "erfcf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "erfc(" + newX + ")";
+            }
+            else if (funcName == "lgammaf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "lgamma(" + newX + ")";
+            }
+            else if (funcName == "tgammaf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "tgamma(" + newX + ")";
+            }
+            else if (funcName == "fmaf") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                Expr *z = ce->getArg(2);
+                std::string newX, newY, newZ;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                RewriteKernelExpr(z, newZ);
+                newExpr = "fma(" + newX + ", " + newY + ", " + newZ + ")";
+            }
+            else if (funcName == "frexpf") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "frexp(" + newX + ", " + newY + ")";
+            }
+            else if (funcName == "ldexpf") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "ldexp(" + newX + ", " + newY + ")";
+            }
+            else if (funcName == "scalbnf") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "(" + newX + " * powr(FLT_RADIX, " + newY + "))";
+            }
+            else if (funcName == "scalb1nf") {
+                Expr *x = ce->getArg(0);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                newExpr = "(" + newX + " * FLT_RADIX)";
+            }
+            else if (funcName == "logbf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "logb(" + newX + ")";
+            }
+            else if (funcName == "ilogbf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "(1 / logb(" + newX + "))";
+            }
+            else if (funcName == "fmodf") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "fmod(" + newX + ", " + newY + ")";
+            }
+            else if (funcName == "remainderf") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "remainder(" + newX + ", " + newY + ")";
+            }
+            else if (funcName == "remquof") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                Expr *z = ce->getArg(2);
+                std::string newX, newY, newZ;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                RewriteKernelExpr(z, newZ);
+                newExpr = "remquo(" + newX + ", " + newY + ", " + newZ + ")";
+            }
+            else if (funcName == "modff") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "modf(" + newX + ", " + newY + ")";
+            }
+            else if (funcName == "fdimf") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "fdim(" + newX + ", " + newY + ")";
+            }
+            else if (funcName == "truncf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "trunc(" + newX + ")";
+            }
+            else if (funcName == "roundf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "round(" + newX + ")";
+            }
+            else if (funcName == "rintf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "rint(" + newX + ")";
+            }
+            else if (funcName == "nearbyintf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "convert_int(" + newX + ")";
+            }
+            else if (funcName == "ceilf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "ceil(" + newX + ")";
+            }
+            else if (funcName == "floorf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "floor(" + newX + ")";
+            }
+            else if (funcName == "lrintf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "convert_long(" + newX + ")";
+            }
+            else if (funcName == "lrioundf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                //Had to emulate functionality by detecting which direction to round
+                newExpr = "(newX > 0 ? convert_long_rtp(" + newX + ") : convert_long_rtn(" + newX + ")";
+            }
+            else if (funcName == "llrintf") {
+                //TODO - figure out how to use long long conversions
+            }
+            else if (funcName == "lrioundf") {
+                //TODO - figure out how to use long long conversions
+            }
+            else if (funcName == "signbit") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "signbit(" + newX + ")";
+            }
+            else if (funcName == "isinf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "isinf(" + newX + ")";
+            }
+            else if (funcName == "isnan") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "isnan(" + newX + ")";
+            }
+            else if (funcName == "isfinite") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "isfinite(" + newX + ")";
+            }
+            else if (funcName == "copysignf") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "copysign(" + newX + ", " + newY + ")";
+            }
+            else if (funcName == "fminf") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "fmin(" + newX + ", " + newY + ")";
+            }
+            else if (funcName == "fmaxf") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "fmax(" + newX + ", " + newY + ")";
+            }
+            else if (funcName == "fabsaf") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "fmax(" + newX + ", " + newY + ")";
+            }
             else if (funcName == "__expf") {
                 Expr *x = ce->getArg(0);
                 std::string newX;
