@@ -1,5 +1,6 @@
 #include "clang/AST/AST.h"
 #include "clang/AST/ASTConsumer.h"
+#include "clang/AST/Decl.h"
 
 #include "clang/Basic/Diagnostic.h"
 #include "clang/Basic/FileManager.h"
@@ -22,6 +23,12 @@
 #include <set>
 #include <sstream>
 #include <string>
+
+#define CU2CL_ENABLE_TIMING
+
+#ifdef CU2CL_ENABLE_TIMING
+#include <sys/time.h>
+#endif
 
 #define CL_DEVICE_PROP \
     "struct __cu2cl_DeviceProp {\n" \
@@ -155,10 +162,80 @@
     "    return ret;\n" \
     "}\n\n"
 
+#define CU2CL_SCAN_DEVICES \
+    "void __cu2cl_ScanDevices() {\n" \
+    "   int i;\n" \
+    "   cl_uint num_platforms = 0;\n" \
+    "   cl_uint num_devices = 0;\n" \
+    "   cl_uint p_dev_count, d_idx;\n" \
+    "\n" \
+    "   //allocate space for platforms\n" \
+    "   clGetPlatformIDs(0, 0, &num_platforms);\n" \
+    "   cl_platform_id * platforms = (cl_platform_id *) malloc(sizeof(cl_platform_id) * num_platforms);\n" \
+    "\n" \
+    "   //get all platforms\n" \
+    "   clGetPlatformIDs(num_platforms, &platforms[0], 0);\n" \
+    "\n" \
+    "   //count devices over all platforms\n" \
+    "   for (i = 0; i < num_platforms; i++) {\n" \
+    "       p_dev_count = 0;\n" \
+    "       clGetDeviceIDs(platforms[i], CL_DEVICE_TYPE_ALL, 0, 0, &p_dev_count);\n" \
+    "       num_devices += p_dev_count;\n" \
+    "   }\n" \
+    "\n" \
+    "   //allocate space for devices\n" \
+    "   cl_device_id * __cu2cl_AllDevices = (cl_device_id *) malloc(sizeof(cl_device_id) * num_devices);\n" \
+    "\n" \
+    "   //get all devices\n" \
+    "   d_idx = 0;\n" \
+    "   for ( i = 0; i < num_platforms; i++) {\n" \
+    "       clGetDeviceIDs(platforms[i], CL_DEVICE_TYPE_ALL, num_devices-d_idx, &__cu2cl_AllDevices[d_idx], &p_dev_count);\n" \
+    "       d_idx += p_dev_count;\n" \
+    "       p_dev_count = 0;\n" \
+    "   }\n" \
+    "\n" \
+    "   __cu2cl_AllDevices_size = d_idx;\n" \
+    "   free(platforms);\n" \
+    "}\n\n"
+
+#define CU2CL_SET_DEVICE \
+    "void  __cu2cl_SetDevice(cl_uint devID) {\n" \
+    "   if (__cu2cl_AllDevices_size == 0) {\n" \
+    "       __cu2cl_ScanDevices();\n" \
+    "   }\n" \
+    "   //only switch devices if it's a valid choice\n" \
+    "   if (devID < __cu2cl_AllDevices_size) {\n" \
+    "       //Assume auto-initialized queue and context, and free them\n" \
+    "       clReleaseCommandQueue(__cu2cl_CommandQueue);\n" \
+    "       clReleaseContext(__cu2cl_Context);\n" \
+    "       //update device and platform references\n" \
+    "       __cu2cl_AllDevices_curr_idx = devID;\n" \
+    "       __cu2cl_Device = __cu2cl_AllDevices[devID];\n" \
+    "       clGetDeviceInfo(__cu2cl_Device, CL_DEVICE_PLATFORM, sizeof(cl_platform_id), &__cu2cl_Platform, NULL);\n" \
+    "       //and make a new context and queue for the selected device\n" \
+    "       __cu2cl_Context = clCreateContext(NULL, 1, &__cu2cl_Device, NULL, NULL, NULL);\n" \
+    "       __cu2cl_CommandQueue = clCreateCommandQueue(__cu2cl_Context, __cu2cl_Device, CL_QUEUE_PROFILING_ENABLE, NULL);\n" \
+    "   }\n" \
+    "}\n\n" 
+
 using namespace clang;
 using namespace llvm::sys::path;
 
 namespace {
+
+#ifdef CU2CL_ENABLE_TIMING
+struct timeval startTime, endTime;
+
+void init_time() {
+    gettimeofday(&startTime, NULL);
+}
+
+uint64_t get_time() {
+    gettimeofday(&endTime, NULL);
+    return (uint64_t) (endTime.tv_sec - startTime.tv_sec)*1000000 +
+        (endTime.tv_usec - startTime.tv_usec);
+}
+#endif
 
 struct cmpDG {
     bool operator()(DeclGroupRef a, DeclGroupRef b) {
@@ -166,7 +243,10 @@ struct cmpDG {
         SourceLocation bLoc = (b.isSingleDecl() ? b.getSingleDecl() : b.getDeclGroup()[0])->getLocStart();
         return aLoc.getRawEncoding() < bLoc.getRawEncoding();
     }
+
+    
 };
+
 
 class RewriteCUDA;
 
@@ -179,10 +259,69 @@ public:
 
     virtual void InclusionDirective(SourceLocation, const Token &,
                                     llvm::StringRef, bool,
-                                    const FileEntry *, SourceLocation/*,
+                                    const FileEntry *, SourceLocation,
+                                    StringRef, StringRef/*,
                                     const llvm::SmallVectorImpl<char> &*/);
 
 };
+
+    //TODO - Paul 7/12/2012
+    //Determine whether a wrapper method for CU2CL error reporting is enough
+    //or whether a full class is
+
+    //Paul - 7/12/2012
+    //A Modified Diagnostic Printer based on TextDiagnosticPrinter
+    // Which emits traditional diagnostics as well as CU2CL diagnostics
+    // The only primary difference of a CU2CL diagnostic is the addition of
+    // inlined comments to draw attention within partially translated output
+/*class CU2CLDiagnosticPrinter : public DiagnosticConsumer {
+protected:
+    unsigned int NumWarnings;
+    unsigned int NumErrors;
+
+public:
+    CU2CLDiagnosticPrinter() {
+
+    }
+    ~CU2CLDiagnosticPrinter() {
+    
+    }
+    unsigned int getNumErrors() {
+        return NumErrors;
+    }
+    unsigned int getNumWarnings() {
+        return NumWarnings;
+    }
+
+    virtual void clear() {
+
+    }
+    
+    virtual void BeginSourceFile(const LangOptions & LangOptions &LangOpts, const Preprocessor * PP = 0) {
+
+    }
+    
+    virtual void EndSourceFile() {
+
+    }
+    
+    virtual void finish() {
+
+    }
+
+    virtual bool IncludeInDiagnosticCounts() const {
+
+    }
+
+    virtual void HandleDiagnostic (DiagnosticsEngine::Level DiagLevel, const Diagnostic &Info) {
+
+    }
+
+    virtual DiagnosticConsumer * clone(DiagnosticsEngine &Diags) const = 0 {
+
+    }
+}*/
+
 
 /**
  * An AST consumer made to rewrite CUDA to OpenCL.
@@ -213,7 +352,7 @@ private:
     std::set<DeclGroupRef, cmpDG> GlobalVarDeclGroups;
     std::set<DeclGroupRef, cmpDG> CurVarDeclGroups;
     std::set<DeclGroupRef, cmpDG> DeviceMemDGs;
-    std::set<VarDecl *> DeviceMemVars;
+    std::set<DeclaratorDecl *> DeviceMemVars;
     std::set<VarDecl *> HostMemVars;
     std::set<VarDecl *> ConstMemVars;
     std::set<VarDecl *> SharedMemVars;
@@ -224,6 +363,7 @@ private:
     std::string MainFuncName;
     FunctionDecl *MainDecl;
 
+    //TODO - Paul, multiple compilation/main header material
     //Preamble string to insert at top of main host file
     std::string HostPreamble;
     std::string HostIncludes;
@@ -248,8 +388,11 @@ private:
     bool UsesCUDAEventQuery;
     bool UsesCUDAMallocHost;
     bool UsesCUDAFreeHost;
+    bool UsesCUDASetDevice;
 
-    void TraverseStmt(Stmt *e, unsigned int indent) {
+	uint64_t TransTime;    
+
+void TraverseStmt(Stmt *e, unsigned int indent) {
         for (unsigned int i = 0; i < indent; i++)
             llvm::errs() << "  ";
         llvm::errs() << e->getStmtClassName() << "\n";
@@ -274,7 +417,67 @@ private:
         return NULL;
     }
 
+    
+
+    //TODO - Paul 7/12/2012
+    //Determine whether a wrapper method for CU2CL error reporting is enough
+    //or whether a full class is necessary
+    
+    // Paul - 7/13/2012
+    // Workhorse for CU2CL diagnostics, provides independent specification of multiple err_notes
+    //  and inline_notes which should be dumped to stderr and translated output, respectively
+    // TODO - Eventually this could stand to be implemented using the real Basic/Diagnostic subsystem
+    //  but at the moment, the set of errors isn't mature enough to make it worth it.
+    // It's just cheaper to directly throw it more readily-adjustable strings until we set the 
+    //  error messages in stone.
+    void emitCU2CLDiagnostic(SourceLocation loc, std::string severity_str, std::string err_note, std::string inline_note, Rewriter * writer) {
+        //Sanitize all incoming locations to make sure they're not MacroIDs
+        SourceLocation expLoc = SM->getExpansionLoc(loc);
+
+        //assemble both the stderr and inlined source output strings
+        std::stringstream inlineStr;
+        std::stringstream errStr;
+        if (expLoc.isValid()){
+            errStr << SM->getBufferName(expLoc) << ":" << SM->getExpansionLineNumber(expLoc) << ":" << SM->getExpansionColumnNumber(expLoc) << ": ";
+        }
+        if (!severity_str.empty()) {
+            errStr << severity_str << ": ";
+            inlineStr << "/*" << severity_str << " -- ";
+        }
+        inlineStr << inline_note << "*/";
+        errStr << err_note << "\n";
+
+        if (expLoc.isValid()){
+            //print the inline string(s) to the output file
+            bool isValid;
+            //writer->InsertTextBefore(loc , "  ");//inlineStr);
+        }
+        //and the stderr string to stderr
+        llvm::errs() << errStr.str();
+
+        //print source line to stderr, with caret and range
+    }
+    
+    // Paul - 7/13/2012
+    // \brief Convenience method for dumping a CU2CL error to both stderr and inlined comments
+    //
+    // Based on a SourceLocation and affected SourceRange, emits a CU2CL
+    //  error to stderr with the specified err_note.
+    // Assumes the err_note is replicated as the inline comment to add to source.
+    void emitCU2CLDiagnostic(SourceLocation loc, std::string severity_str, std::string err_note, Rewriter * writer) {
+        emitCU2CLDiagnostic(loc, severity_str, err_note, err_note, writer);
+    }
+
+    //Paul - 6/29/2012
+    //Convenience method for getting a string of raw text from two SourceLocations
+    std::string getStmtText(Stmt *s) {
+        SourceLocation a(SM->getExpansionLoc(s->getLocStart())), b(Lexer::getLocForEndOfToken(SourceLocation(SM->getExpansionLoc(s->getLocEnd())), 0,  *SM, *LO));
+        return std::string(SM->getCharacterData(a), SM->getCharacterData(b)-SM->getCharacterData(a));
+    }
+
     void RewriteHostFunction(FunctionDecl *hostFunc) {
+        //TODO- Paul - where are function attributes rewritten
+        // at all related to __align__?
         //Remove any CUDA function attributes
         if (CUDAHostAttr *attr = hostFunc->getAttr<CUDAHostAttr>()) {
             RewriteAttr(attr, "", HostRewrite);
@@ -295,6 +498,7 @@ private:
         if (Expr *e = dyn_cast<Expr>(s)) {
             std::string str;
             if (RewriteHostExpr(e, str)) {
+                //llvm::errs() << str << "\n";
                 ReplaceStmtWithText(e, str, HostRewrite);
             }
         }
@@ -332,16 +536,36 @@ private:
         //Rewriter used for rewriting subexpressions
         Rewriter exprRewriter(*SM, *LO);
         //Instantiation locations are used to capture macros
-        SourceRange realRange(SM->getInstantiationLoc(e->getLocStart()),
-                              SM->getInstantiationLoc(e->getLocEnd()));
+        SourceRange realRange(SM->getExpansionLoc(e->getLocStart()),
+                              SM->getExpansionLoc(e->getLocEnd()));
+        //emitCU2CLDiagnostic(SM->getImmediateSpellingLoc(e->getLocStart()), "TESTING", "ASF", &HostRewrite);
+        //emitCU2CLDiagnostic(SM->getImmediateSpellingLoc(e->getLocEnd()), "TESTING", "ASF", &HostRewrite);
 
         if (CUDAKernelCallExpr *kce = dyn_cast<CUDAKernelCallExpr>(e)) {
+            //TODO - Paul Check this hack for templated kernel calls
+            if (kce->isTypeDependent()) {
+                emitCU2CLDiagnostic(kce->getLocStart(), "CU2CL Untranslated", "Template-dependent kernel call", &HostRewrite);
+                return false;
+            } else if (kce->getDirectCallee() == 0 && dyn_cast<ImplicitCastExpr>(kce->getCallee())) {
+                //TODO - Paul 6/26/2012
+                //Check this hack for kernel function pointer calls
+                emitCU2CLDiagnostic(kce->getLocStart(), "CU2CL Unhandled", "Function pointer as kernel call", &HostRewrite);
+                return false;
+            }
             newExpr = RewriteCUDAKernelCall(kce);
             return true;
         }
         else if (CallExpr *ce = dyn_cast<CallExpr>(e)) {
+            if (ce->isTypeDependent()) {
+                emitCU2CLDiagnostic(ce->getLocStart(), "CU2CL Untranslated", "Template-dependent host call", &HostRewrite);
+                return false;
+            }
+            //TODO - Paul - this is where gl calls freak out, because getDirectCallee returns NULL
             //TODO fix case where non-API call starts with "cuda"
-            if (ce->getDirectCallee()->getNameAsString().find("cuda") == 0)
+            if (ce->getDirectCallee() == 0) { //Not a FunctionDecl, this is what happens with gl buffer calls
+                //These segfaults appear to be caused by buffer functions which are #defined rather than declared
+                emitCU2CLDiagnostic(SM->getExpansionLoc(ce->getLocStart()), "CU2CL Unhandled", "Could not identify direct callee in expression", &HostRewrite);
+            } else if (ce->getDirectCallee()->getNameAsString().find("cuda") == 0)
                 return RewriteCUDACall(ce, newExpr);
         }
         else if (MemberExpr *me = dyn_cast<MemberExpr>(e)) {
@@ -359,7 +583,7 @@ private:
                     else if (name == "z") {
                         name = "[2]";
                     }
-                    newExpr = PrintStmtToString(dre) + name;
+                    newExpr = getStmtText(dre) + name; //PrintStmtToString(dre) + name;
                     return true;
                 }
                 else if (type == "cudaDeviceProp") {
@@ -409,7 +633,7 @@ private:
             newExpr = exprRewriter.getRewrittenText(realRange);
             return ret;
         }
-        else if (SizeOfAlignOfExpr *soe = dyn_cast<SizeOfAlignOfExpr>(e)) {
+        else if (UnaryExprOrTypeTraitExpr *soe = dyn_cast<UnaryExprOrTypeTraitExpr>(e)) {
             if (soe->isArgumentType()) {
                 bool ret = true;
                 TypeLoc tl = soe->getArgumentTypeInfo()->getTypeLoc();
@@ -434,11 +658,14 @@ private:
                 else {
                     ret = false;
                 }
-                newExpr = exprRewriter.getRewrittenText(realRange);
+                    SourceRange newrealRange(SM->getExpansionLoc(e->getLocStart()),
+                              SM->getExpansionLoc(e->getLocEnd()));
+                newExpr = exprRewriter.getRewrittenText(newrealRange);
                 return ret;
             }
         }
         else if (CXXTemporaryObjectExpr *cte = dyn_cast<CXXTemporaryObjectExpr>(e)) {
+            emitCU2CLDiagnostic(cte->getLocStart(), "CU2CL Note", "Identified as CXXTemporaryObjectExpr", &exprRewriter);
             //TODO need to know if in constructor or not... if not in
             //constructor, then need to assign each separately
             CXXConstructorDecl *ccd = cte->getConstructor();
@@ -465,10 +692,12 @@ private:
                 }
                 args += "}";
                 newExpr = args;
+                //llvm::errs() << "Temp" << newExpr << "\n";
                 return true;
             }
         }
         else if (CXXConstructExpr *cce = dyn_cast<CXXConstructExpr>(e)) {
+            emitCU2CLDiagnostic(cce->getLocStart(), "CU2CL Note", "Identified as CXXConstructExpr", &exprRewriter);
             CXXConstructorDecl *ccd = cce->getConstructor();
             CXXRecordDecl *crd = ccd->getParent();
             const Type *t = crd->getTypeForDecl();
@@ -483,8 +712,12 @@ private:
                     if (RewriteHostExpr(cce->getArg(0), s)) {
                         ReplaceStmtWithText(cce->getArg(0), s, exprRewriter);
                         ret = true;
+                        //llvm::errs() << "asf:" << s;
                     }
-                    newExpr = exprRewriter.getRewrittenText(realRange);
+                    SourceRange newrealRange(SM->getExpansionLoc(e->getLocStart()),
+                              SM->getExpansionLoc(e->getLocEnd()));
+                    newExpr = exprRewriter.getRewrittenText(newrealRange);
+                    //llvm::errs() << "ConsI" << newExpr << "\n";
                     return ret;
                 }
                 else {
@@ -505,6 +738,7 @@ private:
                     }
                     args += "}";
                     newExpr = args;
+                    //llvm::errs() << "ConsE" << newExpr << "\n";
                 }
                 return true;
             }
@@ -523,6 +757,10 @@ private:
                 ret = true;
             }
         }
+
+
+        SourceRange newrealRange(SM->getExpansionLoc(e->getLocStart()),
+                              SM->getExpansionLoc(e->getLocEnd()));
         newExpr = exprRewriter.getRewrittenText(realRange);
         return ret;
     }
@@ -530,7 +768,6 @@ private:
     bool RewriteCUDACall(CallExpr *cudaCall, std::string &newExpr) {
         //TODO all CUDA calls return a cudaError_t, so need to find a way to keep that working
         //TODO check if the return value is being used somehow?
-        //llvm::errs() << "Rewriting CUDA API call\n";
         std::string funcName = cudaCall->getDirectCallee()->getNameAsString();
 
         //Thread Management
@@ -566,19 +803,25 @@ private:
             newExpr = "clGetDeviceIDs(__cu2cl_Platform, CL_DEVICE_TYPE_GPU, 0, NULL, (cl_uint *) " + newCount + ")";
         }
         else if (funcName == "cudaSetDevice") {
-            //Replace with clCreateContext and clCreateCommandQueue
-            //TODO first, delete old queue and context
-            Expr *device = cudaCall->getArg(0);
-            DeclRefExpr *dre = FindStmt<DeclRefExpr>(device);
-            if (dre != NULL) {
-                std::string newDevice;
-                RewriteHostExpr(device, newDevice);
-                //TODO also rewrite type as in cudaGetDevice
-                //VarDecl *var = dyn_cast<VarDecl>(dre->getDecl());
-                newExpr = "clReleaseContext(__cu2cl_Context);\n";
-                newExpr += "__cu2cl_Context = clCreateContext(NULL, 1, &" + newDevice + ", NULL, NULL, NULL);\n";
-                newExpr += "__cu2cl_CommandQueue = clCreateCommandQueue(__cu2cl_Context, " + newDevice + ", CL_QUEUE_PROFILING_ENABLE, NULL)\n";
+            if (!UsesCUDASetDevice) {
+                UsesCUDASetDevice = true;
+                HostGlobalVars += "cl_device_id * __cu2cl_AllDevices = NULL;\n";
+                HostGlobalVars += "cl_uint __cu2cl_AllDevices_curr_idx = 0;\n";
+                HostGlobalVars += "cl_uint __cu2cl_AllDevices_size = 0;\n";
+                HostFunctions += CU2CL_SCAN_DEVICES;
+                HostFunctions += CU2CL_SET_DEVICE;
             }
+            Expr *device = cudaCall->getArg(0);
+            //Device will only be an integer ID, so don't look for a reference
+            //DeclRefExpr *dre = FindStmt<DeclRefExpr>(device);
+            //if (dre != NULL) {
+            std::string newDevice;
+            RewriteHostExpr(device, newDevice);
+            //TODO also rewrite type as in cudaGetDevice
+            //VarDecl *var = dyn_cast<VarDecl>(dre->getDecl());
+            newExpr = "__cu2cl_SetDevice(" + newDevice + ")";
+            emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Note", "CU2CL Identified cudaSetDevice usage", &HostRewrite);
+            //}
         }
         else if (funcName == "cudaSetDeviceFlags") {
             //Remove for now, as OpenCL has no device flags to set
@@ -641,10 +884,12 @@ private:
 
         //Event Management
         else if (funcName == "cudaEventCreate") {
+//TODO - Paul - clCreateUserEvent
             //Remove the call
             newExpr = "";
         }
         else if (funcName == "cudaEventCreateWithFlags") {
+//TODO - Paul - clSetUserEventStatus
             //Remove the call
             newExpr = "";
         }
@@ -763,7 +1008,19 @@ private:
             RewriteHostExpr(size, newSize);
             RewriteHostExpr(devPtr, newDevPtr);
             DeclRefExpr *dr = FindStmt<DeclRefExpr>(devPtr);
-            VarDecl *var = dyn_cast<VarDecl>(dr->getDecl());
+		MemberExpr *mr = FindStmt<MemberExpr>(devPtr);
+DeclaratorDecl *var;
+		if (mr != NULL) {
+emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Note", "Identified member expression in cudaMalloc device pointer", &HostRewrite);
+
+//}
+//if (dr == NULL) {
+//emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Note", "Identified non-standard cudaMalloc", &HostRewrite);
+var = dyn_cast<DeclaratorDecl>(mr->getMemberDecl());
+//TODO - Paul - dr becomes null  when translating rng.cpp
+             } else {
+var = dyn_cast<VarDecl>(dr->getDecl());
+}
 
             //Replace with clCreateBuffer
             newExpr = "*" + newDevPtr + " = clCreateBuffer(__cu2cl_Context, CL_MEM_READ_WRITE, " + newSize + ", NULL, NULL)";
@@ -776,6 +1033,7 @@ private:
                 DeviceMemDGs.insert(*GlobalVarDeclGroups.find(varDG));
             }
             else {
+emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Note", "Rewriting single decl", &HostRewrite);
                 //TODO single decl, so rewrite now as before
                 //TODO check the type, if pointertype, rewrite as you have already
                 //Change variable's type to cl_mem
@@ -812,6 +1070,8 @@ private:
                 HostMemVars.insert(var);
             }
         }
+        //TODO - Paul - support cudaMemcpyDefault or whatever the
+        // ambiguous call from AMD NDA Tarball was
         else if (funcName == "cudaMemcpy") {
             //TODO support offsets
             //Inspect kind of memcpy and rewrite accordingly
@@ -854,7 +1114,7 @@ private:
             }
             else {
                 //TODO Use diagnostics to print pretty errors
-                llvm::errs() << "Unsupported cudaMemcpyKind: " << enumString << "\n";
+                emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Unsupported", "Unsupported cudaMemcpyKind: " + enumString, &HostRewrite);
             }
         }
         else if (funcName == "cudaMemcpyAsync") {
@@ -907,16 +1167,17 @@ private:
             }
             else if (enumString == "cudaMemcpyDeviceToDevice") {
                 //TODO implement __cu2cl_MemcpyDevToDev
+                //TODO - Paul - no reason to pull this up to host in between
                 ReplaceStmtWithText(cudaCall, "clEnqueueReadBuffer(__cu2cl_CommandQueue, src, CL_TRUE, 0, count, temp, 0, NULL, NULL)", HostRewrite);
                 ReplaceStmtWithText(cudaCall, "clEnqueueWriteBuffer(__cu2cl_CommandQueue, dst, CL_TRUE, 0, count, temp, 0, NULL, NULL)", HostRewrite);
             }
             else {
                 //TODO Use diagnostics to print pretty errors
-                llvm::errs() << "Unsupported cudaMemcpyKind: " << enumString << "\n";
+                emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Unsupported", "Unsupported cudaMemcpyKind: " + enumString, &HostRewrite);
             }
         }
         else if (funcName == "cudaMemcpyToSymbol") {
-            //TODO implement
+            //TODO - Paul - implement
         }
         else if (funcName == "cudaMemset") {
             if (!UsesCUDAMemset) {
@@ -941,26 +1202,42 @@ private:
         }
         else {
             //TODO Use diagnostics to print pretty errors
-            llvm::errs() << "Unsupported CUDA call: " << funcName << "\n";
+            emitCU2CLDiagnostic(SM->getExpansionLoc(cudaCall->getLocStart()), "CU2CL Unsupported", "Unsupported CUDA call: " + funcName, &HostRewrite);
             return false;
         }
         return true;
     }
 
     std::string RewriteCUDAKernelCall(CUDAKernelCallExpr *kernelCall) {
-        //llvm::errs() << "Rewriting CUDA kernel call\n";
         FunctionDecl *callee = kernelCall->getDirectCallee();
         CallExpr *kernelConfig = kernelCall->getConfig();
+        //TODO - Paul - This line causes segfaults when callee is null, which occurs if callee is not a FunctionDecl
+        //TODO - Paul 6/26/2012
+        //Looks like it dies on transpose due to the use of functionpointers to cuda kernels
+        
         std::string kernelName = "__cu2cl_Kernel_" + callee->getNameAsString();
         std::ostringstream args;
         unsigned int dims = 1;
 
         //Set kernel arguments
         for (unsigned i = 0; i < kernelCall->getNumArgs(); i++) {
-            Expr *arg = kernelCall->getArg(i);
+            Expr *arg = kernelCall->getArg(i);//->IgnoreParenCasts();
             std::string newArg;
             RewriteHostExpr(arg, newArg);
+//TODO - Paul - This is where we detect kernel literal arguments
+//If there's no declaration in the argument, or the argument isn't an L value
+if (FindStmt<DeclRefExpr>(arg) == NULL || !arg->IgnoreParenCasts()->isLValue()) {
+//TODO - Paul - make a temporary variable to hold this value, pass it, and destroy it
+//Do this in a separate block to guarantee scope
+ args << "//CU2CL NOTE: created temporary variable for argument " << i << " to kernel " << callee->getNameAsString() << "\n//Original expression was: \""<< getStmtText(arg) << "\"\n";
+ args << arg->getType().getAsString() << " __cu2cl_Kernel_" << callee->getNameAsString() << "_temp_arg_" << i << " = " << newArg << ";\n";
+args << "clSetKernelArg(" << kernelName << ", " << i << ", sizeof(" << arg->getType().getAsString() <<"), &__cu2cl_Kernel_" << callee->getNameAsString() << "_temp_arg_" << i << ");\n";
+
+emitCU2CLDiagnostic(arg->getLocStart(), "CU2CL Note", "Inserted temporary variable for kernel literal argument!", &HostRewrite);
+
+} else {
             VarDecl *var = dyn_cast<VarDecl>(FindStmt<DeclRefExpr>(arg)->getDecl());
+
             args << "clSetKernelArg(" << kernelName << ", " << i << ", sizeof(";
             if (DeviceMemVars.find(var) != DeviceMemVars.end()) {
                 //arg var is a cl_mem
@@ -970,9 +1247,11 @@ private:
                 args << arg->getType().getAsString();
             }
             args << "), &" << newArg << ");\n";
+}
         }
 
         //TODO add constant memory arguments
+        //TODO - Paul - just drawing attention, we need this
 
         //TODO handle passing in a new dim3? (i.e. dim3(1,2,3))
         //Set work sizes
@@ -981,7 +1260,28 @@ private:
         Expr *block = kernelConfig->getArg(1);
         CXXConstructExpr *construct = dyn_cast<CXXConstructExpr>(block);
         ImplicitCastExpr *cast = dyn_cast<ImplicitCastExpr>(construct->getArg(0));
-        if (DeclRefExpr *dre = dyn_cast<DeclRefExpr>(cast->getSubExprAsWritten())) {
+
+//TODO - Paul 7/6/2012
+//Check if all kernel launch parameters now show up as MaterializeTemporaryExpr
+//if so, standardize it as this with the ImplicitCastExpr fallback
+if (cast == NULL) {
+//try chewing it up as a MaterializeTemporaryExpr
+MaterializeTemporaryExpr *mat = dyn_cast<MaterializeTemporaryExpr>(construct->getArg(0));
+if (mat) {
+    emitCU2CLDiagnostic(construct->getLocStart(), "CU2CL Note", "Identified as MaterializeTemporaryExpr", &HostRewrite);
+    cast = dyn_cast<ImplicitCastExpr>(mat->GetTemporaryExpr());
+}
+}
+
+//TODO - Paul - 6/8/2012 Replicated the hack from grid to block
+DeclRefExpr *dre;
+if (cast == NULL) {
+    emitCU2CLDiagnostic(construct->getLocStart(), "CU2CL Note", "Fast-tracked dim3 type without cast", &HostRewrite);
+dre = dyn_cast<DeclRefExpr>(construct->getArg(0));
+} else {
+dre = dyn_cast<DeclRefExpr>(cast->getSubExprAsWritten());
+}
+        if (dre) {
             //Variable passed
             ValueDecl *value = dre->getDecl();
             std::string type = value->getType().getAsString();
@@ -992,7 +1292,8 @@ private:
             }
             else {
                 //Some integer type, likely
-                args << "localWorkSize[0] = " << PrintStmtToString(dre) << ";\n";
+                //args << "localWorkSize[0] = " << PrintStmtToString(dre) << ";\n";
+                args << "localWorkSize[0] = " << getStmtText(dre) << ";\n";
             }
         }
         else {
@@ -1000,12 +1301,34 @@ private:
             Expr *arg = cast->getSubExprAsWritten();
             std::string s;
             RewriteHostExpr(arg, s);
-            args << "localWorkSize[0] = " << s << ";\n";
         }
 
         construct = dyn_cast<CXXConstructExpr>(grid);
         cast = dyn_cast<ImplicitCastExpr>(construct->getArg(0));
-        if (DeclRefExpr *dre = dyn_cast<DeclRefExpr>(cast->getSubExprAsWritten())) {
+
+
+//TODO - Paul 7/6/2012
+//Check if all kernel launch parameters now show up as MaterializeTemporaryExpr
+//if so, standardize it as this with the ImplicitCastExpr fallback
+if (cast == NULL) {
+//try chewing it up as a MaterializeTemporaryExpr
+MaterializeTemporaryExpr *mat = dyn_cast<MaterializeTemporaryExpr>(construct->getArg(0));
+if (mat) {
+    emitCU2CLDiagnostic(construct->getLocStart(), "CU2CL Note", "Identified as MaterializeTemporaryExpr", &HostRewrite);
+    cast = dyn_cast<ImplicitCastExpr>(mat->GetTemporaryExpr());
+}
+}
+
+//TODO - Paul - figure out why MonteCarlo has something that isn't actually an ImplicitCastExpr
+//6/1/2012 - discovered that it's not an implicit cast, because it uses the new dim3 nameofvar(1,2,3) style
+//6/6/2012 - looks like this patch works! at least for the discovery instance in MonteCarlo
+if (cast == NULL) {
+    emitCU2CLDiagnostic(construct->getLocStart(), "CU2CL Note", "Fast-tracked dim3 type without cast", &HostRewrite);
+dre = dyn_cast<DeclRefExpr>(construct->getArg(0));
+} else {
+dre = dyn_cast<DeclRefExpr>(cast->getSubExprAsWritten());
+}
+        if (dre) {
             //Variable passed
             ValueDecl *value = dre->getDecl();
             std::string type = value->getType().getAsString();
@@ -1016,7 +1339,8 @@ private:
             }
             else {
                 //Some integer type, likely
-                args << "globalWorkSize[0] = (" << PrintStmtToString(dre) << ")*localWorkSize[0];\n";
+                //args << "globalWorkSize[0] = (" << PrintStmtToString(dre) << ")*localWorkSize[0];\n";
+                args << "globalWorkSize[0] = (" << getStmtText(dre) << ")*localWorkSize[0];\n";
             }
         }
         else {
@@ -1033,6 +1357,7 @@ private:
 
     void RewriteHostVarDecl(VarDecl *var) {
         if (CUDAConstantAttr *constAttr = var->getAttr<CUDAConstantAttr>()) {
+            //TODO - Paul - drawing attention to constant declaration
             //Handle __constant__ memory declarations
             RewriteAttr(constAttr, "", HostRewrite);
             if (CUDADeviceAttr *devAttr = var->getAttr<CUDADeviceAttr>())
@@ -1099,15 +1424,19 @@ private:
                     RewriteType(tl, newType, HostRewrite);
             }
             //TODO check other CUDA-only types to rewrite
+            //TODO - Paul - texture-to-image? surfaces?
         }
 
         //Rewrite initial value
         if (var->hasInit()) {
             Expr *e = var->getInit();
             std::string s;
+            //llvm::errs() << "Beginning to ";
             if (RewriteHostExpr(e, s)) {
+                //llvm::errs() << s << "\n";
                 //Special cases for dim3s
                 if (type == "dim3") {
+                    //llvm::errs() << "processing dim3\n";
                     //TODO fix case of dim3 c = b;
                     CXXConstructExpr *cce = dyn_cast<CXXConstructExpr>(e);
                     if (cce && cce->getNumArgs() > 1) {
@@ -1124,8 +1453,10 @@ private:
                                     s);
                         }
                     }
-                    else
+                    else {
                         ReplaceStmtWithText(e, s, HostRewrite);
+//llvm::errs() << "took else path\n";
+                    }
 
                     //Add [3]/* to end/start of var identifier
                     if (origTL.getTypePtr()->isPointerType())
@@ -1148,6 +1479,10 @@ private:
     }
 
     void RewriteKernelFunction(FunctionDecl *kernelFunc) {
+
+        //TODO - Paul - 7/11/2012
+        //In case of kernel Template Specializations, add a check to make sure the name isn't on the
+        //list already to save duplication
         if (kernelFunc->hasAttr<CUDAGlobalAttr>()) {
             //If host-callable, get and store kernel filename
             llvm::StringRef r = stem(SM->getFileEntryForID(SM->getFileID(kernelFunc->getLocation()))->getName());
@@ -1182,6 +1517,11 @@ private:
     }
 
     void RewriteKernelParam(ParmVarDecl *parmDecl, bool isFuncGlobal) {
+
+        //TODO - Paul - 7/11/2012
+        //Add a check to make sure kernel params on template specializations don't get rewritten
+        //multiple times, may have to do this further down the stack
+        if (parmDecl->getOriginalType()->isTemplateTypeParmType()) emitCU2CLDiagnostic(parmDecl->getLocStart(), "CU2CL Unhandled", "Detected templated parameter", &KernelRewrite);
         TypeLoc tl = parmDecl->getTypeSourceInfo()->getTypeLoc();
         if (isFuncGlobal && tl.getTypePtr()->isPointerType()) {
             KernelRewrite.InsertTextBefore(
@@ -1244,8 +1584,8 @@ private:
         //Rewriter used for rewriting subexpressions
         Rewriter exprRewriter(*SM, *LO);
         //Instantiation locations are used to capture macros
-        SourceRange realRange(SM->getInstantiationLoc(e->getLocStart()),
-                              SM->getInstantiationLoc(e->getLocEnd()));
+        SourceRange realRange(SM->getExpansionLoc(e->getLocStart()),
+                              SM->getExpansionLoc(e->getLocEnd()));
 
         if (MemberExpr *me = dyn_cast<MemberExpr>(e)) {
             //Check base expr, if DeclRefExpr and a dim3, then rewrite
@@ -1265,7 +1605,7 @@ private:
                     else if (name == "gridDim")
                         newExpr = "get_num_groups";
                     else
-                        newExpr = PrintStmtToString(dre);
+                        newExpr = getStmtText(dre);//PrintStmtToString(dre);
 
                     name = me->getMemberDecl()->getNameAsString();
                     if (newExpr != dre->getDecl()->getNameAsString()) {
@@ -1294,7 +1634,7 @@ private:
                     else if (name == "blockIdx")
                         newExpr = "get_group_id";
                     else
-                        newExpr = PrintStmtToString(dre);
+                        newExpr = getStmtText(dre);//PrintStmtToString(dre);
 
                     name = me->getMemberDecl()->getNameAsString();
                     if (newExpr != dre->getDecl()->getNameAsString()) {
@@ -1324,154 +1664,29 @@ private:
             }
         }
         else if (CallExpr *ce = dyn_cast<CallExpr>(e)) {
+            //TODO -Paul - check this template hack
+            if (ce->isTypeDependent()) {
+                emitCU2CLDiagnostic(e->getLocStart(), "CU2CL Unhandled", "Template-dependent kernel expression", &KernelRewrite);
+                return false;
+            }
+	        //TODO - Paul - Make sure we can handle the "_rn" rounding mode extension to native transcendentals
+            //TODO - Paul - this line still segfaults on kernel calls which use typedef'd function pointers as args (FunctionPointes_kernel.cu from the SDK samples)
+            if (ce->getDirectCallee() == 0) {
+                emitCU2CLDiagnostic(e->getLocStart(), "CU2CL Error", "Unable to identify expression direct callee", &KernelRewrite);
+                return false;
+            }                
+
             std::string funcName = ce->getDirectCallee()->getNameAsString();
             if (funcName == "__syncthreads") {
                 newExpr = "barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE)";
             }
-            else if (funcName == "fabsf") {
-                Expr *x = ce->getArg(0);
-                std::string newX;
-                RewriteKernelExpr(x, newX);
-                newExpr = "fabs(" + newX + ")";
-            }
-            else if (funcName == "sqrtf") {
-                Expr *x = ce->getArg(0);
-                std::string newX;
-                RewriteKernelExpr(x, newX);
-                newExpr = "sqrt(" + newX + ")";
-            }
-            else if (funcName == "cbrtf") {
-                Expr *x = ce->getArg(0);
-                std::string newX;
-                RewriteKernelExpr(x, newX);
-                newExpr = "cbrt(" + newX + ")";
-            }
-            else if (funcName == "expf") {
-                Expr *x = ce->getArg(0);
-                std::string newX;
-                RewriteKernelExpr(x, newX);
-                newExpr = "exp(" + newX + ")";
-            }
-            else if (funcName == "exp2f") {
-                Expr *x = ce->getArg(0);
-                std::string newX;
-                RewriteKernelExpr(x, newX);
-                newExpr = "exp2f(" + newX + ")";
-            }
-            else if (funcName == "exp10f") {
-                Expr *x = ce->getArg(0);
-                std::string newX;
-                RewriteKernelExpr(x, newX);
-                newExpr = "exp10(" + newX + ")";
-            }
-            else if (funcName == "expm1f") {
-                Expr *x = ce->getArg(0);
-                std::string newX;
-                RewriteKernelExpr(x, newX);
-                newExpr = "expm1(" + newX + ")";
-            }
-            else if (funcName == "logf") {
-                Expr *x = ce->getArg(0);
-                std::string newX;
-                RewriteKernelExpr(x, newX);
-                newExpr = "log(" + newX + ")";
-            }
-            else if (funcName == "log2f") {
-                Expr *x = ce->getArg(0);
-                std::string newX;
-                RewriteKernelExpr(x, newX);
-                newExpr = "log2(" + newX + ")";
-            }
-            else if (funcName == "log10f") {
-                Expr *x = ce->getArg(0);
-                std::string newX;
-                RewriteKernelExpr(x, newX);
-                newExpr = "log10(" + newX + ")";
-            }
-            else if (funcName == "log1pf") {
-                Expr *x = ce->getArg(0);
-                std::string newX;
-                RewriteKernelExpr(x, newX);
-                newExpr = "log1p(" + newX + ")";
-            }
-            else if (funcName == "sinf") {
-                Expr *x = ce->getArg(0);
-                std::string newX;
-                RewriteKernelExpr(x, newX);
-                newExpr = "sin(" + newX + ")";
-            }
-            else if (funcName == "cosf") {
-                Expr *x = ce->getArg(0);
-                std::string newX;
-                RewriteKernelExpr(x, newX);
-                newExpr = "cos(" + newX + ")";
-            }
-            else if (funcName == "tanf") {
-                Expr *x = ce->getArg(0);
-                std::string newX;
-                RewriteKernelExpr(x, newX);
-                newExpr = "tan(" + newX + ")";
-            }
-            else if (funcName == "sincosf") {
-                Expr *x = ce->getArg(0);
-                Expr *y = ce->getArg(1);
-                Expr *z = ce->getArg(2);
-                std::string newX, newY, newZ;
-                RewriteKernelExpr(x, newX);
-                RewriteKernelExpr(y, newY);
-                RewriteKernelExpr(z, newZ);
-//TODO - Paul ensure this pointer dereferencing is valid
-                newExpr = "(*" + newY + " = sincos(" + newX + ", " + newZ +"))";
-            }
-            else if (funcName == "asinf") {
-                Expr *x = ce->getArg(0);
-                std::string newX;
-                RewriteKernelExpr(x, newX);
-                newExpr = "asin(" + newX + ")";
-            }
+//NOTE - Paul - As of 05/17/2012 These include all math functions from CUDA 4.2
+//begin single precision
             else if (funcName == "acosf") {
                 Expr *x = ce->getArg(0);
                 std::string newX;
                 RewriteKernelExpr(x, newX);
                 newExpr = "acos(" + newX + ")";
-            }
-            else if (funcName == "atanf") {
-                Expr *x = ce->getArg(0);
-                std::string newX;
-                RewriteKernelExpr(x, newX);
-                newExpr = "atan(" + newX + ")";
-            }
-            else if (funcName == "atan2f") {
-                Expr *x = ce->getArg(1);
-                Expr *y = ce->getArg(0);
-                std::string newX, newY;
-                RewriteKernelExpr(x, newX);
-                RewriteKernelExpr(y, newY);
-                newExpr = "atan2(" + newY + ", " + newX + ")";
-            }
-            else if (funcName == "sinhf") {
-                Expr *x = ce->getArg(0);
-                std::string newX;
-                RewriteKernelExpr(x, newX);
-                newExpr = "sinh(" + newX + ")";
-            }
-            else if (funcName == "coshf") {
-                Expr *x = ce->getArg(0);
-                std::string newX;
-                RewriteKernelExpr(x, newX);
-                newExpr = "cosh(" + newX + ")";
-            }
-            else if (funcName == "tanhf") {
-                Expr *x = ce->getArg(0);
-                std::string newX;
-                RewriteKernelExpr(x, newX);
-                newExpr = "tanh(" + newX + ")";
-            }
-            else if (funcName == "asinhf") {
-                Expr *x = ce->getArg(0);
-                std::string newX;
-                RewriteKernelExpr(x, newX);
-                newExpr = "asinh(" + newX + ")";
             }
             else if (funcName == "acoshf") {
                 Expr *x = ce->getArg(0);
@@ -1479,37 +1694,75 @@ private:
                 RewriteKernelExpr(x, newX);
                 newExpr = "acosh(" + newX + ")";
             }
+            else if (funcName == "asinf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "asin(" + newX + ")";
+            }
+            else if (funcName == "asinhf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "asinh(" + newX + ")";
+            }
+            else if (funcName == "atan2f") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "atan2(" + newX + ", " + newY + ")";
+            }
+            else if (funcName == "atanf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "atan(" + newX + ")";
+            }
             else if (funcName == "atanhf") {
                 Expr *x = ce->getArg(0);
                 std::string newX;
                 RewriteKernelExpr(x, newX);
                 newExpr = "atanh(" + newX + ")";
             }
-            else if (funcName == "powf") {
+            else if (funcName == "cbrtf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "cbrt(" + newX + ")";
+            }
+            else if (funcName == "ceilf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "ceil(" + newX + ")";
+            }
+            else if (funcName == "copysign") {
                 Expr *x = ce->getArg(0);
                 Expr *y = ce->getArg(1);
                 std::string newX, newY;
                 RewriteKernelExpr(x, newX);
                 RewriteKernelExpr(y, newY);
-                newExpr = "pow(" + newX + ", " + newY + ")";
+                newExpr = "copysign(" + newX + ", " + newY + ")";
             }
-            else if (funcName == "erff") {
+            else if (funcName == "cosf") {
                 Expr *x = ce->getArg(0);
                 std::string newX;
                 RewriteKernelExpr(x, newX);
-                newExpr = "erf(" + newX + ")";
+                newExpr = "cos(" + newX + ")";
             }
-            else if (funcName == "erfinvf") {
+            else if (funcName == "coshf") {
                 Expr *x = ce->getArg(0);
                 std::string newX;
                 RewriteKernelExpr(x, newX);
-                newExpr = "(1 / erf(" + newX + "))";
+                newExpr = "cosh(" + newX + ")";
             }
-            else if (funcName == "erfcinvf") {
+            else if (funcName == "cospif") {
                 Expr *x = ce->getArg(0);
                 std::string newX;
                 RewriteKernelExpr(x, newX);
-                newExpr = "(1 / erfc(" + newX + "))";
+                newExpr = "cospi(" + newX + ")";
             }
             else if (funcName == "erfcf") {
                 Expr *x = ce->getArg(0);
@@ -1517,17 +1770,65 @@ private:
                 RewriteKernelExpr(x, newX);
                 newExpr = "erfc(" + newX + ")";
             }
-            else if (funcName == "lgammaf") {
+//TODO - Paul - support erfcinvf, erfcxf
+            else if (funcName == "erff") {
                 Expr *x = ce->getArg(0);
                 std::string newX;
                 RewriteKernelExpr(x, newX);
-                newExpr = "lgamma(" + newX + ")";
+                newExpr = "erf(" + newX + ")";
             }
-            else if (funcName == "tgammaf") {
+//TODO - Paul - support erfinvf
+            else if (funcName == "exp10f") {
                 Expr *x = ce->getArg(0);
                 std::string newX;
                 RewriteKernelExpr(x, newX);
-                newExpr = "tgamma(" + newX + ")";
+                newExpr = "exp10(" + newX + ")";
+            }
+            else if (funcName == "exp2f") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "exp2(" + newX + ")";
+            }
+            else if (funcName == "expf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "exp(" + newX + ")";
+            }
+            else if (funcName == "expm1f") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "expm1(" + newX + ")";
+            }
+            else if (funcName == "fabsf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "fabs(" + newX + ")";
+            }
+            else if (funcName == "fdimf") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "fdim(" + newX + ", " + newY + ")";
+            }
+            else if (funcName == "fdividef") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "(" + newX + "/" + newY + ")";
+            }
+            else if (funcName == "floorf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "floor(" + newX + ")";
             }
             else if (funcName == "fmaf") {
                 Expr *x = ce->getArg(0);
@@ -1539,47 +1840,21 @@ private:
                 RewriteKernelExpr(z, newZ);
                 newExpr = "fma(" + newX + ", " + newY + ", " + newZ + ")";
             }
-            else if (funcName == "frexpf") {
+            else if (funcName == "fmaxf") {
                 Expr *x = ce->getArg(0);
                 Expr *y = ce->getArg(1);
                 std::string newX, newY;
                 RewriteKernelExpr(x, newX);
                 RewriteKernelExpr(y, newY);
-                newExpr = "frexp(" + newX + ", " + newY + ")";
+                newExpr = "fmax(" + newX + ", " + newY + ")";
             }
-            else if (funcName == "ldexpf") {
+            else if (funcName == "fminf") {
                 Expr *x = ce->getArg(0);
                 Expr *y = ce->getArg(1);
                 std::string newX, newY;
                 RewriteKernelExpr(x, newX);
                 RewriteKernelExpr(y, newY);
-                newExpr = "ldexp(" + newX + ", " + newY + ")";
-            }
-            else if (funcName == "scalbnf") {
-                Expr *x = ce->getArg(0);
-                Expr *y = ce->getArg(1);
-                std::string newX, newY;
-                RewriteKernelExpr(x, newX);
-                RewriteKernelExpr(y, newY);
-                newExpr = "(" + newX + " * powr(FLT_RADIX, " + newY + "))";
-            }
-            else if (funcName == "scalb1nf") {
-                Expr *x = ce->getArg(0);
-                std::string newX, newY;
-                RewriteKernelExpr(x, newX);
-                newExpr = "(" + newX + " * FLT_RADIX)";
-            }
-            else if (funcName == "logbf") {
-                Expr *x = ce->getArg(0);
-                std::string newX;
-                RewriteKernelExpr(x, newX);
-                newExpr = "logb(" + newX + ")";
-            }
-            else if (funcName == "ilogbf") {
-                Expr *x = ce->getArg(0);
-                std::string newX;
-                RewriteKernelExpr(x, newX);
-                newExpr = "(1 / logb(" + newX + "))";
+                newExpr = "fmin(" + newX + ", " + newY + ")";
             }
             else if (funcName == "fmodf") {
                 Expr *x = ce->getArg(0);
@@ -1589,100 +1864,33 @@ private:
                 RewriteKernelExpr(y, newY);
                 newExpr = "fmod(" + newX + ", " + newY + ")";
             }
-            else if (funcName == "remainderf") {
+            else if (funcName == "frexpf") {
                 Expr *x = ce->getArg(0);
                 Expr *y = ce->getArg(1);
                 std::string newX, newY;
                 RewriteKernelExpr(x, newX);
                 RewriteKernelExpr(y, newY);
-                newExpr = "remainder(" + newX + ", " + newY + ")";
+                newExpr = "frexp(" + newX + ", " + newY + ")";
             }
-            else if (funcName == "remquof") {
-                Expr *x = ce->getArg(0);
-                Expr *y = ce->getArg(1);
-                Expr *z = ce->getArg(2);
-                std::string newX, newY, newZ;
-                RewriteKernelExpr(x, newX);
-                RewriteKernelExpr(y, newY);
-                RewriteKernelExpr(z, newZ);
-                newExpr = "remquo(" + newX + ", " + newY + ", " + newZ + ")";
-            }
-            else if (funcName == "modff") {
-                Expr *x = ce->getArg(0);
-                Expr *y = ce->getArg(1);
-                std::string newX, newY;
-                RewriteKernelExpr(x, newX);
-                RewriteKernelExpr(y, newY);
-                newExpr = "modf(" + newX + ", " + newY + ")";
-            }
-            else if (funcName == "fdimf") {
-                Expr *x = ce->getArg(0);
-                Expr *y = ce->getArg(1);
-                std::string newX, newY;
-                RewriteKernelExpr(x, newX);
-                RewriteKernelExpr(y, newY);
-                newExpr = "fdim(" + newX + ", " + newY + ")";
-            }
-            else if (funcName == "truncf") {
+	        else if (funcName == "hypotf") {
+		        Expr *x = ce->getArg(0);
+		        Expr *y = ce->getArg(1);
+		        std::string newX, newY;
+		        RewriteKernelExpr(x, newX);
+		        RewriteKernelExpr(y, newY);
+		        newExpr = "hypot(" + newX + ", " + newY + ")";
+	        }
+            else if (funcName == "ilogbf") {
                 Expr *x = ce->getArg(0);
                 std::string newX;
                 RewriteKernelExpr(x, newX);
-                newExpr = "trunc(" + newX + ")";
+                newExpr = "ilogb(" + newX + ")";
             }
-            else if (funcName == "roundf") {
+            else if (funcName == "isfinite") {
                 Expr *x = ce->getArg(0);
                 std::string newX;
                 RewriteKernelExpr(x, newX);
-                newExpr = "round(" + newX + ")";
-            }
-            else if (funcName == "rintf") {
-                Expr *x = ce->getArg(0);
-                std::string newX;
-                RewriteKernelExpr(x, newX);
-                newExpr = "rint(" + newX + ")";
-            }
-            else if (funcName == "nearbyintf") {
-                Expr *x = ce->getArg(0);
-                std::string newX;
-                RewriteKernelExpr(x, newX);
-                newExpr = "convert_int(" + newX + ")";
-            }
-            else if (funcName == "ceilf") {
-                Expr *x = ce->getArg(0);
-                std::string newX;
-                RewriteKernelExpr(x, newX);
-                newExpr = "ceil(" + newX + ")";
-            }
-            else if (funcName == "floorf") {
-                Expr *x = ce->getArg(0);
-                std::string newX;
-                RewriteKernelExpr(x, newX);
-                newExpr = "floor(" + newX + ")";
-            }
-            else if (funcName == "lrintf") {
-                Expr *x = ce->getArg(0);
-                std::string newX;
-                RewriteKernelExpr(x, newX);
-                newExpr = "convert_long(" + newX + ")";
-            }
-            else if (funcName == "lrioundf") {
-                Expr *x = ce->getArg(0);
-                std::string newX;
-                RewriteKernelExpr(x, newX);
-                //Had to emulate functionality by detecting which direction to round
-                newExpr = "(newX > 0 ? convert_long_rtp(" + newX + ") : convert_long_rtn(" + newX + ")";
-            }
-            else if (funcName == "llrintf") {
-                //TODO - figure out how to use long long conversions
-            }
-            else if (funcName == "lrioundf") {
-                //TODO - figure out how to use long long conversions
-            }
-            else if (funcName == "signbit") {
-                Expr *x = ce->getArg(0);
-                std::string newX;
-                RewriteKernelExpr(x, newX);
-                newExpr = "signbit(" + newX + ")";
+                newExpr = "isfinite(" + newX + ")";
             }
             else if (funcName == "isinf") {
                 Expr *x = ce->getArg(0);
@@ -1696,21 +1904,363 @@ private:
                 RewriteKernelExpr(x, newX);
                 newExpr = "isnan(" + newX + ")";
             }
-            else if (funcName == "isfinite") {
-                Expr *x = ce->getArg(0);
-                std::string newX;
-                RewriteKernelExpr(x, newX);
-                newExpr = "isfinite(" + newX + ")";
-            }
-            else if (funcName == "copysignf") {
+//TODO - Paul - Support j0f, j1f, jnf - Bessel function of first kind order 0, 1, and n
+            else if (funcName == "ldexpf") {
                 Expr *x = ce->getArg(0);
                 Expr *y = ce->getArg(1);
                 std::string newX, newY;
                 RewriteKernelExpr(x, newX);
                 RewriteKernelExpr(y, newY);
-                newExpr = "copysign(" + newX + ", " + newY + ")";
+                newExpr = "ldexp(" + newX + ", " + newY + ")";
             }
-            else if (funcName == "fminf") {
+            else if (funcName == "lgammaf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "lgamma(" + newX + ")";
+            }
+//TODO - Paul - suppot llrintf, llroundf - rounding with long long return type
+            else if (funcName == "log10f") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "log10(" + newX + ")";
+            }
+            else if (funcName == "log1pf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "log1p(" + newX + ")";
+            }
+            else if (funcName == "log2f") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "log2(" + newX + ")";
+            }
+            else if (funcName == "logbf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "logb(" + newX + ")";
+            }
+            else if (funcName == "logf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "log(" + newX + ")";
+            }
+//TODO - Paul - support lrintf, lroundf - rounding with long return type
+            else if (funcName == "modff") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "modf(" + newX + ", " + newY + ")";
+            }
+            else if (funcName == "nanf") {
+                //NOTE - original cuda type of x is const char *, opencl is uintn
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "nan(" + newX + ")";
+            }
+//TODO - Paul - Support nearbyintf
+            else if (funcName == "nextafterf") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "nextafter(" + newX + ", " + newY + ")";
+            }
+            else if (funcName == "powf") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "pow(" + newX + ", " + newY + ")";
+            }
+            else if (funcName == "rcbrtf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "(1/cbrt(" + newX + "))";
+            }
+            else if (funcName == "remainderf") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "remainder(" + newX + ", " + newY + ")";
+            }
+            else if (funcName == "remquof") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                Expr *z = ce->getArg(1);
+                std::string newX, newY, newZ;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                RewriteKernelExpr(z, newZ);
+                newExpr = "remquo(" + newX + ", " + newY + ", " + newZ + ")";
+            }
+            else if (funcName == "rintf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "rint(" + newX + ")";
+            }
+            else if (funcName == "roundf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "round(" + newX + ")";
+            }
+            else if (funcName == "rsqrtf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "rsqrt(" + newX + ")";
+            }
+//Both scalbnf and scalblnf are not guaranteed to use the efficient method of exponent manipulation, but are mathematically correct
+            else if (funcName == "scalbnf") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "ldexp(" + newX + ", " + newY + ")";
+            }
+            else if (funcName == "scalblnf") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "ldexp(" + newX + ", " + newY + ")";
+            }
+            else if (funcName == "signbit") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "signbit(" + newX + ")";
+            }
+            else if (funcName == "sincosf") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                Expr *z = ce->getArg(2);
+                std::string newX, newY, newZ;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                RewriteKernelExpr(z, newZ);
+//TODO - Paul - make sure this method works in practice
+                newExpr = "(*" + newY + " = sincos(" + newX + ", " + newZ + "))";
+            }
+            else if (funcName == "sinf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "sin(" + newX + ")";
+            }
+            else if (funcName == "sinhf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "sinh(" + newX + ")";
+            }
+            else if (funcName == "sinpif") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "sinpi(" + newX + ")";
+            }
+            else if (funcName == "sqrtf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "sqrt(" + newX + ")";
+            }
+            else if (funcName == "tanf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "tan(" + newX + ")";
+            }
+            else if (funcName == "tanhf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "tanh(" + newX + ")";
+            }
+            else if (funcName == "tgammaf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "tgamma(" + newX + ")";
+            }
+            else if (funcName == "truncf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "trunc(" + newX + ")";
+            }
+//TODO - Paul - Support y0f, y1f, ynf - Bessel function of first kind order 0, 1, and n
+//Begin double precision
+//These are "translated" to ensure nested calls get translated
+            else if (funcName == "acos") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "acos(" + newX + ")";
+            }
+            else if (funcName == "acosh") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "acosh(" + newX + ")";
+            }
+            else if (funcName == "asin") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "asin(" + newX + ")";
+            }
+            else if (funcName == "asinh") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "asinh(" + newX + ")";
+            }
+            else if (funcName == "atan") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "atan(" + newX + ")";
+            }
+            else if (funcName == "atan2") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "atan(" + newX + ", " + newY + ")";
+            }
+            else if (funcName == "atanh") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "atanh(" + newX + ")";
+            }
+            else if (funcName == "cbrt") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "cbrt(" + newX + ")";
+            }
+            else if (funcName == "ceil") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "ceil(" + newX + ")";
+            }
+//NOTE - Paul - Copysign is already handled in floating point section
+            else if (funcName == "cos") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "cos(" + newX + ")";
+            }
+            else if (funcName == "cosh") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "cosh(" + newX + ")";
+            }
+            else if (funcName == "cospi") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "cospi(" + newX + ")";
+            }
+            else if (funcName == "erf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "erf(" + newX + ")";
+            }
+            else if (funcName == "erfc") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "erfc(" + newX + ")";
+            }
+//TODO - Paul - support erfinv, erfcinv, erfcx
+            else if (funcName == "exp") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "exp(" + newX + ")";
+            }
+            else if (funcName == "exp10") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "exp10(" + newX + ")";
+            }
+            else if (funcName == "exp2") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "exp2(" + newX + ")";
+            }
+            else if (funcName == "expm1") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "expm1(" + newX + ")";
+            }
+            else if (funcName == "fabs") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "fabs(" + newX + ")";
+            }
+            else if (funcName == "fdim") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "fdim(" + newX + ", " + newY + ")";
+            }
+            else if (funcName == "floor") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "floor(" + newX + ")";
+            }
+            else if (funcName == "fma") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                Expr *z = ce->getArg(2);
+                std::string newX, newY, newZ;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                RewriteKernelExpr(z, newZ);
+                newExpr = "fma(" + newX + ", " + newY + ", " + newZ + ")";
+            }
+            else if (funcName == "fmax") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "fmax(" + newX + ", " + newY + ")";
+            }
+            else if (funcName == "fmin") {
                 Expr *x = ce->getArg(0);
                 Expr *y = ce->getArg(1);
                 std::string newX, newY;
@@ -1718,21 +2268,242 @@ private:
                 RewriteKernelExpr(y, newY);
                 newExpr = "fmin(" + newX + ", " + newY + ")";
             }
-            else if (funcName == "fmaxf") {
+            else if (funcName == "fmod") {
                 Expr *x = ce->getArg(0);
                 Expr *y = ce->getArg(1);
                 std::string newX, newY;
                 RewriteKernelExpr(x, newX);
                 RewriteKernelExpr(y, newY);
-                newExpr = "fmax(" + newX + ", " + newY + ")";
+                newExpr = "fmod(" + newX + ", " + newY + ")";
             }
-            else if (funcName == "fabsaf") {
+            else if (funcName == "frexp") {
                 Expr *x = ce->getArg(0);
                 Expr *y = ce->getArg(1);
                 std::string newX, newY;
                 RewriteKernelExpr(x, newX);
                 RewriteKernelExpr(y, newY);
-                newExpr = "fmax(" + newX + ", " + newY + ")";
+                newExpr = "frexp(" + newX + ", " + newY + ")";
+            }
+            else if (funcName == "hypot") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "hypot(" + newX + ", " + newY + ")";
+            }
+            else if (funcName == "ilogb") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "ilogb(" + newX + ")";
+            }
+//NOTE - Paul - isfinite, isinf, and isnan are all handled in floating point section
+//TODO - Paul - support j0, j1, jn - Bessel functions of the first kind of order 0, 1, and n
+            else if (funcName == "ldexp") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "ldexp(" + newX + ", " + newY + ")";
+            }
+            else if (funcName == "lgamma") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "lgamma(" + newX + ")";
+            }
+//TODO - Paul - support llrint, llround
+            else if (funcName == "log") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "log(" + newX + ")";
+            }
+            else if (funcName == "log10") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "log10(" + newX + ")";
+            }
+            else if (funcName == "log1p") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "log1p(" + newX + ")";
+            }
+            else if (funcName == "log2") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "log2(" + newX + ")";
+            }
+            else if (funcName == "logb") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "logb(" + newX + ")";
+            }
+//TODO - Paul - support lrint, lround
+            else if (funcName == "modf") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "modf(" + newX + ", " + newY + ")";
+            }
+//NOTE - Paul - nan is handled in floating point section
+//TODO - Paul - Support nearbyint
+            else if (funcName == "nextafter") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "nextafter(" + newX + ", " + newY + ")";
+            }
+            else if (funcName == "pow") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "pow(" + newX + ", " + newY + ")";
+            }
+            else if (funcName == "rcbrt") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "(1/cbrt(" + newX + "))";
+            }
+            else if (funcName == "remainder") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "remainder(" + newX + ", " + newY + ")";
+            }
+            else if (funcName == "remquo") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                Expr *z = ce->getArg(1);
+                std::string newX, newY, newZ;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                RewriteKernelExpr(z, newZ);
+                newExpr = "remquo(" + newX + ", " + newY + ", " + newZ + ")";
+            }
+            else if (funcName == "rint") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "rint(" + newX + ")";
+            }
+            else if (funcName == "round") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "round(" + newX + ")";
+            }
+            else if (funcName == "rsqrt") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "sqrt(" + newX + ")";
+            }
+//NOTE - Paul - Both scalbnf and scalblnf are not guaranteed to use the efficient method of exponent manipulation, but are mathematically correct
+            else if (funcName == "scalbn") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "ldexp(" + newX + ", " + newY + ")";
+            }
+            else if (funcName == "scalbln") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "ldexp(" + newX + ", " + newY + ")";
+            }
+//NOTE - Paul - signbit is already handled in the float section
+            else if (funcName == "sin") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "sin(" + newX + ")";
+            }
+            else if (funcName == "sincos") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                Expr *z = ce->getArg(2);
+                std::string newX, newY, newZ;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                RewriteKernelExpr(z, newZ);
+//TODO - Paul - make sure this method works in practice
+                newExpr = "(*" + newY + " = sincos(" + newX + ", " + newZ + "))";
+            }
+            else if (funcName == "sinh") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "sinh(" + newX + ")";
+            }
+            else if (funcName == "sinpi") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "sinpi(" + newX + ")";
+            }
+            else if (funcName == "sqrt") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "sqrt(" + newX + ")";
+            }
+            else if (funcName == "tan") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "tan(" + newX + ")";
+            }
+            else if (funcName == "tanh") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "tanh(" + newX + ")";
+            }
+            else if (funcName == "tgamma") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "tgamma(" + newX + ")";
+            }
+            else if (funcName == "trunc") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "trunc(" + newX + ")";
+            }
+//TODO - Paul - support y0, y1, yn
+//Begin native floats
+            else if (funcName == "__cosf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "native_cos(" + newX + ")";
+            }
+            else if (funcName == "__exp10f") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "native_exp10(" + newX + ")";
             }
             else if (funcName == "__expf") {
                 Expr *x = ce->getArg(0);
@@ -1740,17 +2511,33 @@ private:
                 RewriteKernelExpr(x, newX);
                 newExpr = "native_exp(" + newX + ")";
             }
-            else if (funcName == "__logf") {
+//TODO - Paul - support fadd and fdiv with rounding modes
+	        else if (funcName == "__fdividef") {
+		        Expr *x = ce->getArg(0);
+		        Expr *y = ce->getArg(1);
+		        std::string newX, newY;
+		        RewriteKernelExpr(x, newX);
+		        RewriteKernelExpr(y, newY);
+		        newExpr = "native_divide(" + newX + ", " + newY + ")";
+	        }
+//TODO - Paul - support fmaf, fmul, frcp, and fsqrt with rounding modes
+            else if (funcName == "__log10f") {
                 Expr *x = ce->getArg(0);
                 std::string newX;
                 RewriteKernelExpr(x, newX);
-                newExpr = "native_log(" + newX + ")";
+                newExpr = "native_log10(" + newX + ")";
             }
             else if (funcName == "__log2f") {
                 Expr *x = ce->getArg(0);
                 std::string newX;
                 RewriteKernelExpr(x, newX);
                 newExpr = "native_log2(" + newX + ")";
+            }
+            else if (funcName == "__logf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "native_log(" + newX + ")";
             }
             else if (funcName == "__powf") {
                 Expr *x = ce->getArg(0);
@@ -1760,7 +2547,96 @@ private:
                 RewriteKernelExpr(y, newY);
                 newExpr = "native_powr(" + newX + ", " + newY + ")";
             }
+            else if (funcName == "__saturatef") {
+//NOTE - Paul - does not use intrinsics, but returns an equivalent value
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "clamp(" + newX + "0.0f, 1.0f)";
+            }
+            else if (funcName == "__sinf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "native_sin(" + newX + ")";
+            }
+            else if (funcName == "__sincosf") {
+//NOTE - Paul - does not use intrinsics, but returns an equivalent value
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                Expr *z = ce->getArg(2);
+                std::string newX, newY, newZ;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                RewriteKernelExpr(z, newZ);
+//TODO - Paul - make sure this method works in practice
+                newExpr = "(*" + newY + " = sincos(" + newX + ", " + newZ + "))";
+            }
+            else if (funcName == "__tanf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "native_tan(" + newX + ")";
+            }
+//Begin double intrinsics
+//TODO- Paul support double intrinsics
+//Begin integer intrinsics
+//TODO - Paul support integer intrinsics
+//Begin type casting intrinsics
+            else if (funcName == "__double2float_rd") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "convert_float_rtn(" + newX + ")";
+            }
+            else if (funcName == "__double2float_rn") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "convert_float_rte(" + newX + ")";
+            }
+            else if (funcName == "__double2float_ru") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "convert_float_rtp(" + newX + ")";
+            }
+            else if (funcName == "__double2float_rz") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "convert_float_rtz(" + newX + ")";
+            }
+//TODO - Paul - support __double2hiint
+            else if (funcName == "__double2int_rd") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "convert_int_rtn(" + newX + ")";
+            }
+            else if (funcName == "__double2int_rn") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "convert_int_rte(" + newX + ")";
+            }
+            else if (funcName == "__double2int_ru") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "convert_int_rtp(" + newX + ")";
+            }
+            else if (funcName == "__double2int_rz") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "convert_int_rtz(" + newX + ")";
+            }
             else {
+//TODO - Paul Support __sincosf, a few others from Table C-4 of intrinsics
+//TODO - Paul Support double precision intrinsics from Table C-5
+//TODO - Paul - Make sure every possible function call goes through here, or else we may not get rewrites on interior nested calls.
+//TODO - Paul - any unsupported call should throw an error, but still convert interior nesting.
                 return false;
             }
             return true;
@@ -1874,6 +2750,7 @@ private:
         }
     }
 
+    //TODO - Paul - Does cuda have wider vector types?
     std::string RewriteVectorType(std::string type, bool addCL) {
         std::string prepend, append, ret;
         char size = type[type.length() - 1];
@@ -1891,7 +2768,7 @@ private:
             prepend = "cl_";
         if (type[0] == 'u')
             prepend += "u";
-        if (size == '3')
+        if (size == '3') //Only necessary when supporting OpenCL 1.0, otherwise 3 member vectors are supported
             append = '4';
         else if (size != '1')
             append = size;
@@ -1925,17 +2802,25 @@ private:
     }
 
     void RewriteType(TypeLoc tl, std::string replace, Rewriter &rewrite) {
-        rewrite.ReplaceText(
-                tl.getBeginLoc(),
-                rewrite.getRangeSize(tl.getLocalSourceRange()),
-                replace);
+
+//make sure to drop back one, so we don't count the space delimiter token.
+//make sure this isn't end loc, that doesn't work at all.
+SourceRange realRange(tl.getBeginLoc(),
+                              PP->getLocForEndOfToken(tl.getBeginLoc()));
+
+	//if (tl.getBeginLoc().getRawEncoding() != tl.getEndLoc().getRawEncoding()) {
+        //rewrite.ReplaceText(tl.getBeginLoc(), rewrite.getRangeSize(tl.getLocalSourceRange()), replace);
+	//} else {
+        rewrite.ReplaceText(tl.getBeginLoc(), rewrite.getRangeSize(realRange), replace);
+//}
     }
 
     void RewriteAttr(Attr *attr, std::string replace, Rewriter &rewrite) {
-        SourceLocation instLoc = SM->getInstantiationLoc(attr->getLocation());
+        SourceLocation instLoc = SM->getExpansionLoc(attr->getLocation());
         SourceRange realRange(instLoc,
                               PP->getLocForEndOfToken(instLoc));
         rewrite.ReplaceText(instLoc, rewrite.getRangeSize(realRange), replace);
+	
     }
 
     void RemoveFunction(FunctionDecl *func, Rewriter &rewrite) {
@@ -1945,6 +2830,11 @@ private:
         if (tk != FunctionDecl::TK_NonTemplate &&
             tk != FunctionDecl::TK_FunctionTemplate)
             return;
+
+        //Paul - 7/11/2012
+        //Try this hack to adjust the FunctionDecl pointer to only point to the definition
+        const FunctionDecl * funcDef = func;
+        if (func->hasBody()) {func->hasBody(funcDef); func = (FunctionDecl *)funcDef;}
 
         //Find startLoc
         //TODO find first specifier location
@@ -1958,9 +2848,39 @@ private:
         }
         if (func->hasAttrs()) {
             Attr *attr = (func->getAttrs())[0];
-            tempLoc = SM->getInstantiationLoc(attr->getLocation());
+            //TODO - Paul - 6/25/2012
+            //Check this patch for the issue noted below for sideeffects
+            //lets try a simple check, if any of the attributes after zeroth are the same as zeroth, grab it instead
+            //seems to work on both lineofsight and simpleCUFFT
+            int i;
+            for (i = 1; i < func->getAttrs().size(); i++) {
+                if ((func->getAttrs())[i]->getKind() == attr->getKind()) attr = (func->getAttrs())[i];
+            }
+            //TODO - Paul - 6/13/2012
+            //Fix this inappropriately grabbing attributes from prototype declaration
+            //only observed on lineOfSight, make sure that's the root problem
+            //sideeffects observed on simpleCUFFT
+            tempLoc = SM->getExpansionLoc(attr->getLocation());
             if (SM->isBeforeInTranslationUnit(tempLoc, startLoc))
                 startLoc = tempLoc;
+        }
+        //TODO - Paul - 06/12/2012
+        //Validate this fallback for C++ typeless methods (Constructor/destructor)
+        if (startLoc.getRawEncoding() == NULL) {
+            startLoc = func->getQualifierLoc().getBeginLoc();
+            if (startLoc.getRawEncoding() != NULL) emitCU2CLDiagnostic(startLoc, "CU2CL Note", "Removed constructor/deconstructor", &rewrite);
+        }
+
+        //Paul - 8/1/2012
+        // if all else fails, try this simplistic fallback, and emit a notification if we still
+        // can't come up with a valid startLoc
+        if (startLoc.getRawEncoding() == NULL) {
+            startLoc = func->getLocStart();
+            if (startLoc.getRawEncoding() == NULL) {
+                emitCU2CLDiagnostic(startLoc, "CU2CL Error", "Unable to determine valid start location for function \"" + func->getNameAsString() + "\"", &rewrite);
+                return;
+            }
+            emitCU2CLDiagnostic(startLoc, "CU2CL Note", "Inferred function start location, removal may be incomplete", &rewrite);
         }
 
         //Find endLoc
@@ -1985,7 +2905,7 @@ private:
         startLoc = var->getTypeSourceInfo()->getTypeLoc().getBeginLoc();
         if (var->hasAttrs()) {
             Attr *attr = (var->getAttrs())[0];
-            tempLoc = SM->getInstantiationLoc(attr->getLocation());
+            tempLoc = SM->getExpansionLoc(attr->getLocation());
             if (SM->isBeforeInTranslationUnit(tempLoc, startLoc))
                 startLoc = tempLoc;
         }
@@ -1993,16 +2913,16 @@ private:
         //Find endLoc
         if (var->hasInit()) {
             Expr *init = var->getInit();
-            endLoc = SM->getInstantiationLoc(init->getLocEnd());
+            endLoc = SM->getExpansionLoc(init->getLocEnd());
         }
         else {
             //Find location of semi-colon
             TypeLoc tl = var->getTypeSourceInfo()->getTypeLoc();
             if (ArrayTypeLoc *atl = dyn_cast<ArrayTypeLoc>(&tl)) {
-                endLoc = SM->getInstantiationLoc(atl->getRBracketLoc());
+                endLoc = SM->getExpansionLoc(atl->getRBracketLoc());
             }
             else
-                endLoc = SM->getInstantiationLoc(var->getSourceRange().getEnd());
+                endLoc = SM->getExpansionLoc(var->getSourceRange().getEnd());
         }
         rewrite.RemoveText(startLoc,
                            rewrite.getRangeSize(SourceRange(startLoc, endLoc)));
@@ -2024,8 +2944,8 @@ private:
 
     bool ReplaceStmtWithText(Stmt *OldStmt, llvm::StringRef NewStr, Rewriter &Rewrite) {
         SourceRange origRange = OldStmt->getSourceRange();
-        SourceLocation s = SM->getInstantiationLoc(origRange.getBegin());
-        SourceLocation e = SM->getInstantiationLoc(origRange.getEnd());
+        SourceLocation s = SM->getExpansionLoc(origRange.getBegin());
+        SourceLocation e = SM->getExpansionLoc(origRange.getEnd());
         return Rewrite.ReplaceText(s,
                                    Rewrite.getRangeSize(SourceRange(s, e)),
                                    NewStr);
@@ -2083,9 +3003,12 @@ public:
         UsesCUDAStreamQuery = false;
         UsesCUDAEventElapsedTime = false;
         UsesCUDAEventQuery = false;
-    }
+        UsesCUDASetDevice = false;
+    
+	TransTime = 0;
+}
 
-    virtual void HandleTopLevelDecl(DeclGroupRef DG) {
+    virtual bool HandleTopLevelDecl(DeclGroupRef DG) {
         //Check where the declaration(s) comes from (may have been included)
         Decl *firstDecl = DG.isSingleDecl() ? DG.getSingleDecl() : DG.getDeclGroup()[0];
         SourceLocation loc = firstDecl->getLocation();
@@ -2093,6 +3016,7 @@ public:
             llvm::StringRef fileExt = extension(SM->getPresumedLoc(loc).getFilename());
             if (fileExt.equals(".cu") || fileExt.equals(".cuh")) {
                 //If #included and a .cu or .cuh file, rewrite
+                //TODO - Paul, find a way to identify appropriate .c/.h/.cpp/.hpp files
                 if (OutFiles.find(SM->getFileID(loc)) == OutFiles.end()) {
                     //Create new files
                     FileID fileid = SM->getFileID(loc);
@@ -2111,7 +3035,8 @@ public:
                 }
             }
             else {
-                return;
+                //Don't stop parsing, just skip the file
+                return true;
             }
         }
         //Store VarDecl DeclGroupRefs
@@ -2121,55 +3046,98 @@ public:
         //Walk declarations in group and rewrite
         for (DeclGroupRef::iterator i = DG.begin(), e = DG.end(); i != e; ++i) {
             if (DeclContext *dc = dyn_cast<DeclContext>(*i)) {
+                //Basically only handles C++ member functions
                 for (DeclContext::decl_iterator di = dc->decls_begin(), de = dc->decls_end();
                      di != de; ++di) {
                     if (FunctionDecl *fd = dyn_cast<FunctionDecl>(*di)) {
-                        RewriteHostFunction(fd);
-                        RemoveFunction(fd, KernelRewrite);
-
-                        if (fd->getNameAsString() == MainFuncName) {
-                            RewriteMain(fd);
+                        //Paul - 8/1/2012
+                        //Patch to prevent implicitly defined functions from being rewritten
+                        // a la streamcluster_cuda.cu
+                        if (!fd->isImplicit()) {
+                            RewriteHostFunction(fd);
+                            RemoveFunction(fd, KernelRewrite);
+    
+                            if (fd->getNameAsString() == MainFuncName) {
+                                RewriteMain(fd);
+                            }
+                        } else {
+                            emitCU2CLDiagnostic(fd->getLocStart(), "CU2CL Note", "Skipped rewrite of implicitly defined function \"" + fd->getNameAsString() + "\"", &HostRewrite);
                         }
                     }
                 }
             }
+            //Handles globally defined C or C++ functions
             if (FunctionDecl *fd = dyn_cast<FunctionDecl>(*i)) {
-                if (fd->hasAttr<CUDAGlobalAttr>() || fd->hasAttr<CUDADeviceAttr>()) {
+                if(fd->getTemplatedKind() == clang::FunctionDecl::TK_NonTemplate || fd->getTemplatedKind() == FunctionDecl::TK_FunctionTemplate) {
+                    if (fd->hasAttr<CUDAGlobalAttr>() || fd->hasAttr<CUDADeviceAttr>()) {
                     //Device function, so rewrite kernel
-                    RewriteKernelFunction(fd);
-                    if (fd->hasAttr<CUDAHostAttr>())
-                        //Also a host function, so rewrite host
-                        RewriteHostFunction(fd);
-                    else
-                        //Simply a device function, so remove from host
-                        RemoveFunction(fd, HostRewrite);
-                }
-                else {
-                    //Simply a host function, so rewrite
-                    RewriteHostFunction(fd);
-                    //and remove from kernel
-                    RemoveFunction(fd, KernelRewrite);
-
-                    if (fd->getNameAsString() == MainFuncName) {
-                        RewriteMain(fd);
+                        RewriteKernelFunction(fd);
+                        if (fd->hasAttr<CUDAHostAttr>())
+                            //Also a host function, so rewrite host
+                            RewriteHostFunction(fd);
+                        else
+                            //Simply a device function, so remove from host
+                            RemoveFunction(fd, HostRewrite);
                     }
+                    else {
+                        //Simply a host function, so rewrite
+                        RewriteHostFunction(fd);
+                        //and remove from kernel
+                        RemoveFunction(fd, KernelRewrite);
+    
+                        if (fd->getNameAsString() == MainFuncName) {
+                            RewriteMain(fd);
+                        }
+                    }
+                } else {
+                    if (fd->getTemplateSpecializationInfo())
+                    emitCU2CLDiagnostic(fd->getTemplateSpecializationInfo()->getTemplate()->getLocStart(), "CU2CL Untranslated", "Unable to translate template function", &HostRewrite);
+                    else llvm::errs() << "Non-rewriteable function without TemplateSpecializationInfo detected\n";
                 }
             }
             else if (VarDecl *vd = dyn_cast<VarDecl>(*i)) {
                 RemoveVar(vd, KernelRewrite);
                 RewriteHostVarDecl(vd);
             }
+            //TODO - Paul - 8/3/2012
+            //Rewrite Structs here
+
+            //Ideally, we should keep the expression inside parentheses ie __align__(<keep this>)
+            // and just wrap it with __attribute__((aligned (<kept Expr>)))
+            // but so far as I can tell, there's no way to get that expression, or the parentheses
+            // without manually crawling tokens rightward from align->getAlignmentExpr().
+            else if (RecordDecl * rd = dyn_cast<RecordDecl>(*i)) {
+                if (rd->hasAttrs()) {
+                    for (Decl::attr_iterator at = rd->attr_begin(), at_e = rd->attr_end(); at != at_e; ++at) {
+                        if (AlignedAttr *align = dyn_cast<AlignedAttr>(*at)) {
+                            if (!align->isAlignmentDependent()) {
+                                llvm::errs() << "Found an aligned struct of size: " << align->getAlignment(rd->getASTContext()) << " (bits)\n";
+                            } else {
+                                llvm::errs() << "Found a dependent alignment expresssion\n";
+                            }
+                        } else {
+                            llvm::errs() << "Found other attrib\n";
+                        }
+                    }
+                }
+            }
             //TODO rewrite type declarations
         }
+return true;
     }
 
     virtual void HandleTranslationUnit(ASTContext &) {
+#ifdef CU2CL_ENABLE_TIMING
+        init_time();
+#endif
+
         //Declare global clPrograms
         for (StringRefListMap::iterator i = Kernels.begin(),
              e = Kernels.end(); i != e; i++) {
             std::string r = idCharFilter((*i).first);
             HostGlobalVars += "cl_program __cu2cl_Program_" + r + ";\n";
         }
+        //TODO - Paul - main preamble as part of multiple compliation
         //Insert host preamble at top of main file
         HostPreamble = HostIncludes + "\n" + HostDecls + "\n" + HostGlobalVars + "\n" + HostKernels + "\n" + HostFunctions;
         HostRewrite.InsertTextBefore(SM->getLocForStartOfFile(MainFileID), HostPreamble);
@@ -2177,11 +3145,20 @@ public:
         DevPreamble = DevFunctions;
         KernelRewrite.InsertTextBefore(SM->getLocForStartOfFile(MainFileID), DevPreamble);
 
+//TODO - Paul - attack separate compilation here
+        if (MainDecl == NULL) { //No such main method exists in this file
+            emitCU2CLDiagnostic(SM->getLocForStartOfFile(MainFileID), "CU2CL Unhandled", "No main() found, skipping OpenCL boilerplate", &HostRewrite);
+            //return;
+        } else { //begin boilerplate
         CompoundStmt *mainBody = dyn_cast<CompoundStmt>(MainDecl->getBody());
         //Insert OpenCL initialization stuff at top of main
         CLInit += "\n";
         CLInit += "const char *progSrc;\n";
         CLInit += "size_t progLen;\n\n";
+        //Paul - 7/17/2012
+        //Rather than obviating these lines to support cudaSetDevice, we'll assume these lines
+        // are *always* included, and IFF cudaSetDevice is used, include code to instead scan
+        // *all* devices, and allow for reinitialization
         CLInit += "clGetPlatformIDs(1, &__cu2cl_Platform, NULL);\n";
         CLInit += "clGetDeviceIDs(__cu2cl_Platform, CL_DEVICE_TYPE_GPU, 1, &__cu2cl_Device, NULL);\n";
         CLInit += "__cu2cl_Context = clCreateContext(NULL, 1, &__cu2cl_Device, NULL, NULL, NULL);\n";
@@ -2200,8 +3177,9 @@ public:
                 CLInit += "__cu2cl_Kernel_" + kernelName + " = clCreateKernel(__cu2cl_Program_" + file + ", \"" + kernelName + "\", NULL);\n";
             }
         }
-        HostRewrite.InsertTextAfter(PP->getLocForEndOfToken(mainBody->getLBracLoc()), CLInit);
+        HostRewrite.InsertTextAfter(PP->getLocForEndOfToken(mainBody->getLBracLoc(), 0), CLInit);
 
+        //TODO - Paul - move this as part of separate compilation support
         //Insert cleanup code at bottom of main
         CLClean += "\n";
         for (StringRefListMap::iterator i = Kernels.begin(),
@@ -2221,6 +3199,7 @@ public:
         CLClean += "clReleaseCommandQueue(__cu2cl_CommandQueue);\n";
         CLClean += "clReleaseContext(__cu2cl_Context);\n";
         HostRewrite.InsertTextBefore(mainBody->getRBracLoc(), CLClean);
+        } //end boilerplate
 
         //Rewrite cl_mems in DeclGroups
         for (std::set<DeclGroupRef>::iterator i = DeviceMemDGs.begin(),
@@ -2235,7 +3214,31 @@ public:
                 }
                 if (DeviceMemVars.find(vd) != DeviceMemVars.end()) {
                     //Change variable's type to cl_mem
+emitCU2CLDiagnostic(vd->getLocStart(), "CU2CL Note", "Rewrote device var!\n", &HostRewrite);
                     replace += "cl_mem " + vd->getNameAsString();
+			if (vd->getType()->isArrayType()) {
+				//make sure to grab the array [...] Expr too
+				emitCU2CLDiagnostic(vd->getLocStart(), "CU2CL Note", "Device var \"" + vd->getNameAsString() + "\" has array type!\n", &HostRewrite);
+
+				replace += "[";
+				if (const DependentSizedArrayType *arr = dyn_cast<DependentSizedArrayType>(vd->getType().getCanonicalType())) {
+					replace += getStmtText(arr->getSizeExpr());
+
+				} else if (const VariableArrayType *arr = dyn_cast<VariableArrayType>(vd->getType().getCanonicalType())) {
+					replace += getStmtText(arr->getSizeExpr());
+				} else if (const ConstantArrayType *arr = dyn_cast<ConstantArrayType>(vd->getType().getCanonicalType())) {
+					replace += arr->getSize().toString(10, true);	
+				}
+				replace += "]";
+			}
+
+
+			//TODO - Paul 2012.10.15 Try this stub for array processing
+			//it might help with macros for sizes..
+			//TypeLoc tl = var->getTypeSourceInfo()->getTypeLoc();
+            		//	if (ArrayTypeLoc *atl = dyn_cast<ArrayTypeLoc>(&tl)) {
+            		//	    endLoc = SM->getExpansionLoc(atl->getRBracketLoc());
+            		//}
                 }
                 else {
                     replace += PrintDeclToString(vd);
@@ -2247,7 +3250,9 @@ public:
                     replace += ";\n";
                 }
             }
-            HostRewrite.ReplaceText(start, HostRewrite.getRangeSize(SourceRange(start, end)), replace);
+            //TODO - Paul - 7/10/2012
+            //Make sure wrapping the start and end IDs with getExpansionLoc properly handles macros
+            HostRewrite.ReplaceText(start, HostRewrite.getRangeSize(SourceRange(SM->getExpansionLoc(start), SM->getExpansionLoc(end))), replace);
         }
 
         //Output main file's rewritten buffer
@@ -2282,7 +3287,11 @@ public:
             }
             else {
                 //TODO use diagnostics for pretty errors
-                llvm::errs() << "No changes made to " << SM->getFileEntryForID(fid)->getName() << "\n";
+                //Paul TODO - Need to fix this so that host includes which have their directive converted to "*-cl.h" don't just point to an empty file when they're not rewritten
+                //Paul - 8/22/2012 - patch to fix the above issue
+                llvm::StringRef fileBuf = SM->getBufferData(fid);
+                *outFile << std::string(fileBuf.begin(), fileBuf.end());
+                //llvm::errs() << "No (host) changes made to " << SM->getFileEntryForID(fid)->getName() << "\n";
             }
             outFile->flush();
         }
@@ -2296,12 +3305,19 @@ public:
             }
             else {
                 //TODO use diagnostics for pretty errors
-                llvm::errs() << "No changes made to " << SM->getFileEntryForID(fid)->getName() << " kernel\n";
+                llvm::errs() << "No (kernel) changes made to " << SM->getFileEntryForID(fid)->getName() << " kernel\n";
             }
             outFile->flush();
         }
+
+#ifdef CU2CL_ENABLE_TIMING
+        TransTime += get_time();
+
+        llvm::errs() << "Translation Time: " << TransTime << " microseconds\n";
+#endif
     }
 
+    //TODO - Paul - can/should we force system-style include translation?
     void RewriteInclude(SourceLocation HashLoc, const Token &IncludeTok,
                         llvm::StringRef FileName, bool IsAngled,
                         const FileEntry *File, SourceLocation EndLoc/*,
@@ -2309,8 +3325,10 @@ public:
         llvm::StringRef fileExt = extension(SM->getPresumedLoc(HashLoc).getFilename());
         llvm::StringRef includedFile = filename(FileName);
         llvm::StringRef includedExt = extension(includedFile);
+        //llvm::errs() << "Include processing\n";
         if (SM->isFromMainFile(HashLoc) ||
             fileExt.equals(".cu") || fileExt.equals(".cuh")) {
+            //llvm::errs() << "\tis from main\n";
             if (IsAngled) {
                 KernelRewrite.RemoveText(HashLoc, KernelRewrite.getRangeSize(SourceRange(HashLoc, EndLoc)));
                 if (includedFile.equals("cuda.h"))
@@ -2325,9 +3343,9 @@ public:
                 SourceLocation fileStartLoc = SM->getLocForStartOfFile(fileID);
                 llvm::StringRef fileBuf = SM->getBufferData(fileID);
                 const char *fileBufStart = fileBuf.begin();
-
-                SourceLocation start = fileStartLoc.getFileLocWithOffset(includedExt.begin() - fileBufStart);
-                SourceLocation end = fileStartLoc.getFileLocWithOffset((includedExt.end()-1) - fileBufStart);
+                SourceLocation start = fileStartLoc.getLocWithOffset(includedExt.begin() - fileBufStart);
+                SourceLocation end = fileStartLoc.getLocWithOffset((includedExt.end()-1) - fileBufStart);
+                //llvm::errs() << "Rewriting Include directive at position: " << start.getRawEncoding() << ", " << end.getRawEncoding() << "\n";
                 HostRewrite.ReplaceText(start, HostRewrite.getRangeSize(SourceRange(start, end)), "-cl.h");
                 KernelRewrite.ReplaceText(start, KernelRewrite.getRangeSize(SourceRange(start, end)), "-cl.cl");
             }
@@ -2342,6 +3360,7 @@ public:
 class RewriteCUDAAction : public PluginASTAction {
 protected:
     ASTConsumer *CreateASTConsumer(CompilerInstance &CI, llvm::StringRef InFile) {
+        
         std::string filename = InFile.str();
         size_t dotPos = filename.rfind('.');
         filename = filename.substr(0, dotPos) + "-cl" + filename.substr(dotPos);
@@ -2378,8 +3397,10 @@ RewriteIncludesCallback::RewriteIncludesCallback(RewriteCUDA *RC) :
 
 void RewriteIncludesCallback::InclusionDirective(SourceLocation HashLoc, const Token &IncludeTok,
                                                  llvm::StringRef FileName, bool IsAngled,
-                                                 const FileEntry *File, SourceLocation EndLoc/*,
+                                                 const FileEntry *File, SourceLocation EndLoc,
+                                                 StringRef SearchPath, StringRef RelativePath/*,
                                                  const llvm::SmallVectorImpl<char> &RawPath*/) {
+    //llvm::errs() << "Testing InclusionDirective\n";
     RCUDA->RewriteInclude(HashLoc, IncludeTok, FileName, IsAngled, File, EndLoc);
 }
 
