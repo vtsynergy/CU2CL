@@ -223,10 +223,13 @@ using namespace llvm::sys::path;
 
 namespace {
 
+<<<<<<< HEAD
 
     //internal flags for command-line toggles
     bool AddInlineComments = true; //defaults to ON, turn off with '-plugin-arg-rewrite-cuda no-comments' at the command line
 
+=======
+>>>>>>> 95a2581c09258796de8252d47a784b4165d7a338
 #ifdef CU2CL_ENABLE_TIMING
 struct timeval startTime, endTime;
 
@@ -246,12 +249,21 @@ struct cmpDG {
         SourceLocation aLoc = (a.isSingleDecl() ? a.getSingleDecl() : a.getDeclGroup()[0])->getLocStart();
         SourceLocation bLoc = (b.isSingleDecl() ? b.getSingleDecl() : b.getDeclGroup()[0])->getLocStart();
         return aLoc.getRawEncoding() < bLoc.getRawEncoding();
+<<<<<<< HEAD
     }   
 };
 
 
 
 
+=======
+    }
+
+    
+};
+
+
+>>>>>>> 95a2581c09258796de8252d47a784b4165d7a338
 class RewriteCUDA;
 
 class RewriteIncludesCallback : public PPCallbacks {
@@ -338,9 +350,14 @@ private:
     bool UsesCUDAFreeHost;
     bool UsesCUDASetDevice;
 
+<<<<<<< HEAD
 
 	uint64_t TransTime;    
 
+=======
+	uint64_t TransTime;    
+
+>>>>>>> 95a2581c09258796de8252d47a784b4165d7a338
 void TraverseStmt(Stmt *e, unsigned int indent) {
         for (unsigned int i = 0; i < indent; i++)
             llvm::errs() << "  ";
@@ -419,15 +436,21 @@ void TraverseStmt(Stmt *e, unsigned int indent) {
     void emitCU2CLDiagnostic(SourceLocation loc, std::string severity_str, std::string err_note, std::string inline_note, Rewriter &writer) {
         //Sanitize all incoming locations to make sure they're not MacroIDs
         SourceLocation expLoc = SM->getExpansionLoc(loc);
+<<<<<<< HEAD
         SourceLocation writeLoc;
+=======
+>>>>>>> 95a2581c09258796de8252d47a784b4165d7a338
 
         //assemble both the stderr and inlined source output strings
         std::stringstream inlineStr;
         std::stringstream errStr;
         if (expLoc.isValid()){
             errStr << SM->getBufferName(expLoc) << ":" << SM->getExpansionLineNumber(expLoc) << ":" << SM->getExpansionColumnNumber(expLoc) << ": ";
+<<<<<<< HEAD
             //grab the start of column write location
             writeLoc = SM->translateLineCol(SM->getFileID(expLoc), SM->getExpansionLineNumber(expLoc), 1);
+=======
+>>>>>>> 95a2581c09258796de8252d47a784b4165d7a338
         }
         if (!severity_str.empty()) {
             errStr << severity_str << ": ";
@@ -444,11 +467,19 @@ void TraverseStmt(Stmt *e, unsigned int indent) {
 			//Paul - 04/30/2013
 			//Disable this section to turn off error emission, by default if an
 			// inline error string is empty, it will turn off comment insertion for that error
+<<<<<<< HEAD
 			if (!inline_note.empty() && AddInlineComments) {
 				if (&writer == &HostRewrite) {
 				bufferComment(writeLoc, inlineStr.str(), true);
 				} else {
 				bufferComment(writeLoc, inlineStr.str(), false);
+=======
+			if (!inline_note.empty()) {
+				if (&writer == &HostRewrite) {
+				bufferComment(loc, inlineStr.str(), true);
+				} else {
+				bufferComment(loc, inlineStr.str(), false);
+>>>>>>> 95a2581c09258796de8252d47a784b4165d7a338
 				}
 			}
             //writer->InsertTextBefore(loc , llvm::StringRef(inlineStr.str()));
@@ -550,7 +581,11 @@ void TraverseStmt(Stmt *e, unsigned int indent) {
             } else if (kce->getDirectCallee() == 0 && dyn_cast<ImplicitCastExpr>(kce->getCallee())) {
                 //TODO - Paul 6/26/2012
                 //Check this hack for kernel function pointer calls
+<<<<<<< HEAD
                 emitCU2CLDiagnostic(kce->getLocStart(), "CU2CL Untranslated", "Function pointer as kernel call", HostRewrite);
+=======
+                emitCU2CLDiagnostic(kce->getLocStart(), "CU2CL Unhandled", "Function pointer as kernel call", HostRewrite);
+>>>>>>> 95a2581c09258796de8252d47a784b4165d7a338
                 return false;
             }
             newExpr = RewriteCUDAKernelCall(kce);
@@ -1234,10 +1269,14 @@ if (FindStmt<DeclRefExpr>(arg) == NULL || !arg->IgnoreParenCasts()->isLValue()) 
  args << arg->getType().getAsString() << " __cu2cl_Kernel_" << callee->getNameAsString() << "_temp_arg_" << i << " = " << newArg << ";\n";
 args << "clSetKernelArg(" << kernelName << ", " << i << ", sizeof(" << arg->getType().getAsString() <<"), &__cu2cl_Kernel_" << callee->getNameAsString() << "_temp_arg_" << i << ");\n";
 
+<<<<<<< HEAD
 std::stringstream comment;
 comment << "Inserted temporary variable for kernel literal argument " << i << "!";
 //emitCU2CLDiagnostic(arg->getLocStart(), "CU2CL Note", "Inserted temporary variable for kernel literal argument!", HostRewrite);
 emitCU2CLDiagnostic(kernelCall->getLocStart(), "CU2CL Note", comment.str(), HostRewrite);
+=======
+emitCU2CLDiagnostic(arg->getLocStart(), "CU2CL Note", "Inserted temporary variable for kernel literal argument!", HostRewrite);
+>>>>>>> 95a2581c09258796de8252d47a784b4165d7a338
 
 } else {
             VarDecl *var = dyn_cast<VarDecl>(FindStmt<DeclRefExpr>(arg)->getDecl());
@@ -3037,6 +3076,7 @@ public:
         UsesCUDAEventQuery = false;
         UsesCUDASetDevice = false;
 
+<<<<<<< HEAD
 	//AddInlineComments = true;
 
 	//Set up the simple linked-list for buffering inserted comments
@@ -3047,6 +3087,16 @@ public:
 	TransTime = 0;
 }
 
+=======
+	//Set up the simple linked-list for buffering inserted comments
+	head = (struct commentBufferNode *)malloc(sizeof(struct commentBufferNode));
+	head->n = NULL;
+    	tail = head;
+    
+	TransTime = 0;
+}
+
+>>>>>>> 95a2581c09258796de8252d47a784b4165d7a338
     virtual bool HandleTopLevelDecl(DeclGroupRef DG) {
         //Check where the declaration(s) comes from (may have been included)
         Decl *firstDecl = DG.isSingleDecl() ? DG.getSingleDecl() : DG.getDeclGroup()[0];
@@ -3299,9 +3349,12 @@ return true;
 		//Paul - 11/15/2012
 		// Write out all comment buffers after translation has finished
 		writeComments();
+<<<<<<< HEAD
 free(head);
 head = NULL;
 tail = NULL;
+=======
+>>>>>>> 95a2581c09258796de8252d47a784b4165d7a338
 
         //Output main file's rewritten buffer
         if (const RewriteBuffer *RewriteBuff =

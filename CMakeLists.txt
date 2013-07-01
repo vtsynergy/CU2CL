@@ -31,13 +31,15 @@ if(CU2CL_PATH_TO_CLANG_SRC)
     endif()
 endif()
 
-if(NOT EXISTS "${CU2CL_PATH_TO_LLVM_BUILD}/bin/tblgen${CMAKE_EXECUTABLE_SUFFIX}" )
+#if installing from combined LLVM/Clang SVN source tree, use /bin/llvm-tblgen
+#otherwise, use /bin/tblgen
+if(NOT EXISTS "${CU2CL_PATH_TO_LLVM_BUILD}/bin/llvm-tblgen${CMAKE_EXECUTABLE_SUFFIX}" )
     message(FATAL_ERROR
             "Please set CU2CL_PATH_TO_LLVM_BUILD to a directory containing an LLVM build.")
 endif()
 get_filename_component(LLVM_BUILD_DIR ${CU2CL_PATH_TO_LLVM_BUILD}
                        ABSOLUTE)
-if(NOT EXISTS "${CU2CL_PATH_TO_CLANG_BUILD}/bin/clang${CMAKE_EXECUTABLE_SUFFIX}" )
+if(NOT EXISTS "${CU2CL_PATH_TO_CLANG_BUILD}/bin/clang-3.2${CMAKE_EXECUTABLE_SUFFIX}" )
     message(FATAL_ERROR
             "Please set CU2CL_PATH_TO_CLANG_BUILD to a directory containing a Clang build.")
 endif()
@@ -48,7 +50,9 @@ list(APPEND CMAKE_MODULE_PATH "${LLVM_BUILD_DIR}/share/llvm/cmake")
 
 include(AddLLVM)
 include(HandleLLVMOptions)
-include("${LLVM_BUILD_DIR}/share/llvm/cmake/LLVM.cmake")
+#if building from combined LLVM/Clang SVN source tree, use /share/llvm/cmkae/LLVMConfig.cmake
+#otherwise use LLVM.cmake
+include("${LLVM_BUILD_DIR}/share/llvm/cmake/LLVMConfig.cmake")
 
 set(CMAKE_INCLUDE_CURRENT_DIR ON)
 include_directories("${LLVM_BUILD_DIR}/include" "${LLVM_SRC_DIR}/include")
