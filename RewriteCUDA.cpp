@@ -419,12 +419,15 @@ void TraverseStmt(Stmt *e, unsigned int indent) {
     void emitCU2CLDiagnostic(SourceLocation loc, std::string severity_str, std::string err_note, std::string inline_note, Rewriter &writer) {
         //Sanitize all incoming locations to make sure they're not MacroIDs
         SourceLocation expLoc = SM->getExpansionLoc(loc);
+        SourceLocation writeLoc;
 
         //assemble both the stderr and inlined source output strings
         std::stringstream inlineStr;
         std::stringstream errStr;
         if (expLoc.isValid()){
             errStr << SM->getBufferName(expLoc) << ":" << SM->getExpansionLineNumber(expLoc) << ":" << SM->getExpansionColumnNumber(expLoc) << ": ";
+            //grab the start of column write location
+            writeLoc = SM->translateLineCol(SM->getFileID(expLoc), SM->getExpansionLineNumber(expLoc), 1);
         }
         if (!severity_str.empty()) {
             errStr << severity_str << ": ";
@@ -443,9 +446,9 @@ void TraverseStmt(Stmt *e, unsigned int indent) {
 			// inline error string is empty, it will turn off comment insertion for that error
 			if (!inline_note.empty() && AddInlineComments) {
 				if (&writer == &HostRewrite) {
-				bufferComment(loc, inlineStr.str(), true);
+				bufferComment(writeLoc, inlineStr.str(), true);
 				} else {
-				bufferComment(loc, inlineStr.str(), false);
+				bufferComment(writeLoc, inlineStr.str(), false);
 				}
 			}
             //writer->InsertTextBefore(loc , llvm::StringRef(inlineStr.str()));
@@ -1231,7 +1234,10 @@ if (FindStmt<DeclRefExpr>(arg) == NULL || !arg->IgnoreParenCasts()->isLValue()) 
  args << arg->getType().getAsString() << " __cu2cl_Kernel_" << callee->getNameAsString() << "_temp_arg_" << i << " = " << newArg << ";\n";
 args << "clSetKernelArg(" << kernelName << ", " << i << ", sizeof(" << arg->getType().getAsString() <<"), &__cu2cl_Kernel_" << callee->getNameAsString() << "_temp_arg_" << i << ");\n";
 
-emitCU2CLDiagnostic(arg->getLocStart(), "CU2CL Note", "Inserted temporary variable for kernel literal argument!", HostRewrite);
+std::stringstream comment;
+comment << "Inserted temporary variable for kernel literal argument " << i << "!";
+//emitCU2CLDiagnostic(arg->getLocStart(), "CU2CL Note", "Inserted temporary variable for kernel literal argument!", HostRewrite);
+emitCU2CLDiagnostic(kernelCall->getLocStart(), "CU2CL Note", comment.str(), HostRewrite);
 
 } else {
             VarDecl *var = dyn_cast<VarDecl>(FindStmt<DeclRefExpr>(arg)->getDecl());
