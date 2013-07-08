@@ -3182,12 +3182,6 @@ return true;
         DevPreamble = DevFunctions;
         KernelRewrite.InsertTextBefore(SM->getLocForStartOfFile(MainFileID), DevPreamble);
 
-//TODO - Paul - attack separate compilation here
-        if (MainDecl == NULL) { //No such main method exists in this file
-            emitCU2CLDiagnostic(SM->getLocForStartOfFile(MainFileID), "CU2CL Unhandled", "No main() found, skipping OpenCL boilerplate", HostRewrite);
-            //return;
-        } else { //begin boilerplate
-        CompoundStmt *mainBody = dyn_cast<CompoundStmt>(MainDecl->getBody());
         //Insert OpenCL initialization stuff at top of main
         CLInit += "\n";
         CLInit += "const char *progSrc;\n";
@@ -3214,7 +3208,7 @@ return true;
                 CLInit += "__cu2cl_Kernel_" + kernelName + " = clCreateKernel(__cu2cl_Program_" + file + ", \"" + kernelName + "\", NULL);\n";
             }
         }
-        HostRewrite.InsertTextAfter(PP->getLocForEndOfToken(mainBody->getLBracLoc(), 0), CLInit);
+        
 
         //TODO - Paul - move this as part of separate compilation support
         //Insert cleanup code at bottom of main
@@ -3235,6 +3229,21 @@ return true;
         }
         CLClean += "clReleaseCommandQueue(__cu2cl_CommandQueue);\n";
         CLClean += "clReleaseContext(__cu2cl_Context);\n";
+        
+        //07/08/2013, restructured this section to allow the same code to be used
+        // to generate boilerplate for main method or header comment
+//TODO - Paul - attack separate compilation here
+        if (MainDecl == NULL) { //No such main method exists in this file
+            
+        std::stringstream boilStr;
+        boilStr << "No main() found\nCU2CL Boilerplate inserted here:\nCU2CL Initialization:\n" << CLInit << "\n\nCU2CL Cleanup:\n" <<CLClean; 
+            
+            emitCU2CLDiagnostic(SM->getLocForStartOfFile(MainFileID), "CU2CL Unhandled", "No main() found!\n\tBoilerplate inserted as header comment!\n", boilStr.str(), HostRewrite);
+            //return;
+        } else { //begin boilerplate
+        CompoundStmt *mainBody = dyn_cast<CompoundStmt>(MainDecl->getBody());
+        
+        HostRewrite.InsertTextAfter(PP->getLocForEndOfToken(mainBody->getLBracLoc(), 0), CLInit);
         HostRewrite.InsertTextBefore(mainBody->getRBracLoc(), CLClean);
         } //end boilerplate
 
