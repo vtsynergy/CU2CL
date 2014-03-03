@@ -1072,7 +1072,8 @@ emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Note", "Rewriting single dec
         //TODO - Paul - support cudaMemcpyDefault or whatever the
         // ambiguous call from AMD NDA Tarball was
         else if (funcName == "cudaMemcpy") {
-            //TODO support offsets
+            //TODO support offsets (will need to grab pointer out of cudamemcpy call)
+	    // then separate off the rest of the math as the offset
             //Inspect kind of memcpy and rewrite accordingly
             Expr *dst = cudaCall->getArg(0);
             Expr *src = cudaCall->getArg(1);
@@ -1108,8 +1109,10 @@ emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Note", "Rewriting single dec
             }
             else if (enumString == "cudaMemcpyDeviceToDevice") {
                 //TODO implement __cu2cl_MemcpyDevToDev
-                ReplaceStmtWithText(cudaCall, "clEnqueueReadBuffer(__cu2cl_CommandQueue, src, CL_TRUE, 0, count, temp, 0, NULL, NULL)", HostRewrite);
-                ReplaceStmtWithText(cudaCall, "clEnqueueWriteBuffer(__cu2cl_CommandQueue, dst, CL_TRUE, 0, count, temp, 0, NULL, NULL)", HostRewrite);
+		newExpr = "clEnqueueCopyBuffer(__cu2cl_CommandQueue, " + newSrc + ", " + newDst + ", 0, 0, " + newCount + ", 0, NULL, NULL)";
+		//PAUL 2014.03.03 - Removed this (broken) old method of doing DeviceToDevice copy
+                //ReplaceStmtWithText(cudaCall, "clEnqueueReadBuffer(__cu2cl_CommandQueue, src, CL_TRUE, 0, count, temp, 0, NULL, NULL)", HostRewrite);
+                //ReplaceStmtWithText(cudaCall, "clEnqueueWriteBuffer(__cu2cl_CommandQueue, dst, CL_TRUE, 0, count, temp, 0, NULL, NULL)", HostRewrite);
             }
             else {
                 //TODO Use diagnostics to print pretty errors
@@ -1117,7 +1120,8 @@ emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Note", "Rewriting single dec
             }
         }
         else if (funcName == "cudaMemcpyAsync") {
-            //TODO support offsets
+            //TODO support offsets (will need to grab pointer out of cudamemcpy call)
+	    // then separate off the rest of the math as the offset
             //Inspect kind of memcpy and rewrite accordingly
             Expr *dst = cudaCall->getArg(0);
             Expr *src = cudaCall->getArg(1);
@@ -1166,9 +1170,10 @@ emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Note", "Rewriting single dec
             }
             else if (enumString == "cudaMemcpyDeviceToDevice") {
                 //TODO implement __cu2cl_MemcpyDevToDev
-                //TODO - Paul - no reason to pull this up to host in between
-                ReplaceStmtWithText(cudaCall, "clEnqueueReadBuffer(__cu2cl_CommandQueue, src, CL_TRUE, 0, count, temp, 0, NULL, NULL)", HostRewrite);
-                ReplaceStmtWithText(cudaCall, "clEnqueueWriteBuffer(__cu2cl_CommandQueue, dst, CL_TRUE, 0, count, temp, 0, NULL, NULL)", HostRewrite);
+		newExpr = "clEnqueueCopyBuffer(__cu2cl_CommandQueue, " + newSrc + ", " + newDst + ", 0, 0, " + newCount + ", 0, NULL, NULL)";
+		//PAUL 2014.03.03 - Removed this (broken) old method of doing DeviceToDevice copy
+                //ReplaceStmtWithText(cudaCall, "clEnqueueReadBuffer(__cu2cl_CommandQueue, src, CL_TRUE, 0, count, temp, 0, NULL, NULL)", HostRewrite);
+                //ReplaceStmtWithText(cudaCall, "clEnqueueWriteBuffer(__cu2cl_CommandQueue, dst, CL_TRUE, 0, count, temp, 0, NULL, NULL)", HostRewrite);
             }
             else {
                 //TODO Use diagnostics to print pretty errors
