@@ -8,13 +8,22 @@
 #include "clang/Basic/FileManager.h"
 #include "clang/Basic/SourceManager.h"
 
+//Added during the libTooling conversion
+#include "clang/Driver/Options.h"
+
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Frontend/FrontendPluginRegistry.h"
+//Added during the libTooling conversion
+#include "clang/Frontend/FrontendActions.h"
 
 #include "clang/Lex/Preprocessor.h"
 #include "clang/Lex/PPCallbacks.h"
 
 #include "clang/Rewrite/Core/Rewriter.h"
+
+//Added during the libTooling conversion
+#include "clang/Tooling/CommonOptionsParser.h"
+#include "clang/Tooling/Tooling.h"
 
 #include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
@@ -221,6 +230,7 @@
     "}\n\n" 
 
 using namespace clang;
+using namespace clang::tooling;
 using namespace llvm::sys::path;
 
 namespace {
@@ -260,10 +270,13 @@ private:
 public:
     RewriteIncludesCallback(RewriteCUDA *);
 
+
     virtual void InclusionDirective(SourceLocation, const Token &,
                                     llvm::StringRef, bool,
-                                    const FileEntry *, SourceLocation,
-                                    StringRef, StringRef/*,
+				    CharSourceRange, const FileEntry *,
+                         //           const FileEntry *, SourceLocation,
+                                    StringRef, StringRef,
+				    const Module * /*,
                                     const llvm::SmallVectorImpl<char> &*/);
 
 };
@@ -544,6 +557,10 @@ void TraverseStmt(Stmt *e, unsigned int indent) {
 
         if (CUDAKernelCallExpr *kce = dyn_cast<CUDAKernelCallExpr>(e)) {
             //TODO - Paul Check this hack for templated kernel calls
+	//Paul - 2014.09.02 - Switched to isInstantiationDependent necessary for Clang 3.4
+	  //  if (kce->isInstantiationDependent()) {
+//	emitCU2CLDiagnostic(kce->getLocStart(), "CU2CL DEBUG", "KCE Found!", HostRewrite);
+	 //   if (clang::Expr::hasAnyTypeDependentArguments(kce)) {
             if (kce->isTypeDependent()) {
                 emitCU2CLDiagnostic(kce->getLocStart(), "CU2CL Untranslated", "Template-dependent kernel call", HostRewrite);
                 return false;
@@ -553,14 +570,20 @@ void TraverseStmt(Stmt *e, unsigned int indent) {
                 emitCU2CLDiagnostic(kce->getLocStart(), "CU2CL Unhandled", "Function pointer as kernel call", HostRewrite);
                 return false;
             }
+	//	llvm::errs() << "Template-dependent kernels should never reach here!\n";
             newExpr = RewriteCUDAKernelCall(kce);
             return true;
         }
         else if (CallExpr *ce = dyn_cast<CallExpr>(e)) {
+	//Paul - 2014.09.02 - Switched to isInstantiationDependent necessary for Clang 3.4
+	//    if (ce->isInstantiationDependent()) {
+//	emitCU2CLDiagnostic(ce->getLocStart(), "CU2CL DEBUG", "CE Found!", HostRewrite);
+	//    if (clang::Expr::hasAnyTypeDependentArguments(ce)) {
             if (ce->isTypeDependent()) {
                 emitCU2CLDiagnostic(ce->getLocStart(), "CU2CL Untranslated", "Template-dependent host call", HostRewrite);
                 return false;
             }
+	//	llvm::errs() << "Template-dependent host calls should never reach here!\n";
             //TODO - Paul - this is where gl calls freak out, because getDirectCallee returns NULL
             //TODO fix case where non-API call starts with "cuda"
             if (ce->getDirectCallee() == 0) { //Not a FunctionDecl, this is what happens with gl buffer calls
@@ -2874,7 +2897,6 @@ SourceRange realRange(tl.getBeginLoc(),
         //Try this hack to adjust the FunctionDecl pointer to only point to the definition
         const FunctionDecl * funcDef = func;
         if (func->hasBody()) {func->hasBody(funcDef); func = (FunctionDecl *)funcDef;}
-
         //Find startLoc
         //TODO find first specifier location
         //TODO find storage class specifier
@@ -2885,6 +2907,7 @@ SourceRange realRange(tl.getBeginLoc(),
             if (SM->isBeforeInTranslationUnit(tempLoc, startLoc))
                 startLoc = tempLoc;
         }
+
         if (func->hasAttrs()) {
             Attr *attr = (func->getAttrs())[0];
             //TODO - Paul - 6/25/2012
@@ -2904,9 +2927,11 @@ SourceRange realRange(tl.getBeginLoc(),
                 startLoc = tempLoc;
         }
         //TODO - Paul - 06/12/2012
-        //Validate this fallback for C++ typeless methods (Constructor/destructor)
-        if (startLoc.getRawEncoding() == NULL) {
+        //Validate this fallback for C++ typeless methods (Constructor/destructor)  
+	if (dyn_cast<CXXConstructorDecl>(func) || dyn_cast<CXXDestructorDecl>(func)) {
+   //     if (startLoc.getRawEncoding() == NULL) {
             startLoc = func->getQualifierLoc().getBeginLoc();
+		//Paul - TODO 2014.09.03 - fix constructor/destructor detection in 3.4
             if (startLoc.getRawEncoding() != NULL) emitCU2CLDiagnostic(startLoc, "CU2CL Note", "Removed constructor/deconstructor", rewrite);
         }
 
@@ -3115,7 +3140,13 @@ public:
                 }
             }
             //Handles globally defined C or C++ functions
-            if (FunctionDecl *fd = dyn_cast<FunctionDecl>(*i)) {
+		FunctionDecl *fd = dyn_cast<FunctionDecl>(*i);
+		if (fd == NULL) {
+			FunctionTemplateDecl *ftd = dyn_cast<FunctionTemplateDecl>(*i);
+			if (ftd) fd = ftd->getTemplatedDecl();
+		}
+	    //if (FunctionDecl *fd = dyn_cast<FunctionDecl>(*i)) {
+            if (fd) {
                 if(fd->getTemplatedKind() == clang::FunctionDecl::TK_NonTemplate || fd->getTemplatedKind() == FunctionDecl::TK_FunctionTemplate) {
                     if (fd->hasAttr<CUDAGlobalAttr>() || fd->hasAttr<CUDADeviceAttr>()) {
                     //Device function, so rewrite kernel
@@ -3169,6 +3200,44 @@ public:
                     }
                 }
             }
+	    else if (TypedefDecl *tdd = dyn_cast<TypedefDecl>(*i)) {
+		//Just catch typedefs, do nothing (yet)
+		//Eventually, check if the base type is CUDA-specific
+//		emitCU2CLDiagnostic(tdd->getLocStart(), "CU2CL DEBUG", "Caught typedef", HostRewrite);
+	    }
+	    else if (EnumDecl *ed = dyn_cast<EnumDecl>(*i)) {
+		//Just catch enums, do nothing (yet)
+		//Eventually, check if anything inside is CUDA-specific
+//		emitCU2CLDiagnostic(ed->getLocStart(), "CU2CL DEBUG", "Caught enum", HostRewrite);
+	    }
+	    else if (LinkageSpecDecl *lsd = dyn_cast<LinkageSpecDecl>(*i)) {
+		//Just catch externs, do nothing (yet)
+		//Eventually, replace (not rewrite) any pieces that are CUDA and trust that the source file that *implemented* the call is translated similarly
+//		emitCU2CLDiagnostic(lsd->getLocStart(), "CU2CL DEBUG", "Caught extern", HostRewrite);
+	    }
+	    else if (EmptyDecl *ed = dyn_cast<EmptyDecl>(*i)) {
+		//For some reason, the phrase   extern "C" {
+                // is treated as an "Empty Declaration" in the 3.4 AST
+		// so once we do something with externs, consider treating them as well
+	    }
+	    else if (ClassTemplateDecl *ctd = dyn_cast<ClassTemplateDecl>(*i)) {
+		//These will likely need to be rewritten, at least internally, eventually
+	    }
+	    else if (NamespaceDecl *nsd = dyn_cast<NamespaceDecl>(*i)) {
+		//Catch them, just so the catchall fires, not likely to do anything with it
+	    }
+	    else if (UsingDirectiveDecl *udd = dyn_cast<UsingDirectiveDecl>(*i)) {
+		//Just catch using directives, don't do anythign with them
+		//Eventually, these will need to be pulled from device code, if they're not already
+		//emitCU2CLDiagnostic(udd->getLocStart(), "CU2CL DEBUG", "Caught using", HostRewrite);
+	    }
+	    else if (UsingDecl *ud = dyn_cast<UsingDecl>(*i)) {
+		//Similar to UsingDirectiveDecl, just pull out of kernel code
+	    }
+	    else {
+		//This catches everything else, including enums
+		emitCU2CLDiagnostic((*i)->getLocStart(), "CU2CL DEBUG", "Decl couldn't be determined", HostRewrite);
+	    }
             //TODO rewrite type declarations
         }
 return true;
@@ -3363,6 +3432,7 @@ tail = NULL;
              i != e; i++) {
             FileID fid = (*i).first;
             llvm::raw_ostream *outFile = (*i).second;
+		llvm::errs() << "Attempting to dump kernel: " << SM->getFileEntryForID(fid)->getName() << "\n";
             if (const RewriteBuffer *RewriteBuff =
                 KernelRewrite.getRewriteBufferFor(fid)) {
                 *outFile << std::string(RewriteBuff->begin(), RewriteBuff->end());
@@ -3389,11 +3459,13 @@ tail = NULL;
         llvm::StringRef fileExt = extension(SM->getPresumedLoc(HashLoc).getFilename());
         llvm::StringRef includedFile = filename(FileName);
         llvm::StringRef includedExt = extension(includedFile);
+//	llvm::errs() << "Need to rewrite include: " << fileExt << "\n";
         //llvm::errs() << "Include processing\n";
         if (SM->isInMainFile(HashLoc) ||
             fileExt.equals(".cu") || fileExt.equals(".cuh")) {
             //llvm::errs() << "\tis from main\n";
             if (IsAngled) {
+//		llvm::errs() << "Kernel removed include " << fileExt << "\n";
                 KernelRewrite.RemoveText(HashLoc, KernelRewrite.getRangeSize(SourceRange(HashLoc, EndLoc)));
                 if (includedFile.equals("cuda.h"))
                     HostRewrite.RemoveText(HashLoc, HostRewrite.getRangeSize(SourceRange(HashLoc, EndLoc)));
@@ -3415,6 +3487,8 @@ tail = NULL;
                 //HostRewrite.ReplaceText(start, HostRewrite.getRangeSize(SourceRange(start, end)), "-cl.h");
                 //KernelRewrite.ReplaceText(start, KernelRewrite.getRangeSize(SourceRange(start, end)), "-cl.cl");
                 HostRewrite.ReplaceText(end, 0, "-cl.h");
+//		llvm::errs() << "Kernel rewriting include " << fileExt;
+                
                 KernelRewrite.ReplaceText(end, 0, "-cl.cl");
             }
             else {
@@ -3473,14 +3547,31 @@ RewriteIncludesCallback::RewriteIncludesCallback(RewriteCUDA *RC) :
 
 void RewriteIncludesCallback::InclusionDirective(SourceLocation HashLoc, const Token &IncludeTok,
                                                  llvm::StringRef FileName, bool IsAngled,
-                                                 const FileEntry *File, SourceLocation EndLoc,
-                                                 StringRef SearchPath, StringRef RelativePath/*,
+						 CharSourceRange FileNameRange, const FileEntry *File,
+//                                                 const FileEntry *File, SourceLocation EndLoc,
+                                                 StringRef SearchPath, StringRef RelativePath,
+						 const Module * Imported/*,
                                                  const llvm::SmallVectorImpl<char> &RawPath*/) {
     //llvm::errs() << "Testing InclusionDirective\n";
-    RCUDA->RewriteInclude(HashLoc, IncludeTok, FileName, IsAngled, File, EndLoc);
+	if (Imported != NULL) llvm::errs() << "CU2CL DEBUG -- Import directive detected, translation not supported!";
+    //RCUDA->RewriteInclude(HashLoc, IncludeTok, FileName, IsAngled, File, EndLoc);
+    RCUDA->RewriteInclude(HashLoc, IncludeTok, FileName, IsAngled, File, FileNameRange.getEnd());
 }
 
 }
 
 static FrontendPluginRegistry::Add<RewriteCUDAAction>
 X("rewrite-cuda", "translate CUDA to OpenCL");
+
+int main(int argc, const char ** argv) {
+	//Before we do anything, parse off common arguments, a la MPI
+	CommonOptionsParser options(argc, argv);
+
+	//create a ClangTool instance
+	ClangTool cu2cl(options.getCompilations(), options.getSourcePathList());
+
+	//run the tool (for now, just use the PluginASTAction from original CU2CL
+	int result = cu2cl.run(newFrontendActionFactory<RewriteCUDAAction>());
+	
+}
+
