@@ -36,6 +36,8 @@
 //Added during the libTooling conversion
 #include "clang/Tooling/CommonOptionsParser.h"
 #include "clang/Tooling/Tooling.h"
+//Support the RefactoringTool class
+#include "clang/Tooling/Refactoring.h"
 
 #include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
@@ -342,6 +344,11 @@ private:
     Rewriter HostRewrite;
     Rewriter KernelRewrite;
 
+    //TODO: Once Clang updates to use vectors rather than sets for Replacements
+    // change this to reflect that
+    std::vector<Replacement> HostReplace;
+    std::vector<Replacement> KernReplace;
+
     //Rewritten files
     FileID MainFileID;
     llvm::raw_ostream *MainOutFile;
@@ -458,9 +465,11 @@ void TraverseStmt(Stmt *e, unsigned int indent) {
 	while (curr != NULL) { // as long as we have more comment nodes..
 	    // inject the comment to the host output stream if true
 	    if (curr->w) {
-		HostRewrite.InsertTextBefore(SourceLocation::getFromPtrEncoding(curr->l), llvm::StringRef(curr->s));
+		HostReplace.push_back(Replacement(*SM, SourceLocation::getFromPtrEncoding(curr->l), 0, llvm::StringRef(curr->s)));
+		//HostRewrite.InsertTextBefore(SourceLocation::getFromPtrEncoding(curr->l), llvm::StringRef(curr->s));
 	    } else { // or the kernel output stream if false
-		KernelRewrite.InsertTextBefore(SourceLocation::getFromPtrEncoding(curr->l), llvm::StringRef(curr->s));
+		KernReplace.push_back(Replacement(*SM, SourceLocation::getFromPtrEncoding(curr->l), 0, llvm::StringRef(curr->s)));
+		//KernelRewrite.InsertTextBefore(SourceLocation::getFromPtrEncoding(curr->l), llvm::StringRef(curr->s));
 	    }
 	    //move ahead, then destroy the current node
 	    curr = curr->n;
@@ -468,6 +477,17 @@ void TraverseStmt(Stmt *e, unsigned int indent) {
 	    free(head->n);
 	    head->n = curr;
 	}
+	//TODO: Temp insert deduplicate and write to Rewriters here
+	std::vector<Range> conflicts;
+	//FIXME: Replacement sets are converted to vectors on-the-fly
+	// Clang seems to plan to convert Replacements to use a vector
+	// so this will not be needed anymore
+	deduplicate(HostReplace, conflicts);
+	applyAllReplacements(HostReplace, HostRewrite);
+	
+	deduplicate(KernReplace, conflicts);
+	applyAllReplacements(KernReplace, KernelRewrite);
+
 	tail = head;
     }
     
@@ -3056,6 +3076,8 @@ public:
 
         if (MainFuncName == "")
             MainFuncName = "main";
+	//Ensure that each time a new RewriteCUDA instance is spawned this gets reset
+	MainDecl = NULL;
 
         HostIncludes += "#ifdef __APPLE__\n";
         HostIncludes += "#include <OpenCL/opencl.h>\n";
@@ -3491,6 +3513,7 @@ return true;
 
 class RewriteCUDAAction : public PluginASTAction {
 protected:
+
     //The factory method needeed to initialize the plugin as an ASTconsumer
     ASTConsumer *CreateASTConsumer(CompilerInstance &CI, llvm::StringRef InFile) {
         
@@ -3499,6 +3522,7 @@ protected:
 	filename = filename + "-cl" + filename.substr(dotPos);
         llvm::raw_ostream *hostOS = CI.createDefaultOutputFile(false, filename, "cpp");
         llvm::raw_ostream *kernelOS = CI.createDefaultOutputFile(false, filename, "cl");
+	llvm::errs() << "Firing UP Consumer\n";
         if (hostOS && kernelOS)
             return new RewriteCUDA(&CI, hostOS, kernelOS);
         //TODO cleanup files?
@@ -3583,7 +3607,7 @@ int main(int argc, const char ** argv) {
 	CommonOptionsParser options(argc, argv);
 
 	//create a ClangTool instance
-	ClangTool cu2cl(options.getCompilations(), options.getSourcePathList());
+	RefactoringTool cu2cl(options.getCompilations(), options.getSourcePathList());
 
 	//Inject extra default arguments
 	//These are needed to override parsing of some CUDA headers Clang doesn't like

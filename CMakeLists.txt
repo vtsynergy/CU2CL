@@ -61,9 +61,8 @@ link_directories("${LLVM_BUILD_DIR}/lib")
 link_directories("${CLANG_BUILD_DIR}/lib")
 
 #Paul - added cu2cl_libTooling.cpp
-llvm_process_sources(srcs RewriteCUDA.cpp cu2cl_libTooling.cpp)
+llvm_process_sources(srcs cu2cl_libTooling.cpp)
 
-add_library(RewriteCUDA MODULE ${srcs})
 
 #Paul - added clangTooling as a dependency during the libTooling conversion
 set(LLVM_USED_LIBS
@@ -83,16 +82,6 @@ set(LLVM_USED_LIBS
     LLVMCore
 )
 
-
-foreach(lib ${LLVM_USED_LIBS})
-    target_link_libraries(RewriteCUDA ${lib})
-endforeach(lib)
-
-set_target_properties(RewriteCUDA
-    PROPERTIES
-    LINKER_LANGUAGE CXX
-    PREFIX ""
-)
 
 add_executable(cu2cl-tool
     cu2cl_libTooling.cpp
