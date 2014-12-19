@@ -282,6 +282,7 @@ namespace {
 
 //Simple timer calls that get injected if enabled
 #ifdef CU2CL_ENABLE_TIMING
+	uint64_t TransTime;    
 struct timeval startTime, endTime;
 
 void init_time() {
@@ -303,6 +304,56 @@ struct cmpDG {
         return aLoc.getRawEncoding() < bLoc.getRawEncoding();
     }   
 };
+
+//FIXME: Borrowed verbatim from Clang's Refactoring.cpp
+// Just call theirs once we can (for now it's not recognized as a member of the clang::tooling namespace, though it should be
+static int getRangeSize(SourceManager &Sources, const CharSourceRange &Range) {
+  SourceLocation SpellingBegin = Sources.getSpellingLoc(Range.getBegin());
+  SourceLocation SpellingEnd = Sources.getSpellingLoc(Range.getEnd());
+  std::pair<FileID, unsigned> Start = Sources.getDecomposedLoc(SpellingBegin);
+  std::pair<FileID, unsigned> End = Sources.getDecomposedLoc(SpellingEnd);
+  if (Start.first != End.first) return -1;
+  if (Range.isTokenRange())
+    End.second += Lexer::MeasureTokenLength(SpellingEnd, Sources, LangOptions());
+  return End.second - Start.second;
+}
+
+//This method is designed to walk a vector of Replacements that has already
+// been deduplicated, and fuse Replacments that are enqueued on the same
+// start SourceLocation
+//\pre replace is sorted in order of increasing SourceLocation
+//\pre replace has no duplicate Replacements
+//\post replace has no more than one Replacement per SourceLocation
+void coalesceReplacements(std::vector<Replacement> &replace) {
+	//Must assemble a new vector in-place
+	//Swap the input vector with the work vector so we can add replacements directly back as output
+	std::vector<Replacement> work;
+	work.swap(replace);
+
+	//track the maximum range for a set of Replacements to be fused
+	int max;
+	//track the concatenated text for a set of Replacements to be fused
+	std::stringstream text;
+	std::vector<Replacement>::const_iterator J;
+	
+	//Iterate over every Replacement in the input vector
+	for (std::vector<Replacement>::const_iterator I = work.begin(), E = work.end(); I != E; I++) {
+	    //reset the max range size and string to match I
+	    max = I->getLength();
+	    text.str("");
+	    text << I->getReplacementText().str();
+	    //Look forward at all Replacements at the same location as I
+	    for (J = I+1; J !=E && J->getFilePath() == I->getFilePath() && J->getOffset() == I->getOffset(); J++) {
+	    	//Check if they cover a longer range, and concatenate changes
+		max = (max > J->getLength() ? max : J->getLength());
+		text << J->getReplacementText().str();
+	    }
+	    //Add the coalesced Replacement back to the input vector
+	    replace.push_back(Replacement(I->getFilePath(), I->getOffset(), max, text.str()));
+	    //And finally move the I iterator forward to the last-fused Replacement
+	    I = J-1;
+	}
+}
 
 class RewriteCUDA;
 
@@ -368,6 +419,8 @@ private:
     std::set<VarDecl *> SharedMemVars;
     std::set<ParmVarDecl *> CurRefParmVars;
 
+    std::map<SourceLocation, Replacement> HostVecVars;
+
     TypeLoc LastLoc;
 
     std::string MainFuncName;
@@ -401,7 +454,6 @@ private:
     bool UsesCUDASetDevice;
 
 
-	uint64_t TransTime;    
 
 void TraverseStmt(Stmt *e, unsigned int indent) {
         for (unsigned int i = 0; i < indent; i++)
@@ -477,18 +529,15 @@ void TraverseStmt(Stmt *e, unsigned int indent) {
 	    free(head->n);
 	    head->n = curr;
 	}
-	//TODO: Temp insert deduplicate and write to Rewriters here
-	std::vector<Range> conflicts;
-	//FIXME: Replacement sets are converted to vectors on-the-fly
-	// Clang seems to plan to convert Replacements to use a vector
-	// so this will not be needed anymore
-	deduplicate(HostReplace, conflicts);
-	applyAllReplacements(HostReplace, HostRewrite);
-	
-	deduplicate(KernReplace, conflicts);
-	applyAllReplacements(KernReplace, KernelRewrite);
 
 	tail = head;
+    }
+
+    void debugPrintReplacements(std::vector<Replacement> replace) {
+	for (std::vector<Replacement>::const_iterator I = replace.begin(), E = replace.end(); I != E; I++) {
+	    llvm::errs() << I->toString() << "\n";
+	}
+
     }
     
     // Workhorse for CU2CL diagnostics, provides independent specification of multiple err_notes
@@ -497,7 +546,7 @@ void TraverseStmt(Stmt *e, unsigned int indent) {
     //  but at the moment, the set of errors isn't mature enough to make it worth it.
     // It's just cheaper to directly throw it more readily-adjustable strings until we set the 
     //  error messages in stone.
-    void emitCU2CLDiagnostic(SourceLocation loc, std::string severity_str, std::string err_note, std::string inline_note, Rewriter &writer) {
+    void emitCU2CLDiagnostic(SourceLocation loc, std::string severity_str, std::string err_note, std::string inline_note, std::vector<Replacement> &replace) {
         //Sanitize all incoming locations to make sure they're not MacroIDs
         SourceLocation expLoc = SM->getExpansionLoc(loc);
         SourceLocation writeLoc;
@@ -505,13 +554,14 @@ void TraverseStmt(Stmt *e, unsigned int indent) {
         //assemble both the stderr and inlined source output strings
         std::stringstream inlineStr;
         std::stringstream errStr;
+	inlineStr << "/*";
         if (expLoc.isValid()){
 	    //Tack the source line information onto the diagnostic
+            //inlineStr << SM->getBufferName(expLoc) << ":" << SM->getExpansionLineNumber(expLoc) << ":" << SM->getExpansionColumnNumber(expLoc) << ": ";
             errStr << SM->getBufferName(expLoc) << ":" << SM->getExpansionLineNumber(expLoc) << ":" << SM->getExpansionColumnNumber(expLoc) << ": ";
             //grab the start of column write location
             writeLoc = SM->translateLineCol(SM->getFileID(expLoc), SM->getExpansionLineNumber(expLoc), 1);
         }
-	inlineStr << "/*";
 	//Inject the severity string to both outputs
         if (!severity_str.empty()) {
             errStr << severity_str << ": ";
@@ -527,7 +577,7 @@ void TraverseStmt(Stmt *e, unsigned int indent) {
 			//Disable this section to turn off error emission, by default if an
 			// inline error string is empty, it will turn off comment insertion for that error
 			if (!inline_note.empty() && AddInlineComments) {
-				if (&writer == &HostRewrite) {
+				if (&replace == &HostReplace) {
 				bufferComment(writeLoc, inlineStr.str(), true);
 				} else {
 				bufferComment(writeLoc, inlineStr.str(), false);
@@ -542,8 +592,8 @@ void TraverseStmt(Stmt *e, unsigned int indent) {
     // Convenience method for dumping the same CU2CL error to both stderr and inlined comments
     //  using the mechanism above
     // Assumes the err_note is replicated as the inline comment to add to source.
-    void emitCU2CLDiagnostic(SourceLocation loc, std::string severity_str, std::string err_note, Rewriter &writer) {
-        emitCU2CLDiagnostic(loc, severity_str, err_note, err_note, writer);
+    void emitCU2CLDiagnostic(SourceLocation loc, std::string severity_str, std::string err_note, std::vector<Replacement> &replace) {
+        emitCU2CLDiagnostic(loc, severity_str, err_note, err_note, replace);
     }
 
     //Convenience method for getting a string of raw text between two SourceLocations
@@ -557,10 +607,10 @@ void TraverseStmt(Stmt *e, unsigned int indent) {
     void RewriteHostFunction(FunctionDecl *hostFunc) {
         //Remove any CUDA function attributes
         if (CUDAHostAttr *attr = hostFunc->getAttr<CUDAHostAttr>()) {
-            RewriteAttr(attr, "", HostRewrite);
+            RewriteAttr(attr, "", HostReplace);
         }
         if (CUDADeviceAttr *attr = hostFunc->getAttr<CUDADeviceAttr>()) {
-            RewriteAttr(attr, "", HostRewrite);
+            RewriteAttr(attr, "", HostReplace);
         }
 
         //Rewrite the body
@@ -576,7 +626,7 @@ void TraverseStmt(Stmt *e, unsigned int indent) {
         if (Expr *e = dyn_cast<Expr>(s)) {
             std::string str;
             if (RewriteHostExpr(e, str)) {
-                ReplaceStmtWithText(e, str, HostRewrite);
+                ReplaceStmtWithText(e, str, HostReplace);
             }
         }
         else if (DeclStmt *ds = dyn_cast<DeclStmt>(s)) {
@@ -623,12 +673,12 @@ void TraverseStmt(Stmt *e, unsigned int indent) {
         if (CUDAKernelCallExpr *kce = dyn_cast<CUDAKernelCallExpr>(e)) {
             //Short-circuit templated kernel launches
             if (kce->isTypeDependent()) {
-                emitCU2CLDiagnostic(kce->getLocStart(), "CU2CL Untranslated", "Template-dependent kernel call", HostRewrite);
+                emitCU2CLDiagnostic(kce->getLocStart(), "CU2CL Untranslated", "Template-dependent kernel call", HostReplace);
                 return false;
             }
 	    //Short-circuit launching a function pointer until we can handle it
 	    else if (kce->getDirectCallee() == 0 && dyn_cast<ImplicitCastExpr>(kce->getCallee())) {
-                emitCU2CLDiagnostic(kce->getLocStart(), "CU2CL Unhandled", "Function pointer as kernel call", HostRewrite);
+                emitCU2CLDiagnostic(kce->getLocStart(), "CU2CL Unhandled", "Function pointer as kernel call", HostReplace);
                 return false;
             }
 	    //If it's not a templated or pointer launch, proceed with translation
@@ -637,13 +687,13 @@ void TraverseStmt(Stmt *e, unsigned int indent) {
         }
         else if (CallExpr *ce = dyn_cast<CallExpr>(e)) {
             if (ce->isTypeDependent()) {
-                emitCU2CLDiagnostic(ce->getLocStart(), "CU2CL Untranslated", "Template-dependent host call", HostRewrite);
+                emitCU2CLDiagnostic(ce->getLocStart(), "CU2CL Untranslated", "Template-dependent host call", HostReplace);
                 return false;
             }
             //This catches some errors encountered with heavily-nested, PP-assembled function-like macros
 	    // mostly observed within the OpenGL and GLUT headers
             if (ce->getDirectCallee() == 0) {
-                emitCU2CLDiagnostic(SM->getExpansionLoc(ce->getLocStart()), "CU2CL Unhandled", "Could not identify direct callee in expression", HostRewrite);
+                emitCU2CLDiagnostic(SM->getExpansionLoc(ce->getLocStart()), "CU2CL Unhandled", "Could not identify direct callee in expression", HostReplace);
             }
 	    //This catches all Runtime API calls, since they are all prefixed by "cuda"
 	    // and all Driver API calls that are prefixed with just "cu"
@@ -719,6 +769,7 @@ void TraverseStmt(Stmt *e, unsigned int indent) {
                 ret = true;
             }
             newExpr = exprRewriter.getRewrittenText(realRange);
+//		emitCU2CLDiagnostic(e->getLocStart(), "CU2CL DIAG1", newExpr, HostReplace);
             return ret;
         }
 	//Rewrite unary expressions or type trait expressions (things like sizeof)
@@ -750,10 +801,11 @@ void TraverseStmt(Stmt *e, unsigned int indent) {
                     SourceRange newrealRange(SM->getExpansionLoc(e->getLocStart()),
                               SM->getExpansionLoc(e->getLocEnd()));
                 newExpr = exprRewriter.getRewrittenText(newrealRange);
+//		emitCU2CLDiagnostic(e->getLocStart(), "CU2CL DIAG2", newExpr, HostReplace);
                 return ret;
             }
         }
-	//Catches dim3 declarations of the form: some_var=dim3(x,y,z);
+	//Catches dim3 declarations of the form: some_var=dim3(x,p,z);
 	// the RHS is considered a temporary object
         else if (CXXTemporaryObjectExpr *cte = dyn_cast<CXXTemporaryObjectExpr>(e)) {
            // emitCU2CLDiagnostic(cte->getLocStart(), "CU2CL Note", "Identified as CXXTemporaryObjectExpr", HostRewrite);
@@ -887,7 +939,7 @@ void TraverseStmt(Stmt *e, unsigned int indent) {
 
             //Rewrite var type to cl_device_id
             TypeLoc tl = var->getTypeSourceInfo()->getTypeLoc();
-            RewriteType(tl, "cl_device_id", HostRewrite);
+            RewriteType(tl, "cl_device_id", HostReplace);
             newExpr = "*" + newDevice + " = __cu2cl_Device";
         }
         else if (funcName == "cudaGetDeviceCount") {
@@ -916,7 +968,7 @@ void TraverseStmt(Stmt *e, unsigned int indent) {
             //TODO also rewrite type as in cudaGetDevice
             //VarDecl *var = dyn_cast<VarDecl>(dre->getDecl());
             newExpr = "__cu2cl_SetDevice(" + newDevice + ")";
-            emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Warning", "CU2CL Identified cudaSetDevice usage", HostRewrite);
+            emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Warning", "CU2CL Identified cudaSetDevice usage", HostReplace);
             //}
         }
         else if (funcName == "cudaSetDeviceFlags") {
@@ -1109,7 +1161,7 @@ void TraverseStmt(Stmt *e, unsigned int indent) {
 DeclaratorDecl *var;
 	    //If the device pointer is a struct or class member, it shows up as a MemberExpr rather than a DeclRefExpr
 	    if (mr != NULL) {
-		emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Note", "Identified member expression in cudaMalloc device pointer", HostRewrite);
+		emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Note", "Identified member expression in cudaMalloc device pointer", HostReplace);
 		var = dyn_cast<DeclaratorDecl>(mr->getMemberDecl());
 	    }
 	    //If it's just a global or locally-scoped singleton, then it shows up as a DeclRefExpr
@@ -1128,10 +1180,10 @@ DeclaratorDecl *var;
                 DeviceMemDGs.insert(*GlobalVarDeclGroups.find(varDG));
             }
             else {
-emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Note", "Rewriting single decl", HostRewrite);
+emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Note", "Rewriting single decl", HostReplace);
                 //Change variable's type to cl_mem
                 TypeLoc tl = var->getTypeSourceInfo()->getTypeLoc();
-                RewriteType(tl, "cl_mem ", HostRewrite);
+                RewriteType(tl, "cl_mem ", HostReplace);
             }
 
             //Add var to DeviceMemVars
@@ -1204,7 +1256,7 @@ emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Note", "Rewriting single dec
 		newExpr = "clEnqueueCopyBuffer(__cu2cl_CommandQueue, " + newSrc + ", " + newDst + ", 0, 0, " + newCount + ", 0, NULL, NULL)";
             }
             else {
-                emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Unsupported", "Unsupported cudaMemcpyKind: " + enumString, HostRewrite);
+                emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Unsupported", "Unsupported cudaMemcpyKind: " + enumString, HostReplace);
             }
         }
         //TODO: support cudaMemcpyDefault
@@ -1259,7 +1311,7 @@ emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Note", "Rewriting single dec
 		newExpr = "clEnqueueCopyBuffer(__cu2cl_CommandQueue, " + newSrc + ", " + newDst + ", 0, 0, " + newCount + ", 0, NULL, NULL)";
             }
             else {
-                emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Unsupported", "Unsupported cudaMemcpyKind: " + enumString, HostRewrite);
+                emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Unsupported", "Unsupported cudaMemcpyKind: " + enumString, HostReplace);
             }
         }
         //else if (funcName == "cudaMemcpyToSymbol") {
@@ -1286,7 +1338,7 @@ emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Note", "Rewriting single dec
             newExpr = "__cu2cl_Memset(" + newDevPtr + ", " + newValue + ", " + newCount + ")";
         }
         else {
-            emitCU2CLDiagnostic(SM->getExpansionLoc(cudaCall->getLocStart()), "CU2CL Unsupported", "Unsupported CUDA call: " + funcName, HostRewrite);
+            emitCU2CLDiagnostic(SM->getExpansionLoc(cudaCall->getLocStart()), "CU2CL Unsupported", "Unsupported CUDA call: " + funcName, HostReplace);
             return false;
 	    //TODO: Even if the call is unsupported, we should attempt to translate params, need to fire up the standard rewrite machinery for that and return whether or not any children were changed
         }
@@ -1320,7 +1372,7 @@ emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Note", "Rewriting single dec
 
 		std::stringstream comment;
 		comment << "Inserted temporary variable for kernel literal argument " << i << "!";
-		emitCU2CLDiagnostic(kernelCall->getLocStart(), "CU2CL Note", comment.str(), HostRewrite);
+		emitCU2CLDiagnostic(kernelCall->getLocStart(), "CU2CL Note", comment.str(), HostReplace);
 	    }
 	    //If the arg is just a declared variable, simply pass its address
 	    else {
@@ -1361,7 +1413,7 @@ emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Note", "Rewriting single dec
 
 	DeclRefExpr *dre;
 	if (cast == NULL) {
-	    emitCU2CLDiagnostic(construct->getLocStart(), "CU2CL Note", "Fast-tracked dim3 type without cast", HostRewrite);
+	    emitCU2CLDiagnostic(construct->getLocStart(), "CU2CL Note", "Fast-tracked dim3 type without cast", HostReplace);
 	    dre = dyn_cast<DeclRefExpr>(construct->getArg(0));
 	} else {
 	    dre = dyn_cast<DeclRefExpr>(cast->getSubExprAsWritten());
@@ -1403,7 +1455,7 @@ emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Note", "Rewriting single dec
 	}
 
 	if (cast == NULL) {
-	    emitCU2CLDiagnostic(construct->getLocStart(), "CU2CL Note", "Fast-tracked dim3 type without cast", HostRewrite);
+	    emitCU2CLDiagnostic(construct->getLocStart(), "CU2CL Note", "Fast-tracked dim3 type without cast", HostReplace);
 	    dre = dyn_cast<DeclRefExpr>(construct->getArg(0));
 	} else {
 	    dre = dyn_cast<DeclRefExpr>(cast->getSubExprAsWritten());
@@ -1437,24 +1489,24 @@ emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Note", "Rewriting single dec
     void RewriteHostVarDecl(VarDecl *var) {
         if (CUDAConstantAttr *constAttr = var->getAttr<CUDAConstantAttr>()) {
             //TODO: Do something with __constant__ memory declarations
-            RewriteAttr(constAttr, "", HostRewrite);
+            RewriteAttr(constAttr, "", HostReplace);
             if (CUDADeviceAttr *devAttr = var->getAttr<CUDADeviceAttr>())
-                RewriteAttr(devAttr, "", HostRewrite);
+                RewriteAttr(devAttr, "", HostReplace);
             //DeviceMemVars.insert(var);
             ConstMemVars.insert(var);
 
             TypeLoc origTL = var->getTypeSourceInfo()->getTypeLoc();
             if (LastLoc.isNull() || origTL.getBeginLoc() != LastLoc.getBeginLoc()) {
                 LastLoc = origTL;
-                RewriteType(origTL, "cl_mem", HostRewrite);
+                RewriteType(origTL, "cl_mem", HostReplace);
             }
             return;
         }
         else if (CUDASharedAttr *sharedAttr = var->getAttr<CUDASharedAttr>()) {
             //Handle __shared__ memory declarations
-            RewriteAttr(sharedAttr, "", HostRewrite);
+            RewriteAttr(sharedAttr, "", HostReplace);
             if (CUDADeviceAttr *devAttr = var->getAttr<CUDADeviceAttr>())
-                RewriteAttr(devAttr, "", HostRewrite);
+                RewriteAttr(devAttr, "", HostReplace);
             //TODO rewrite shared mem
             //If extern, remove extern keyword and make into pointer
             //if (var->isExtern())
@@ -1462,7 +1514,7 @@ emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Note", "Rewriting single dec
         }
         else if (CUDADeviceAttr *attr = var->getAttr<CUDADeviceAttr>()) {
             //Handle __device__ memory declarations
-            RewriteAttr(attr, "", HostRewrite);
+            RewriteAttr(attr, "", HostReplace);
             //TODO add to devmems, rewrite type
         }
 
@@ -1480,7 +1532,7 @@ emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Note", "Rewriting single dec
             LastLoc = origTL;
             if (type == "dim3") {
                 //Rewrite to size_t[3] array
-                RewriteType(tl, "size_t", HostRewrite);
+                RewriteType(tl, "size_t", HostReplace);
             }
             else if (type == "struct cudaDeviceProp") {
                 if (!UsesCUDADeviceProp) {
@@ -1488,18 +1540,25 @@ emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Note", "Rewriting single dec
                     HostFunctions += CL_GET_DEVICE_PROPS;
                     UsesCUDADeviceProp = true;
                 }
-                RewriteType(tl, "__cu2cl_DeviceProp", HostRewrite);
+                RewriteType(tl, "__cu2cl_DeviceProp", HostReplace);
             }
             else if (type == "cudaStream_t") {
-                RewriteType(tl, "cl_command_queue", HostRewrite);
+                RewriteType(tl, "cl_command_queue", HostReplace);
             }
             else if (type == "cudaEvent_t") {
-                RewriteType(tl, "cl_event", HostRewrite);
+                RewriteType(tl, "cl_event", HostReplace);
             }
             else {
                 std::string newType = RewriteVectorType(type, true);
-                if (newType != "")
-                    RewriteType(tl, newType, HostRewrite);
+                if (newType != "") {
+		    //Stage the replacement in a map to avoid conflicts with later cl_mem conversions of cudaMalloced host variables
+		    Replacement vecType(*SM, tl.getBeginLoc(), getRangeSize(*SM, CharSourceRange::getTokenRange(tl.getLocalSourceRange())), newType);
+		    //Try to insert into the map, but just dump a diagnostic warning if we fail
+		    // Don't need to try too hard, since if a Replacement is already mapped at this location it must also be another vector rewrite
+		    if (!HostVecVars.insert(std::pair<SourceLocation, Replacement>(tl.getBeginLoc(), vecType)).second)
+			emitCU2CLDiagnostic(tl.getBeginLoc(), "CU2CL Warning", "Failed to insert host vector type Replacement to cl_mem conflict map!\n" + vecType.toString(), HostReplace);
+                    //RewriteType(tl, newType, HostReplace);
+		}
             }
             //TODO check other CUDA-only types to rewrite
         }
@@ -1508,6 +1567,10 @@ emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Note", "Rewriting single dec
         if (var->hasInit()) {
             Expr *e = var->getInit();
             std::string s;
+	    //Given the loss of InsertBefore/After semantics with the switch of
+	    // Rewriters to Replacements, the deferred insertion of a default dim3
+	    // initialization is now required, the below boolean handles that
+	    bool deferInsert = false;
             if (RewriteHostExpr(e, s)) {
                 //Special cases for dim3s
                 if (type == "dim3") {
@@ -1515,33 +1578,37 @@ emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Note", "Rewriting single dec
                     if (cce && cce->getNumArgs() > 1) {
                         SourceRange parenRange = cce->getParenOrBraceRange();
                         if (parenRange.isValid()) {
-                            HostRewrite.ReplaceText(
-                                    parenRange.getBegin(),
-                                    HostRewrite.getRangeSize(parenRange),
-                                    s);
+                            HostReplace.push_back(Replacement(*SM, parenRange.getBegin(), getRangeSize(*SM, CharSourceRange::getTokenRange(parenRange)), s));
+			    //WAS RewriteText
                         }
                         else {
-                            HostRewrite.InsertTextAfter(
-                                    PP->getLocForEndOfToken(var->getLocation()),
-                                    s);
+			    if (origTL.getTypePtr()->isPointerType())
+				HostReplace.push_back(Replacement(*SM, PP->getLocForEndOfToken(var->getLocation()), 0, s));
+			    else
+				deferInsert = true;
+			    //WAS InsertTextAfter
                         }
                     }
                     else {
-                        ReplaceStmtWithText(e, s, HostRewrite);
+                        ReplaceStmtWithText(e, s, HostReplace);
                     }
 
                     //Add [3] to end/start of var identifier
                     if (origTL.getTypePtr()->isPointerType())
-                        HostRewrite.InsertTextBefore(
-                                var->getLocation(),
-                                "*");
-                    else
-                        HostRewrite.InsertTextBefore(
-                                PP->getLocForEndOfToken(var->getLocation()),
-                                "[3]");
+			HostReplace.push_back(Replacement(*SM, var->getLocation(), 0, "*"));
+			//WAS InsertTextBefore
+                    else {
+			if (!deferInsert)
+			    HostReplace.push_back(Replacement(*SM, PP->getLocForEndOfToken(var->getLocation()), 0, "[3]"));
+			    //WAS InsertTextBefore
+		    }
+
+		    if (deferInsert) {
+			HostReplace.push_back(Replacement(*SM, PP->getLocForEndOfToken(var->getLocation()), 0, "[3]" + s));
+		    }
                 }
                 else
-                    ReplaceStmtWithText(e, s, HostRewrite);
+                    ReplaceStmtWithText(e, s, HostReplace);
             }
         }
     }
@@ -1568,16 +1635,16 @@ emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Note", "Rewriting single dec
         //Rewrite kernel attributes
 	//__global__ must be mapped to __kernel
         if (CUDAGlobalAttr *attr = kernelFunc->getAttr<CUDAGlobalAttr>()) {
-            RewriteAttr(attr, "__kernel", KernelRewrite);
+            RewriteAttr(attr, "__kernel", KernReplace);
         }
 	//__device__ functions don't have any attributes in OpenCL
         if (CUDADeviceAttr *attr = kernelFunc->getAttr<CUDADeviceAttr>()) {
-            RewriteAttr(attr, "", KernelRewrite);
+            RewriteAttr(attr, "", KernReplace);
         }
 	//OpenCL kernel code has no such thing as a __host__ function
 	// these are already preserved in the host code elsewhere
         if (CUDAHostAttr *attr = kernelFunc->getAttr<CUDAHostAttr>()) {
-            RewriteAttr(attr, "", KernelRewrite);
+            RewriteAttr(attr, "", KernReplace);
         }
 
         //Rewrite formal parameters
@@ -1599,7 +1666,7 @@ emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Note", "Rewriting single dec
     // appropriate address space attribute
     void RewriteKernelParam(ParmVarDecl *parmDecl, bool isFuncGlobal) {
 
-        if (parmDecl->getOriginalType()->isTemplateTypeParmType()) emitCU2CLDiagnostic(parmDecl->getLocStart(), "CU2CL Unhandled", "Detected templated parameter", KernelRewrite);
+        if (parmDecl->getOriginalType()->isTemplateTypeParmType()) emitCU2CLDiagnostic(parmDecl->getLocStart(), "CU2CL Unhandled", "Detected templated parameter", KernReplace);
         TypeLoc tl = parmDecl->getTypeSourceInfo()->getTypeLoc();
 
 	//A rewrite offset is declared to do bookkeeping for the amount of
@@ -1607,16 +1674,20 @@ emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Note", "Rewriting single dec
 	// parameters would be overwritten
 	int rewriteOffset = 0;
         if (isFuncGlobal && tl.getTypePtr()->isPointerType()) {
-            KernelRewrite.InsertTextBefore(
-                    tl.getBeginLoc(),
-                    "__global ");
+	    KernReplace.push_back(Replacement(*SM, tl.getBeginLoc(), 0, "__global "));
+//		emitCU2CLDiagnostic(tl.getBeginLoc(), "CU2CL DIAG1", "\"__global \" inserted", KernReplace);
+            //KernReplace.InsertTextBefore(
+            //        tl.getBeginLoc(),
+            //        "__global ");
 		rewriteOffset -= 9; //ignore the 9 chars of "__global "
+		rewriteOffset +=9; //FIXME: Revert this to diagnose range issues
         }
         else if (ReferenceTypeLoc rtl = tl.getAs<ReferenceTypeLoc>()) {
-            KernelRewrite.ReplaceText(
-                    rtl.getSigilLoc(),
-                    KernelRewrite.getRangeSize(rtl.getLocalSourceRange()),
-                    "*");
+	    KernReplace.push_back(Replacement(*SM, rtl.getSigilLoc(), getRangeSize(*SM, CharSourceRange::getTokenRange(rtl.getLocalSourceRange())), "*"));
+	    //KernReplace.ReplaceText(
+            //        rtl.getSigilLoc(),
+            //        KernReplace.getRangeSize(rtl.getLocalSourceRange()),
+            //        "*");
             CurRefParmVars.insert(parmDecl);
         }
 
@@ -1630,7 +1701,7 @@ emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Note", "Rewriting single dec
 	//if it's a vector type, it must be checked for a rewrite
         std::string newType = RewriteVectorType(type, false);
         if (newType != "") {
-            RewriteType(tl, newType, KernelRewrite, rewriteOffset);
+            RewriteType(tl, newType, KernReplace, rewriteOffset);
 	}
     }
 
@@ -1642,7 +1713,7 @@ emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Note", "Rewriting single dec
         if (Expr *e = dyn_cast<Expr>(ks)) {
             std::string str;
             if (RewriteKernelExpr(e, str)) {
-                ReplaceStmtWithText(e, str, KernelRewrite);
+                ReplaceStmtWithText(e, str, KernReplace);
             }
         }
         else if (DeclStmt *ds = dyn_cast<DeclStmt>(ks)) {
@@ -1754,12 +1825,12 @@ emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Note", "Rewriting single dec
 	    //If the expression involves a template, don't bother translating
 	    //TODO: Support auto-generation of template specializations
 	    if (ce->isTypeDependent()) {
-                emitCU2CLDiagnostic(e->getLocStart(), "CU2CL Unhandled", "Template-dependent kernel expression", KernelRewrite);
+                emitCU2CLDiagnostic(e->getLocStart(), "CU2CL Unhandled", "Template-dependent kernel expression", KernReplace);
                 return false;
             }
 	    //This catches potential segfaults related to function pointe usage
             if (ce->getDirectCallee() == 0) {
-                emitCU2CLDiagnostic(e->getLocStart(), "CU2CL Warning", "Unable to identify expression direct callee", KernelRewrite);
+                emitCU2CLDiagnostic(e->getLocStart(), "CU2CL Warning", "Unable to identify expression direct callee", KernReplace);
                 return false;
             }                
 
@@ -2763,9 +2834,9 @@ emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Note", "Rewriting single dec
     void RewriteKernelVarDecl(VarDecl *var) {
         //TODO handle extern __shared__ memory pointers
         if (CUDASharedAttr *sharedAttr = var->getAttr<CUDASharedAttr>()) {
-            RewriteAttr(sharedAttr, "__local", KernelRewrite);
+            RewriteAttr(sharedAttr, "__local", KernReplace);
             if (CUDADeviceAttr *devAttr = var->getAttr<CUDADeviceAttr>())
-                RewriteAttr(devAttr, "", KernelRewrite);
+                RewriteAttr(devAttr, "", KernReplace);
             //TODO rewrite extern shared mem
             //if (var->isExtern()) {
 		//handle the addition of a __local address space kernel param
@@ -2786,12 +2857,12 @@ emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Note", "Rewriting single dec
             LastLoc = origTL;
             if (type == "dim3") {
                 //Rewrite to size_t[3] array
-                RewriteType(tl, "size_t", KernelRewrite);
+                RewriteType(tl, "size_t", KernReplace);
             }
             else {
                 std::string newType = RewriteVectorType(type, false);
                 if (newType != "")
-                    RewriteType(tl, newType, KernelRewrite);
+                    RewriteType(tl, newType, KernReplace);
             }
             //TODO check other CUDA-only types to rewrite
         }
@@ -2808,32 +2879,36 @@ emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Note", "Rewriting single dec
                     if (cce && cce->getNumArgs() > 1) {
                         SourceRange parenRange = cce->getParenOrBraceRange();
                         if (parenRange.isValid()) {
-                            KernelRewrite.ReplaceText(
-                                    parenRange.getBegin(),
-                                    KernelRewrite.getRangeSize(parenRange),
-                                    s);
+			    KernReplace.push_back(Replacement(*SM, parenRange.getBegin(), getRangeSize(*SM, CharSourceRange::getTokenRange(parenRange)), s));
+                            //KernReplace.ReplaceText(
+                            //        parenRange.getBegin(),
+                            //        KernReplace.getRangeSize(parenRange),
+                            //        s);
                         }
                         else {
-                            KernelRewrite.InsertTextAfter(
-                                    PP->getLocForEndOfToken(var->getLocation()),
-                                    s);
+			    KernReplace.push_back(Replacement(*SM, PP->getLocForEndOfToken(var->getLocation()), 0, s));
+                            //KernReplace.InsertTextAfter(
+                            //        PP->getLocForEndOfToken(var->getLocation()),
+                            //        s);
                         }
                     }
                     else
-                        ReplaceStmtWithText(e, s, KernelRewrite);
+                        ReplaceStmtWithText(e, s, KernReplace);
 
                     //Add [3]/* to end/start of var identifier
                     if (origTL.getTypePtr()->isPointerType())
-                        KernelRewrite.InsertTextBefore(
-                                var->getLocation(),
-                                "*");
+                        KernReplace.push_back(Replacement(*SM, var->getLocation(), 0, "*"));
+			//KernReplace.InsertTextBefore(
+                        //        var->getLocation(),
+                        //        "*");
                     else
-                        KernelRewrite.InsertTextBefore(
-                                PP->getLocForEndOfToken(var->getLocation()),
-                                "[3]");
+                        KernReplace.push_back(Replacement(*SM, PP->getLocForEndOfToken(var->getLocation()), 0, "[3]"));
+			//KernReplace.InsertTextBefore(
+                        //        PP->getLocForEndOfToken(var->getLocation()),
+                        //        "[3]");
                 }
                 else
-                    ReplaceStmtWithText(e, s, KernelRewrite);
+                    ReplaceStmtWithText(e, s, KernReplace);
             }
         }
     }
@@ -2885,32 +2960,42 @@ emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Note", "Rewriting single dec
         if (regex->match(type)) {
             ret = prepend + "float" + append;
         }
-        delete regex;
+        delete regex;	
         return ret;
     }
 
     //The workhorse that takes the constructed replacement type and inserts it in place of the old one
     //RewriteType requires a rangeOffset parameter to account for a case in which
     // a rewrite to the type has already occured before we get here (i.e. adding "__global " requires an offset of -9)
+    void RewriteType(TypeLoc tl, std::string replace, std::vector<Replacement> &replacements, int rangeOffset = 0) {
+	SourceRange realRange(tl.getBeginLoc(), PP->getLocForEndOfToken(tl.getBeginLoc()));
+//		emitCU2CLDiagnostic(tl.getBeginLoc(), "CU2CL DIAG0", replace + ((getRangeSize(*SM, CharSourceRange::getTokenRange(tl.getLocalSourceRange()))+rangeOffset < 0) ? " INVALID" : " VALID"), replacements);
+	replacements.push_back(Replacement(*SM, tl.getBeginLoc(), getRangeSize(*SM, CharSourceRange::getTokenRange(tl.getLocalSourceRange()))+rangeOffset, replace));
+        //replacements.ReplaceText(tl.getBeginLoc(), rewrite.getRangeSize(tl.getLocalSourceRange()) + rangeOffset, replace);
+    }
+
+    //Rewrite Type also needs a form that still takes a Rewriter
+    // so that local Expr Rewriters can be used
     void RewriteType(TypeLoc tl, std::string replace, Rewriter &rewrite, int rangeOffset = 0) {
 
 	SourceRange realRange(tl.getBeginLoc(), PP->getLocForEndOfToken(tl.getBeginLoc()));
 
-        rewrite.ReplaceText(tl.getBeginLoc(), rewrite.getRangeSize(tl.getLocalSourceRange()) + rangeOffset, replace);
+	bool status = rewrite.ReplaceText(tl.getBeginLoc(), rewrite.getRangeSize(tl.getLocalSourceRange()) + rangeOffset, replace);
     }
 
     //The workhorse that takes the constructed replacement attribute and inserts it in place of the old one
-    void RewriteAttr(Attr *attr, std::string replace, Rewriter &rewrite) {
+    void RewriteAttr(Attr *attr, std::string replace, std::vector<Replacement> &replacements) {
         SourceLocation instLoc = SM->getExpansionLoc(attr->getLocation());
         SourceRange realRange(instLoc,
                               PP->getLocForEndOfToken(instLoc));
-        rewrite.ReplaceText(instLoc, rewrite.getRangeSize(realRange), replace);
+        replacements.push_back(Replacement(*SM, instLoc, getRangeSize(*SM, CharSourceRange::getTokenRange(realRange)), replace));
+	//replacements.ReplaceText(instLoc, rewrite.getRangeSize(realRange), replace);
 	
     }
 
     //Completely remove a function from one of the output streams
     //Used to split host and kernel code
-    void RemoveFunction(FunctionDecl *func, Rewriter &rewrite) {
+    void RemoveFunction(FunctionDecl *func, std::vector<Replacement> &replace) {
         SourceLocation startLoc, endLoc, tempLoc;
 
         FunctionDecl::TemplatedKind tk = func->getTemplatedKind();
@@ -2955,19 +3040,19 @@ emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Note", "Rewriting single dec
 	// and may not have attributes. This if block catches them
 	if (dyn_cast<CXXConstructorDecl>(func) || dyn_cast<CXXDestructorDecl>(func)) {
             startLoc = func->getQualifierLoc().getBeginLoc();
-            if (startLoc.getRawEncoding() != NULL) emitCU2CLDiagnostic(startLoc, "CU2CL Note", "Removed constructor/deconstructor", rewrite);
+            if (startLoc.getRawEncoding() != 0) emitCU2CLDiagnostic(startLoc, "CU2CL Note", "Removed constructor/deconstructor", replace);
         }
 
 	//If we still haven't found an appropriate startLoc, something's atypical
 	//Grab whatever Clang thinks is the startLoc, and remove from there
-        if (startLoc.getRawEncoding() == NULL) {
+        if (startLoc.getRawEncoding() == 0) {
             startLoc = func->getLocStart();
 	    //If even Clang doesn't have any idea where to start, give up
-            if (startLoc.getRawEncoding() == NULL) {
-                emitCU2CLDiagnostic(startLoc, "CU2CL Error", "Unable to determine valid start location for function \"" + func->getNameAsString() + "\"", rewrite);
+            if (startLoc.getRawEncoding() == 0) {
+                emitCU2CLDiagnostic(startLoc, "CU2CL Error", "Unable to determine valid start location for function \"" + func->getNameAsString() + "\"", replace);
                 return;
             }
-            emitCU2CLDiagnostic(startLoc, "CU2CL Warning", "Inferred function start location, removal may be incomplete", rewrite);
+            emitCU2CLDiagnostic(startLoc, "CU2CL Warning", "Inferred function start location, removal may be incomplete", replace);
         }
 
         //Calculate the SourceLocation of the closing brace if it's a definition
@@ -2980,13 +3065,14 @@ emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Note", "Rewriting single dec
             //Find location of semi-colon
             endLoc = func->getSourceRange().getEnd();
         }
-        rewrite.RemoveText(startLoc,
-                           rewrite.getRangeSize(SourceRange(startLoc, endLoc)));
+	replace.push_back(Replacement(*SM, startLoc, getRangeSize(*SM, CharSourceRange::getTokenRange(SourceRange(startLoc,endLoc))), ""));
+        //replace.RemoveText(startLoc,
+        //                   replace.getRangeSize(SourceRange(startLoc, endLoc)));
     }
 
     //Get rid of a variable declaration
     // useful for pulling global host variables out of kernel code
-    void RemoveVar(VarDecl *var, Rewriter &rewrite) {
+    void RemoveVar(VarDecl *var, std::vector<Replacement> &replace) {
         SourceLocation startLoc, endLoc, tempLoc;
 
         //Find startLoc
@@ -3014,8 +3100,9 @@ emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Note", "Rewriting single dec
             else
                 endLoc = SM->getExpansionLoc(var->getSourceRange().getEnd());
         }
-        rewrite.RemoveText(startLoc,
-                           rewrite.getRangeSize(SourceRange(startLoc, endLoc)));
+	replace.push_back(Replacement(*SM, startLoc, getRangeSize(*SM, CharSourceRange::getTokenRange(SourceRange(startLoc, endLoc))), ""));
+        //replace.RemoveText(startLoc,
+        //                   replace.getRangeSize(SourceRange(startLoc, endLoc)));
     }
 
     //DEPRECATED: Old method to get the string representation of a Stmt
@@ -3036,12 +3123,25 @@ emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Note", "Rewriting single dec
     }
 
     //Replace a chunk of code represented by a Stmt with a constructed string
-    bool ReplaceStmtWithText(Stmt *OldStmt, llvm::StringRef NewStr, Rewriter &Rewrite) {
+    bool ReplaceStmtWithText(Stmt *OldStmt, llvm::StringRef NewStr, std::vector<Replacement> &replace) {
         SourceRange origRange = OldStmt->getSourceRange();
         SourceLocation s = SM->getExpansionLoc(origRange.getBegin());
         SourceLocation e = SM->getExpansionLoc(origRange.getEnd());
-        return Rewrite.ReplaceText(s,
-                                   Rewrite.getRangeSize(SourceRange(s, e)),
+	//FIXME: Originally, the rewriter method of replacements would return true if for some reason the SourceLocation could not be rewriten, need to make sure switching to Replacements and ASSUMING the location is rewritable is acceptable
+	replace.push_back(Replacement(*SM, s, getRangeSize(*SM, CharSourceRange::getTokenRange(SourceRange(s, e))), NewStr));
+	return false;
+        //return replace.ReplaceText(s,
+        //                           replace.getRangeSize(SourceRange(s, e)),
+        //                           NewStr);
+    }
+
+    //ReplaceStmtWithText still needs a Rewriter form so that localized Expr Rewriters can work
+    bool ReplaceStmtWithText(Stmt *OldStmt, llvm::StringRef NewStr, Rewriter &rewrite) {
+        SourceRange origRange = OldStmt->getSourceRange();
+        SourceLocation s = SM->getExpansionLoc(origRange.getBegin());
+        SourceLocation e = SM->getExpansionLoc(origRange.getEnd());
+        return rewrite.ReplaceText(s,
+                                   rewrite.getRangeSize(SourceRange(s, e)),
                                    NewStr);
     }
 
@@ -3163,13 +3263,13 @@ public:
 			// (since there's no source to rewrite..)
                         if (!fd->isImplicit()) {
                             RewriteHostFunction(fd);
-                            RemoveFunction(fd, KernelRewrite);
+                            RemoveFunction(fd, KernReplace);
     
                             if (fd->getNameAsString() == MainFuncName) {
                                 RewriteMain(fd);
                             }
                         } else {
-                            emitCU2CLDiagnostic(fd->getLocStart(), "CU2CL Note", "Skipped rewrite of implicitly defined function \"" + fd->getNameAsString() + "\"", HostRewrite);
+                            emitCU2CLDiagnostic(fd->getLocStart(), "CU2CL Note", "Skipped rewrite of implicitly defined function \"" + fd->getNameAsString() + "\"", HostReplace);
                         }
                     }
                 }
@@ -3192,13 +3292,13 @@ public:
                             RewriteHostFunction(fd);
                         else
                             //Simply a device function, so remove from host
-                            RemoveFunction(fd, HostRewrite);
+                            RemoveFunction(fd, HostReplace);
                     }
                     else {
                         //Simply a host function, so rewrite
                         RewriteHostFunction(fd);
                         //and remove from kernel
-                        RemoveFunction(fd, KernelRewrite);
+                        RemoveFunction(fd, KernReplace);
     
                         if (fd->getNameAsString() == MainFuncName) {
                             RewriteMain(fd);
@@ -3206,12 +3306,12 @@ public:
                     }
                 } else {
                     if (fd->getTemplateSpecializationInfo())
-                    emitCU2CLDiagnostic(fd->getTemplateSpecializationInfo()->getTemplate()->getLocStart(), "CU2CL Untranslated", "Unable to translate template function", HostRewrite);
+                    emitCU2CLDiagnostic(fd->getTemplateSpecializationInfo()->getTemplate()->getLocStart(), "CU2CL Untranslated", "Unable to translate template function", HostReplace);
                     else llvm::errs() << "Non-rewriteable function without TemplateSpecializationInfo detected\n";
                 }
             }
             else if (VarDecl *vd = dyn_cast<VarDecl>(*i)) {
-                RemoveVar(vd, KernelRewrite);
+                RemoveVar(vd, KernReplace);
                 RewriteHostVarDecl(vd);
             }
             //Rewrite Structs here
@@ -3269,7 +3369,7 @@ public:
 	    }
 	    else {
 		//This catches everything else, including enums
-		emitCU2CLDiagnostic((*i)->getLocStart(), "CU2CL DEBUG", "Decl couldn't be determined", HostRewrite);
+		emitCU2CLDiagnostic((*i)->getLocStart(), "CU2CL DEBUG", "Decl couldn't be determined", HostReplace);
 	    }
             //TODO rewrite type declarations
         }
@@ -3280,9 +3380,6 @@ return true;
     //Traditionally CU2CL is run on one standalone source file (with #includes)
     // at a time 
     virtual void HandleTranslationUnit(ASTContext &) {
-#ifdef CU2CL_ENABLE_TIMING
-        init_time();
-#endif
 
         //Declare global clPrograms, one for each kernel-bearing source file
         for (StringRefListMap::iterator i = Kernels.begin(),
@@ -3293,10 +3390,12 @@ return true;
         //TODO: differentiate main preamble from helpers as part of multiple compliation
         //Insert host preamble at top of main file
         HostPreamble = HostIncludes + "\n" + HostDecls + "\n" + HostGlobalVars + "\n" + HostKernels + "\n" + HostFunctions;
-        HostRewrite.InsertTextBefore(SM->getLocForStartOfFile(MainFileID), HostPreamble);
+        HostReplace.push_back(Replacement(*SM, SM->getLocForStartOfFile(MainFileID), 0, HostPreamble));
+	//HostReplace.InsertTextBefore(SM->getLocForStartOfFile(MainFileID), HostPreamble);
         //Insert device preamble at top of main kernel file
         DevPreamble = DevFunctions;
-        KernelRewrite.InsertTextBefore(SM->getLocForStartOfFile(MainFileID), DevPreamble);
+        KernReplace.push_back(Replacement(*SM, SM->getLocForStartOfFile(MainFileID), 0, DevPreamble));
+	//KernReplace.InsertTextBefore(SM->getLocForStartOfFile(MainFileID), DevPreamble);
 
         //Construct OpenCL initialization boilerplate
         CLInit += "\n";
@@ -3351,16 +3450,19 @@ return true;
         CLClean += "clReleaseContext(__cu2cl_Context);\n";
         
         //Insert boilerplate at the top of file as a comment, if it doesn't have a main method
+	//TODO: Change this to make file-specific named Init and Cleanup methods
 	if (MainDecl == NULL) {
 	    std::stringstream boilStr;
 	    boilStr << "No main() found\nCU2CL Boilerplate inserted here:\nCU2CL Initialization:\n" << CLInit << "\n\nCU2CL Cleanup:\n" <<CLClean; 
-            emitCU2CLDiagnostic(SM->getLocForStartOfFile(MainFileID), "CU2CL Unhandled", "No main() found!\n\tBoilerplate inserted as header comment!\n", boilStr.str(), HostRewrite);
+            emitCU2CLDiagnostic(SM->getLocForStartOfFile(MainFileID), "CU2CL Unhandled", "No main() found!\n\tBoilerplate inserted as header comment!\n", boilStr.str(), HostReplace);
         }
 	//Otherwise, insert it the start and end of the main method
 	else {
 	    CompoundStmt *mainBody = dyn_cast<CompoundStmt>(MainDecl->getBody());
-	    HostRewrite.InsertTextAfter(PP->getLocForEndOfToken(mainBody->getLBracLoc(), 0), CLInit);
-	    HostRewrite.InsertTextBefore(mainBody->getRBracLoc(), CLClean);
+	    HostReplace.push_back(Replacement(*SM, PP->getLocForEndOfToken(mainBody->getLBracLoc(), 0), 0, CLInit));
+	    //HostReplace.InsertTextAfter(PP->getLocForEndOfToken(mainBody->getLBracLoc(), 0), CLInit);
+	    HostReplace.push_back(Replacement(*SM, mainBody->getRBracLoc(), 0, CLClean));
+	    //HostReplace.InsertTextBefore(mainBody->getRBracLoc(), CLClean);
         }
 
         //Rewrite cl_mems in DeclGroups
@@ -3379,7 +3481,7 @@ return true;
                     replace += "cl_mem " + vd->getNameAsString();
 		    if (vd->getType()->isArrayType()) {
 			//make sure to grab the array [...] Expr too
-			emitCU2CLDiagnostic(vd->getLocStart(), "CU2CL Note", "Device var \"" + vd->getNameAsString() + "\" has array type!\n", HostRewrite);
+			emitCU2CLDiagnostic(vd->getLocStart(), "CU2CL Note", "Device var \"" + vd->getNameAsString() + "\" has array type!\n", HostReplace);
 			replace += "[";
 			if (const DependentSizedArrayType *arr = dyn_cast<DependentSizedArrayType>(vd->getType().getCanonicalType())) {
 			    replace += getStmtText(arr->getSizeExpr());
@@ -3401,14 +3503,38 @@ return true;
                     replace += ";\n";
                 }
             }
-            HostRewrite.ReplaceText(start, HostRewrite.getRangeSize(SourceRange(SM->getExpansionLoc(start), SM->getExpansionLoc(end))), replace);
+	    //If the host pointer has been previously Replaced with a vector rewrite, delete it
+	    HostVecVars.erase(start);
+	    //Before pushing this replacement, check HostReplace for previous vector type rewrites on the variable
+	    HostReplace.push_back(Replacement(*SM, start, getRangeSize(*SM, CharSourceRange::getTokenRange(SourceRange(SM->getExpansionLoc(start), SM->getExpansionLoc(end)))), replace));
+            //HostReplace.ReplaceText(start, HostReplace.getRangeSize(SourceRange(SM->getExpansionLoc(start), SM->getExpansionLoc(end))), replace);
         }
+	//Flush all remaining vector rewrites still in the map
+	for (std::map<SourceLocation, Replacement>::const_iterator I = HostVecVars.begin(), E = HostVecVars.end(); I != E; I++) {
+		HostReplace.push_back(I->second);
+	}
 	//Write all buffered comments to output streams
 	writeComments();
 	//And clean up the list's sentinel
 	free(head);
 	head = NULL;
 	tail = NULL;
+	
+	//TODO: the actual application of Replacements up to the tool layer
+	//TODO: design a clean merge for Replacement vectors at the tool layer
+	//Do final cleanup of the Replacement vectors
+	std::vector<Range> conflicts;
+	//Get rid of duplicate replacements (e.g. multiple "Cannot translate template" comments
+	deduplicate(HostReplace, conflicts);
+	//Collapse Replacements on the same SourceLocation (for things like InsertBefore + Replace)
+	coalesceReplacements(HostReplace);
+	//Apply them to the rewriter
+	applyAllReplacements(HostReplace, HostRewrite);
+
+	//Do the same steps on kernel code	
+	deduplicate(KernReplace, conflicts);
+	coalesceReplacements(KernReplace);
+	applyAllReplacements(KernReplace, KernelRewrite);
 
         //Output main file's rewritten buffer
         if (const RewriteBuffer *RewriteBuff =
@@ -3464,11 +3590,6 @@ return true;
             outFile->flush();
         }
 
-#ifdef CU2CL_ENABLE_TIMING
-        TransTime += get_time();
-
-        llvm::errs() << "Translation Time: " << TransTime << " microseconds\n";
-#endif
     }
 
     void RewriteInclude(SourceLocation HashLoc, const Token &IncludeTok,
@@ -3481,15 +3602,19 @@ return true;
             fileExt.equals(".cu") || fileExt.equals(".cuh")) {
             //If system-wide include style (#include <foo.h>) is used, don't translate
             if (IsAngled) {
-                KernelRewrite.RemoveText(HashLoc, KernelRewrite.getRangeSize(SourceRange(HashLoc, EndLoc)));
+		KernReplace.push_back(Replacement(*SM, HashLoc, getRangeSize(*SM, CharSourceRange::getTokenRange(SourceRange(HashLoc, EndLoc))), ""));
+                //KernReplace.RemoveText(HashLoc, KernReplace.getRangeSize(SourceRange(HashLoc, EndLoc)));
 		//Remove reference to the CUDA header
                 if (includedFile.equals("cuda.h"))
-                    HostRewrite.RemoveText(HashLoc, HostRewrite.getRangeSize(SourceRange(HashLoc, EndLoc)));
+		    HostReplace.push_back(Replacement(*SM, HashLoc, getRangeSize(*SM, CharSourceRange::getTokenRange(SourceRange(HashLoc, EndLoc))), ""));
+                    //HostReplace.RemoveText(HashLoc, HostReplace.getRangeSize(SourceRange(HashLoc, EndLoc)));
             }
 	    //Remove quote-included reference to the CUDA header
             else if (includedFile.equals("cuda.h")) {
-                HostRewrite.RemoveText(HashLoc, HostRewrite.getRangeSize(SourceRange(HashLoc, EndLoc)));
-                KernelRewrite.RemoveText(HashLoc, KernelRewrite.getRangeSize(SourceRange(HashLoc, EndLoc)));
+		HostReplace.push_back(Replacement(*SM, HashLoc, getRangeSize(*SM, CharSourceRange::getTokenRange(SourceRange(HashLoc, EndLoc))), ""));
+                //HostReplace.RemoveText(HashLoc, HostReplace.getRangeSize(SourceRange(HashLoc, EndLoc)));
+		KernReplace.push_back(Replacement(*SM, HashLoc, getRangeSize(*SM, CharSourceRange::getTokenRange(SourceRange(HashLoc, EndLoc))), ""));
+                //KernReplace.RemoveText(HashLoc, KernReplace.getRangeSize(SourceRange(HashLoc, EndLoc)));
             }
 	    //If local include style (#include "foo.h") is used, do translate
             else if (includedExt.equals(".cu") || includedExt.equals(".cuh")) {
@@ -3500,8 +3625,10 @@ return true;
                 SourceLocation start = fileStartLoc.getLocWithOffset(includedExt.begin() - fileBufStart);
                 SourceLocation end = fileStartLoc.getLocWithOffset((includedExt.end()) - fileBufStart);
 		//append new file-type to output sourcefile name
-                HostRewrite.ReplaceText(end, 0, "-cl.h");
-                KernelRewrite.ReplaceText(end, 0, "-cl.cl");
+		HostReplace.push_back(Replacement(*SM, end, 0, "-cl.h"));
+                //HostReplace.ReplaceText(end, 0, "-cl.h");
+		KernReplace.push_back(Replacement(*SM, end, 0, "-cl.cl"));
+                //KernReplace.ReplaceText(end, 0, "-cl.cl");
             }
             else {
                 //TODO: store include info to rewrite later?
@@ -3522,7 +3649,6 @@ protected:
 	filename = filename + "-cl" + filename.substr(dotPos);
         llvm::raw_ostream *hostOS = CI.createDefaultOutputFile(false, filename, "cpp");
         llvm::raw_ostream *kernelOS = CI.createDefaultOutputFile(false, filename, "cl");
-	llvm::errs() << "Firing UP Consumer\n";
         if (hostOS && kernelOS)
             return new RewriteCUDA(&CI, hostOS, kernelOS);
         //TODO cleanup files?
@@ -3583,6 +3709,7 @@ public:
     AppendAdjuster(const char *Add) : AddV() {
 	std::stringstream ss(Add);
 	std::string item;
+	//Tokenize based on a space character delimiter
 	while(std::getline(ss, item, ' ')) {
 	    AddV.push_back(item);
 	}
@@ -3603,6 +3730,9 @@ static FrontendPluginRegistry::Add<RewriteCUDAAction>
 X("rewrite-cuda", "translate CUDA to OpenCL");
 
 int main(int argc, const char ** argv) {
+	#ifdef CU2CL_ENABLE_TIMING
+        	init_time();
+	#endif
 	//Before we do anything, parse off common arguments, a la MPI
 	CommonOptionsParser options(argc, argv);
 
@@ -3616,6 +3746,9 @@ int main(int argc, const char ** argv) {
 
 	//run the tool (for now, just use the PluginASTAction from original CU2CL
 	int result = cu2cl.run(newFrontendActionFactory<RewriteCUDAAction>());
-	
+	#ifdef CU2CL_ENABLE_TIMING
+	    TransTime += get_time();
+	    llvm::errs() << "Translation Time: " << TransTime << " microseconds\n";
+	#endif
 }
 
