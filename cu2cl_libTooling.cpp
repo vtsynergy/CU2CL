@@ -276,6 +276,41 @@ using namespace llvm::sys::path;
 
 namespace {
 
+    //We borrow the OutputFile data structure from Clang's CompilerInstance.h
+    // So that we can use it to store output streams and emulate their temp
+    // file usage at the tool level
+    struct OutputFile {
+	std::string Filename;
+	std::string TempFilename;
+	raw_ostream *OS;
+
+	OutputFile(const std::string &filename, const std::string &tempFilename, raw_ostream *os) : Filename(filename), TempFilename(tempFilename), OS(os) { }
+    };
+
+    typedef std::map<std::string, OutputFile *> IDOutFileMap;
+    //Global Replacement structs, contributed to by each instance of the translator (one-per-main-source-file)
+    // only written to after local deduplication and coalescing
+    std::vector<Replacement> GlobalHostReplace;
+    std::vector<Replacement> GlobalKernReplace;
+    
+    //Global outFiles maps, moved so that they can be shared and written to at the tool level
+    IDOutFileMap OutFiles;
+    IDOutFileMap KernelOutFiles;
+
+    //We also borrow the loose method of dealing with temporary output files from
+    // CompilerInstance::clearOutputFiles
+    void clearOutputFile(OutputFile *OF, FileManager *FM) {
+	if(!OF->TempFilename.empty()) {
+	    SmallString<128> NewOutFile(OF->Filename);
+	    FM->FixupRelativePath(NewOutFile);
+	    if (llvm::error_code ec = llvm::sys::fs::rename(OF->TempFilename, NewOutFile.str()))
+		llvm::errs() << "Unable to move CU2CL temporary output [" << OF->TempFilename << "] to [" << OF->Filename << "]!\n\t Diag Msg: " << ec.message() << "\n";
+	    llvm::sys::fs::remove(OF->TempFilename);
+	} else {
+	    llvm::sys::fs::remove(OF->Filename);
+	}
+	delete OF->OS;
+    }
 
     //internal flags for command-line toggles
     bool AddInlineComments = true; //defaults to ON, turn off with '-plugin-arg-rewrite-cuda no-comments' at the command line
@@ -354,6 +389,12 @@ void coalesceReplacements(std::vector<Replacement> &replace) {
 	    I = J-1;
 	}
 }
+    void debugPrintReplacements(std::vector<Replacement> replace) {
+	for (std::vector<Replacement>::const_iterator I = replace.begin(), E = replace.end(); I != E; I++) {
+	    llvm::errs() << I->toString() << "\n";
+	}
+
+    }
 
 class RewriteCUDA;
 
@@ -384,7 +425,6 @@ class RewriteCUDA : public ASTConsumer {
 protected:
 
 private:
-    typedef std::map<FileID, llvm::raw_ostream *> IDOutFileMap;
     typedef std::map<llvm::StringRef, std::list<llvm::StringRef> > StringRefListMap;
 
     CompilerInstance *CI;
@@ -402,10 +442,9 @@ private:
 
     //Rewritten files
     FileID MainFileID;
-    llvm::raw_ostream *MainOutFile;
-    llvm::raw_ostream *MainKernelOutFile;
-    IDOutFileMap OutFiles;
-    IDOutFileMap KernelOutFiles;
+    std::string mainFilename;
+    OutputFile *MainOutFile;
+    OutputFile *MainKernelOutFile;
     //TODO lump IDs and both outfiles together
 
     StringRefListMap Kernels;
@@ -533,12 +572,6 @@ void TraverseStmt(Stmt *e, unsigned int indent) {
 	tail = head;
     }
 
-    void debugPrintReplacements(std::vector<Replacement> replace) {
-	for (std::vector<Replacement>::const_iterator I = replace.begin(), E = replace.end(); I != E; I++) {
-	    llvm::errs() << I->toString() << "\n";
-	}
-
-    }
     
     // Workhorse for CU2CL diagnostics, provides independent specification of multiple err_notes
     //  and inline_notes which should be dumped to stderr and translated output, respectively
@@ -3156,8 +3189,8 @@ emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Note", "Rewriting single dec
     }
 
 public:
-    RewriteCUDA(CompilerInstance *comp, llvm::raw_ostream *HostOS,
-                llvm::raw_ostream *KernelOS) :
+    RewriteCUDA(CompilerInstance *comp, std::string origFilename, OutputFile * HostOS,
+                OutputFile * KernelOS) : mainFilename(origFilename),
         ASTConsumer(), CI(comp),
         MainOutFile(HostOS), MainKernelOutFile(KernelOS) { }
 
@@ -3173,6 +3206,10 @@ public:
         HostRewrite.setSourceMgr(*SM, *LO);
         KernelRewrite.setSourceMgr(*SM, *LO);
         MainFileID = SM->getMainFileID();
+	
+	//TODOF: Register the main fileID and OS with the global map
+        OutFiles[mainFilename] = MainOutFile;
+        KernelOutFiles[mainFilename] = MainKernelOutFile;
 
         if (MainFuncName == "")
             MainFuncName = "main";
@@ -3225,17 +3262,24 @@ public:
             if (fileExt.equals(".cu") || fileExt.equals(".cuh")) {
                 //If #included and a .cu or .cuh file, rewrite
                 //TODO: accept .c/.h/.cpp/.hpp files but only if they contain CUDA Runtime calls
-                if (OutFiles.find(SM->getFileID(loc)) == OutFiles.end()) {
+                if (OutFiles.find(SM->getPresumedLoc(loc).getFilename()) == OutFiles.end()) {
                     //Create new files
                     FileID fileid = SM->getFileID(loc);
                     std::string filename = SM->getPresumedLoc(loc).getFilename();
+		    std::string origFilename = filename;
                     size_t dotPos = filename.rfind('.');
 		    filename = filename + "-cl" + filename.substr(dotPos);
-                    llvm::raw_ostream *hostOS = CI->createDefaultOutputFile(false, filename, "h");
-                    llvm::raw_ostream *kernelOS = CI->createDefaultOutputFile(false, filename, "cl");
+			//PAUL: These calls had to be replaced so the CompilerInstance wouldn't destroy the raw_ostream after translation finished
+                    //llvm::raw_ostream *hostOS = CI->createDefaultOutputFile(false, filename, "h");
+                    //llvm::raw_ostream *kernelOS = CI->createDefaultOutputFile(false, filename, "cl");
+		    std::string error, HostOutputPathName, HostTempPathName, KernOutputPathName, KernTempPathName;
+		    llvm::raw_ostream *hostOS = CI->createOutputFile(StringRef(CI->getFrontendOpts().OutputFile), error, false, true, filename, "h", true, true, &HostOutputPathName, &HostTempPathName);
+		    llvm::raw_ostream *kernelOS = CI->createOutputFile(StringRef(CI->getFrontendOpts().OutputFile), error, false, true, filename, "cl", true, true, &KernOutputPathName, &KernTempPathName);
+			OutputFile *HostOF = new OutputFile(HostOutputPathName, HostTempPathName, hostOS);
+			OutputFile *KernOF = new OutputFile(KernOutputPathName, KernTempPathName, kernelOS);
                     if (hostOS && kernelOS) {
-                        OutFiles[fileid] = hostOS;
-                        KernelOutFiles[fileid] = kernelOS;
+                        OutFiles[origFilename] = HostOF;
+                        KernelOutFiles[origFilename] = KernOF;
                     }
                     else {
 			//We've already registered an output stream for this
@@ -3380,6 +3424,9 @@ return true;
     //Traditionally CU2CL is run on one standalone source file (with #includes)
     // at a time 
     virtual void HandleTranslationUnit(ASTContext &) {
+	#ifdef CU2CL_ENABLE_TIMING
+        	init_time();
+	#endif
 
         //Declare global clPrograms, one for each kernel-bearing source file
         for (StringRefListMap::iterator i = Kernels.begin(),
@@ -3529,66 +3576,42 @@ return true;
 	//Collapse Replacements on the same SourceLocation (for things like InsertBefore + Replace)
 	coalesceReplacements(HostReplace);
 	//Apply them to the rewriter
-	applyAllReplacements(HostReplace, HostRewrite);
+	//TODO move application of replacements up to the tool level
+	GlobalHostReplace.insert(GlobalHostReplace.end(), HostReplace.begin(), HostReplace.end());
+	//applyAllReplacements(HostReplace, HostRewrite);
 
 	//Do the same steps on kernel code	
 	deduplicate(KernReplace, conflicts);
 	coalesceReplacements(KernReplace);
-	applyAllReplacements(KernReplace, KernelRewrite);
+	//applyAllReplacements(KernReplace, KernelRewrite);
+	GlobalKernReplace.insert(GlobalKernReplace.end(), KernReplace.begin(), KernReplace.end());
 
         //Output main file's rewritten buffer
-        if (const RewriteBuffer *RewriteBuff =
-            HostRewrite.getRewriteBufferFor(MainFileID)) {
-            *MainOutFile << std::string(RewriteBuff->begin(), RewriteBuff->end());
-        }
-        else {
+        //if (const RewriteBuffer *RewriteBuff =
+        //    HostRewrite.getRewriteBufferFor(MainFileID)) {
+        //    *MainOutFile << std::string(RewriteBuff->begin(), RewriteBuff->end());
+        //}
+        //else {
             //TODO use diagnostics for pretty errors
-            llvm::errs() << "No changes made to " << SM->getFileEntryForID(MainFileID)->getName() << "\n";
-        }
+        //    llvm::errs() << "No changes made to " << SM->getFileEntryForID(MainFileID)->getName() << "\n";
+        //}
         //Output main kernel file's rewritten buffer
-        if (const RewriteBuffer *RewriteBuff =
-            KernelRewrite.getRewriteBufferFor(MainFileID)) {
-            *MainKernelOutFile << std::string(RewriteBuff->begin(), RewriteBuff->end());
-        }
-        else {
+        //if (const RewriteBuffer *RewriteBuff =
+        //    KernelRewrite.getRewriteBufferFor(MainFileID)) {
+        //    *MainKernelOutFile << std::string(RewriteBuff->begin(), RewriteBuff->end());
+        //}
+        //else {
             //TODO use diagnostics for pretty errors
-            llvm::errs() << "No changes made to " << SM->getFileEntryForID(MainFileID)->getName() << " kernel\n";
-        }
+        //    llvm::errs() << "No changes made to " << SM->getFileEntryForID(MainFileID)->getName() << " kernel\n";
+        //}
         //Flush rewritten files
-        MainOutFile->flush();
-        MainKernelOutFile->flush();
+        //MainOutFile->flush();
+        //MainKernelOutFile->flush();
 
-	//Flush rewritten #included host files
-        for (IDOutFileMap::iterator i = OutFiles.begin(), e = OutFiles.end();
-             i != e; i++) {
-            FileID fid = (*i).first;
-            llvm::raw_ostream *outFile = (*i).second;
-	    //If changes were made, bring them in from the rewriter
-            if (const RewriteBuffer *RewriteBuff =
-                HostRewrite.getRewriteBufferFor(fid)) {
-                *outFile << std::string(RewriteBuff->begin(), RewriteBuff->end());
-            }
-	    //Otherwise just dump the file directly
-            else {
-                llvm::StringRef fileBuf = SM->getBufferData(fid);
-                *outFile << std::string(fileBuf.begin(), fileBuf.end());
-            }
-            outFile->flush();
-        }
-	//Flush rewritten #included kernel files
-        for (IDOutFileMap::iterator i = KernelOutFiles.begin(), e = KernelOutFiles.end();
-             i != e; i++) {
-            FileID fid = (*i).first;
-            llvm::raw_ostream *outFile = (*i).second;
-            if (const RewriteBuffer *RewriteBuff =
-                KernelRewrite.getRewriteBufferFor(fid)) {
-                *outFile << std::string(RewriteBuff->begin(), RewriteBuff->end());
-            }
-            else {
-                llvm::errs() << "No (kernel) changes made to " << SM->getFileEntryForID(fid)->getName() << " kernel\n";
-            }
-            outFile->flush();
-        }
+	#ifdef CU2CL_ENABLE_TIMING
+	    TransTime += get_time();
+	    llvm::errs() << SM->getFileEntryForID(MainFileID)->getName() << " Translation Time: " << TransTime << " microseconds\n";
+	#endif
 
     }
 
@@ -3645,12 +3668,18 @@ protected:
     ASTConsumer *CreateASTConsumer(CompilerInstance &CI, llvm::StringRef InFile) {
         
         std::string filename = InFile.str();
+	std::string origFilename = filename;
         size_t dotPos = filename.rfind('.');
 	filename = filename + "-cl" + filename.substr(dotPos);
-        llvm::raw_ostream *hostOS = CI.createDefaultOutputFile(false, filename, "cpp");
-        llvm::raw_ostream *kernelOS = CI.createDefaultOutputFile(false, filename, "cl");
-        if (hostOS && kernelOS)
-            return new RewriteCUDA(&CI, hostOS, kernelOS);
+        //llvm::raw_ostream *hostOS = CI.createDefaultOutputFile(false, filename, "cpp");
+        //llvm::raw_ostream *kernelOS = CI.createDefaultOutputFile(false, filename, "cl");
+		    std::string error, HostOutputPathName, HostTempPathName, KernOutputPathName, KernTempPathName;
+		    llvm::raw_ostream *hostOS = CI.createOutputFile(StringRef(CI.getFrontendOpts().OutputFile), error, false, true, filename, "cpp", true, true, &HostOutputPathName, &HostTempPathName);
+		    llvm::raw_ostream *kernelOS = CI.createOutputFile(StringRef(CI.getFrontendOpts().OutputFile), error, false, true, filename, "cl", true, true, &KernOutputPathName, &KernTempPathName);
+			OutputFile *HostOF = new OutputFile(HostOutputPathName, HostTempPathName, hostOS);
+			OutputFile *KernOF = new OutputFile(KernOutputPathName, KernTempPathName, kernelOS);
+                    if (hostOS && kernelOS) 
+            return new RewriteCUDA(&CI, origFilename, HostOF, KernOF);
         //TODO cleanup files?
         return NULL;
     }
@@ -3730,9 +3759,6 @@ static FrontendPluginRegistry::Add<RewriteCUDAAction>
 X("rewrite-cuda", "translate CUDA to OpenCL");
 
 int main(int argc, const char ** argv) {
-	#ifdef CU2CL_ENABLE_TIMING
-        	init_time();
-	#endif
 	//Before we do anything, parse off common arguments, a la MPI
 	CommonOptionsParser options(argc, argv);
 
@@ -3746,9 +3772,108 @@ int main(int argc, const char ** argv) {
 
 	//run the tool (for now, just use the PluginASTAction from original CU2CL
 	int result = cu2cl.run(newFrontendActionFactory<RewriteCUDAAction>());
-	#ifdef CU2CL_ENABLE_TIMING
-	    TransTime += get_time();
-	    llvm::errs() << "Translation Time: " << TransTime << " microseconds\n";
-	#endif
+
+	//After all Source files have been processed, they will have accumulated their Replacments
+	// into the global data structures, now deduplicate and fuse across them
+	std::vector<Range> conflicts;
+	deduplicate(GlobalHostReplace, conflicts);
+	coalesceReplacements(GlobalHostReplace);
+	deduplicate(GlobalKernReplace, conflicts);
+	coalesceReplacements(GlobalKernReplace);
+	
+	//Construct a SourceManager for the rewriters the replacements will be applied to
+	// We use a stripped-down version of the way clang-apply-replacements sets up their SourceManager
+	IntrusiveRefCntPtr<DiagnosticOptions> DiagOpts(new DiagnosticOptions());
+	DiagnosticsEngine Diagnostics(IntrusiveRefCntPtr<DiagnosticIDs>(new DiagnosticIDs()), DiagOpts.getPtr());
+	FileManager Files((FileSystemOptions()));
+	SourceManager RewriteSM(Diagnostics, Files);
+	//Set up our two rewriters
+	Rewriter GlobalHostRewrite(RewriteSM, LangOptions());
+	Rewriter GlobalKernRewrite(RewriteSM, LangOptions());
+
+	//Apply the global set of replacements to each of them
+	applyAllReplacements(GlobalHostReplace, GlobalHostRewrite);
+	applyAllReplacements(GlobalKernReplace, GlobalKernRewrite);
+
+	//debugPrintReplacements(GlobalHostReplace);
+	//debugPrintReplacements(GlobalKernReplace);
+
+	//DONE//TODO: Make sure each mainfile adds itself to this list
+	//Flush all rewritten #included host files
+        for (IDOutFileMap::iterator i = OutFiles.begin(), e = OutFiles.end();
+             i != e; i++) {
+		const FileEntry * FE = Files.getFile((*i).first);
+            //FileID fid = RewriteSM.translateFile(FE);
+            FileID fid = RewriteSM.translateFile(FE);
+            OutputFile * outFile = (*i).second;
+		if (fid.isInvalid()) {
+		    llvm::errs() << "File [" << (*i).first << "] has invalid (zero) FID, attempting forced creation!\n\t(Likely cause is lack of rewrites in both host and kernel outputs.)\n";
+		    //SourceLocation loc = RewriteSM.translateFileLineCol(FE, 1, 1);
+		    fid = RewriteSM.createFileID(FE, SourceLocation(), SrcMgr::C_User);
+		    if (fid.isInvalid()) {
+			llvm::errs() << "\tError file [" << (*i).first << "] still has invalid (zero) FID, dropping output! (Temp files may persist.)\n";
+			continue;
+		    } else {
+			llvm::errs() << "\tForced FID creation for file [" << (*i).first << "] succeeded, proceeding with output.\n";
+		    }	
+		}
+	    //If changes were made, bring them in from the rewriter
+            if (const RewriteBuffer *RewriteBuff =
+                GlobalHostRewrite.getRewriteBufferFor(fid)) {
+                *(outFile->OS) << std::string(RewriteBuff->begin(), RewriteBuff->end());
+            }
+	    //Otherwise just dump the file directly
+            else {
+                llvm::StringRef fileBuf = RewriteSM.getBufferData(fid);
+                *(outFile->OS) << std::string(fileBuf.begin(), fileBuf.end());
+		llvm::errs() << "No changes made to " << RewriteSM.getFileEntryForID(fid)->getName() << "\n";
+            }
+            outFile->OS->flush();
+	    clearOutputFile(outFile, &Files);
+        }
+
+	//Flush rewritten #included kernel files
+        for (IDOutFileMap::iterator i = KernelOutFiles.begin(), e = KernelOutFiles.end();
+             i != e; i++) {
+            FileID fid = RewriteSM.translateFile(Files.getFile((*i).first));
+            //FileID fid = (*i).first;
+            OutputFile * outFile = (*i).second;
+		if (fid.isInvalid()) {
+		    llvm::errs() << "Error file [" << (*i).first << "] has invalid (zero) fid!\n";
+		    //Push the file to the redo list, it might show up in the SM once it's relevant main file is processed
+		    continue;
+		}
+            if (const RewriteBuffer *RewriteBuff =
+                GlobalKernRewrite.getRewriteBufferFor(fid)) {
+                *(outFile->OS) << std::string(RewriteBuff->begin(), RewriteBuff->end());
+            }
+            else {
+                llvm::errs() << "No (kernel) changes made to " << RewriteSM.getFileEntryForID(fid)->getName() << "\n";
+            }
+            outFile->OS->flush();
+	    clearOutputFile(outFile, &Files);
+        }
+	
+	//In order to output replacements globally we need a few things
+	//DONE// A way of passing a shared replacement structure down through the factory
+	//DONE//> Why not just make a GlobalHostReplace and GlobalKernReplace which are global to the tool itself?
+	//DONE	//Each TU will handle it's own internal coallescing and dedup, then add its replacements to these structs
+	///DONE	//Then a global coalesce/dedup is performed
+	//DONE//We need to assemble a SourceManager, so that the rewriter can be constructed from it
+	//DONE//We then need to just "applyAllReplacements" from the global struct onto the global rewriters
+	//After applying replacements, the rewrites have to be gathered and written to the Main and included outfiles
+	//DONE	//This necessitates making OutFiles and KernelOutFiles global to the tool
+	//DONE	//This necessitates hoisting all the output code here, if the two OutFiles structs are global though, the outputstreams (based on file names) can still be generated internal to a RewriteCUDAAction instance)
+	//DONE//OutFiles AND KernelOutFiles should both be hoisted - and include all N "main files"
+		//This will necessitate a little rework of how MainFileID is used
+		//Local to RewriteCUDAAction instance, it must still be used for inserting per-file initilization/cleanup triggers
+		//It must NOT be used for anything that is part of global init/cleanup
+		//This will likely fall out as a sideeffect of how we handle boilerplate in the new multi-file method anyway
+	//Boilerplate needs to be reworked to be both file-local and global
+		//program and kernel generation/cleanup is file local, and extern references to queue, context, device, etc
+		//all utils (cu2cl_memset, readprogsrc, etc.) as well as global OpenCL init (device, context, queue) are now global and will get added to "cu2cl_util.c/h"
+		//Global utils will have global init/cleanup functions which will call the per-file initializers/cleanups
+		//These will be assembled from a shared data structure that lives globally at the tool level, which is contributed to by each RewriteCUDAAction
+		//This should allow fully-unordered translation and still make sure all initialization/cleanup gets done properly.
 }
 
