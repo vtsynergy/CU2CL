@@ -1,0 +1,65 @@
+CU2CL Beta Release (0.6.2b)
+========================================
+This is our first public release of the CU2CL (CUDA-to-OpenCL) translator. It provides translation of many frequently-used CUDA features targeting OpenCL 1.0 compatibility and maintainability of translated OpenCL source by preserving formatting and comments from original CUDA code. It translates both host- and device-side code with a primary focus on CUDA Runtime API calls required for basic memory, device, thread, stream, and event management as well as host-side kernel invocations using the CUDA C execution configuration syntax, and kernel function translation.
+
+This release is a work-in-progress academic prototype and currently has limited or no support for several features including (but not limited to):
+
+    CUDA Textures and Surfaces
+    CUDA/OpenGL Interoperability
+    C++ Templates in kernel code
+    CUDA Driver API
+    CUDA Runtime API features newer than 3.2
+    CUDA Kernel features newer than 3.2
+    Precompiled CUDA libraries
+
+We have endeavored to provide translation-time warnings for as many of these cases as possible, but the tool is undergoing active development and the CUDA specification is a moving target so there are likely cases we've missed. There is also a potential for the translator to produce small mistranslations in the presence of atypical usage of CUDA syntax. There will be bugs, and we'd love to hear about them so that we can improve the tool. Contact us at cu2cl-info@cs.vt.edu.
+
+
+
+Installation
+========================================
+Currently only tested and officially supported on 64-bit variants of Ubuntu Linux (10.04 and later). (But likely to work on other 64-bit Debian variants.)
+
+Dependencies:
+
+    make
+    cmake >= 2.8
+    subversion
+    CUDA Runtime >=3.2
+    GNU C Library (glibc) >= 2.11.1
+
+Ensure you have internet access as the install process will download the specific LLVM/Clang revision used to build the CU2CL binary.
+
+Unpack this tarball, and invoke the install.sh BASH script to start the install process. The script will use subversion to download the necessary revision of the LLVM/Clang source, to subdirectory “llvm” and create the build directory “llvm-build”. It will then configure cmake and build the LLVM/Clang binaries required by CU2CL. Compiling Clang can take some time, so by default the installation script is configured to use two make jobs for compilation. To change this behavior, edit line 16 of the script “make -j2” to reflect the desired number of jobs.
+
+After compiling Clang, the installation should be complete. However it may be necessary to manually specify some include paths for necessary system headers. This can be achieved by either editting the "CU2CL_EXTRA_INCLUDES" variable in the "cu2cl_translate.sh" wrapper script to reflect their paths, or specifying them at each compile time.
+
+After modifying the wrapper script, if necessary, installation is complete, and the cu2cl_translate.sh wrapper script may be used for invoking the CU2CL translator. 
+
+
+Usage
+========================================
+Once installed and appropriately configured, the cu2cl_translate.sh script from the install directory can be used to translate single CUDA source files, along with any *.cu or *.cuh source files they include. However, it will not provide translation of any included headers specified with the system include "<...>" syntax. After successful translation, CU2CL will output *-cl.cpp, *-cl.cl, and *-cl.h files as appropriate for host, device, and header code. (*-cl.h headers will only be generated from *-.cuh input.)
+
+Additional compiler arguments may be specified, and should be specified in between the script call and input CUDA file. For example:
+
+"/path/to/unpacked/tarball/location/cu2cl_translate.sh -I ./ foo.cu" 
+
+This should output "foo-cl.cpp" and "foo-cl.cl" host- and device-side source files in the current working directory.
+
+By default CU2CL outputs a large amount of information during translation, but this may be lessened by removing the "-v" compiler flag near the end of the CU2CL invocation on line 15 of cu2cl_translate.sh.
+
+It will not attempt to translate any *.c *.h, *.cpp, *.hpp or other included source file types, regardless of whether they contain CUDA syntax (variables, runtime function calls, or special syntax) or not, ONLY *.cu or *.cuh. It will also not attempt to translate any includes specified with the #include <...> syntax for system headers. Finally, it does not support the CUDA SDK Samples' shrUtils or cutils, and will likely emit malformed source code if they are present. Please manually refactor your code to handle these constraints before attempting translation. 
+
+Please visit http://chrec.cs.vt.edu/cu2cl for answers to other frequently asked questions.
+
+
+Acknowledgements
+========================================
+	CU2CL has been supported in part by NSF I/UCRC IIP-0804155 via the NSF Center for High-Performance Reconfigurable Computing.
+
+
+
+License
+========================================
+Please refer to the included LICENSE file.
