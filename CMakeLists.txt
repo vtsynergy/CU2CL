@@ -39,7 +39,7 @@ if(NOT EXISTS "${CU2CL_PATH_TO_LLVM_BUILD}/bin/llvm-tblgen${CMAKE_EXECUTABLE_SUF
 endif()
 get_filename_component(LLVM_BUILD_DIR ${CU2CL_PATH_TO_LLVM_BUILD}
                        ABSOLUTE)
-if(NOT EXISTS "${CU2CL_PATH_TO_CLANG_BUILD}/bin/clang-3.2${CMAKE_EXECUTABLE_SUFFIX}" )
+if(NOT EXISTS "${CU2CL_PATH_TO_CLANG_BUILD}/bin/clang${CMAKE_EXECUTABLE_SUFFIX}" )
     message(FATAL_ERROR
             "Please set CU2CL_PATH_TO_CLANG_BUILD to a directory containing a Clang build.")
 endif()
@@ -60,23 +60,38 @@ include_directories("${CLANG_BUILD_DIR}/include" "${CLANG_SRC_DIR}/include")
 link_directories("${LLVM_BUILD_DIR}/lib")
 link_directories("${CLANG_BUILD_DIR}/lib")
 
-llvm_process_sources(srcs RewriteCUDA.cpp)
+#Paul - added cu2cl_libTooling.cpp
+llvm_process_sources(srcs cu2cl_libTooling.cpp)
 
-add_library(RewriteCUDA MODULE ${srcs})
 
+#Paul - added clangTooling as a dependency during the libTooling conversion
 set(LLVM_USED_LIBS
     clangFrontend
-    clangRewrite
+    clangRewriteCore
     clangAST
     clangLex
     clangBasic
+    clangTooling
+    clangDriver
+    clangSerialization
+    clangParse
+    clangSema
+    clangAnalysis
+    clangEdit
+    clang
+    LLVMCore
+)
+
+
+add_executable(cu2cl-tool
+    cu2cl_libTooling.cpp
 )
 
 foreach(lib ${LLVM_USED_LIBS})
-    target_link_libraries(RewriteCUDA ${lib})
+    target_link_libraries(cu2cl-tool ${lib})
 endforeach(lib)
 
-set_target_properties(RewriteCUDA
+set_target_properties(cu2cl-tool
     PROPERTIES
     LINKER_LANGUAGE CXX
     PREFIX ""
