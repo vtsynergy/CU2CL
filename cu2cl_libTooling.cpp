@@ -4,15 +4,25 @@
 *
 * (c) 2010-2015 Virginia Tech
 *
-*    This library is free software; you can redistribute it and/or modify it under the terms of the attached Virginia Tech and GNU Lesser General Public Licenses v2.1 as published by the Free Software Foundation.
+*    This library is free software; you can redistribute it and/or modify it under the terms of the attached GNU Lesser General Public License v2.1 as published by the Free Software Foundation.
 *
 *    This library is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Lesser General Public License for more details.
 *
-*   You should have received a copy of the GNU Lesser General Public License along with this library; if not, write to the Free Software Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA  
+*   You should have received a copy of the GNU Lesser General Public License along with this library; if not, write to the Free Software Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA 
+* 
 * Authors: Gabriel Martinez, Paul Sathre
 *
 */
 
+#define CU2CL_LICENSE \
+	"/* (c) 2010-2016 Virginia Tech\n" \
+	"*\n" \
+	"*    This library is free software; you can redistribute it and/or modify it under the terms of the attached GNU Lesser General Public License v2.1 as published by the Free Software Foundation.\n" \
+	"*\n" \
+	"*    This library is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Lesser General Public License for more details.\n" \
+	"*\n" \
+	"*   You should have received a copy of the GNU Lesser General Public License along with this library; if not, write to the Free Software Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA \n" \
+	"*/\n" 
 #include "clang/AST/AST.h"
 #include "clang/AST/ASTConsumer.h"
 #include "clang/AST/Decl.h"
@@ -3845,6 +3855,11 @@ int main(int argc, const char ** argv) {
 	raw_ostream * cu2cl_util = new llvm::raw_fd_ostream("cu2cl_util.c", error);
 	raw_ostream * cu2cl_header = new llvm::raw_fd_ostream("cu2cl_util.h", error);
 	raw_ostream * cu2cl_kernel = new llvm::raw_fd_ostream("cu2cl_util.cl", error);
+
+	//Add licensing info to all generated files
+	*cu2cl_header << CU2CL_LICENSE;
+	*cu2cl_util << CU2CL_LICENSE;
+	*cu2cl_kernel << CU2CL_LICENSE;
 
 	//Force cu2cl_util.c to include cu2cl_util.h and it, the other key headers
 	*cu2cl_header << "#ifdef __APPLE__\n";
