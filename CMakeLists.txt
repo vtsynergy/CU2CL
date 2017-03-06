@@ -54,6 +54,7 @@ include(HandleLLVMOptions)
 #otherwise use LLVM.cmake
 include("${LLVM_BUILD_DIR}/share/llvm/cmake/LLVMConfig.cmake")
 
+set(CMAKE_CXX_FLAGS "-std=c++11 ${CMAKE_CXX_FLAGS}")
 set(CMAKE_INCLUDE_CURRENT_DIR ON)
 include_directories("${LLVM_BUILD_DIR}/include" "${LLVM_SRC_DIR}/include")
 include_directories("${CLANG_BUILD_DIR}/include" "${CLANG_SRC_DIR}/include")

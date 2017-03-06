@@ -1,8 +1,8 @@
 /*
 * CU2CL - A prototype CUDA-to-OpenCL translator built on the Clang compiler infrastructure
-* Version 0.7.0b (beta)
+* Version 0.7.1b (beta)
 *
-* (c) 2010-2015 Virginia Tech
+* (c) 2010-2016 Virginia Tech
 *
 *    This library is free software; you can redistribute it and/or modify it under the terms of the attached GNU Lesser General Public License v2.1 as published by the Free Software Foundation.
 *
@@ -56,12 +56,16 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/Regex.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/CommandLine.h"
 
 #include <list>
 #include <map>
 #include <set>
 #include <sstream>
 #include <string>
+#include <iostream>
+#include <cstdio>
+#include <memory>
 
 //Injects a small amount of code to time the translation process
 #define CU2CL_ENABLE_TIMING
@@ -332,6 +336,13 @@ namespace {
     bool UsesCU2CLUtilCL = false;
     bool UsesCU2CLLoadSrc = false;
 
+    //internal flags for command-line toggles
+    bool AddInlineComments = true; //defaults to ON, turn off with '--inline-comments=false' at the command line
+    //Extra Arguments to be appended to all generated clBuildProgram calls.
+    std::string ExtraBuildArgs; //defaults to "", add more with '--cl-build-args="<args>"'
+    bool FilterKernelName = false; //defaults to OFF, turn on with '--rename-kernel-files' or '--rename-kernel-files=true'
+
+    bool UseGCCPaths = false; //defaults to OFF, turn on with '--import-gcc-paths'
     //We borrow the OutputFile data structure from Clang's CompilerInstance.h
     // So that we can use it to store output streams and emulate their temp
     // file usage at the tool level
@@ -379,8 +390,22 @@ namespace {
 	delete OF->OS;
     }
 
-    //internal flags for command-line toggles
-    bool AddInlineComments = true; //defaults to ON, turn off with '-plugin-arg-rewrite-cuda no-comments' at the command line
+    //Replace all instances of the phrase "kernel" with "knl"
+    // Used to rename files as per Altera's kernel filename requirement
+    std::string kernelNameFilter(std::string str) {
+	std::string newStr = str;
+	if (!FilterKernelName) return newStr;
+	size_t pos = newStr.rfind("/"); //Only rewrite the file, not the path
+	if (pos == std::string::npos) pos = 0;
+	for (; ; pos += 3) {
+	    pos = newStr.find("kernel", pos);
+	    if (pos == std::string::npos) break;
+	    newStr.erase(pos, 6);
+	    newStr.insert(pos, "knl");
+	}
+	return newStr;
+    }
+
 
 //Simple timer calls that get injected if enabled
 #ifdef CU2CL_ENABLE_TIMING
@@ -628,6 +653,7 @@ void TraverseStmt(Stmt *e, unsigned int indent) {
 	    free(head->n);
 	    head->n = curr;
 	}
+
 	tail = head;
     }
 
@@ -686,6 +712,10 @@ void TraverseStmt(Stmt *e, unsigned int indent) {
     // Assumes the err_note is replicated as the inline comment to add to source.
     void emitCU2CLDiagnostic(SourceLocation loc, std::string severity_str, std::string err_note, std::vector<Replacement> &replace) {
         emitCU2CLDiagnostic(loc, severity_str, err_note, err_note, replace);
+    }
+
+    std::string getTextFromLocs(SourceLocation a, SourceLocation b) {
+	return std::string(SM->getCharacterData(a), SM->getCharacterData(b)-SM->getCharacterData(a));
     }
 
     //Convenience method for getting a string of raw text between two SourceLocations
@@ -3090,11 +3120,16 @@ emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Note", "Rewriting single dec
 	    func = (FunctionDecl *)funcDef;
 	}
 
+	//Start with reasonable defaults
+        startLoc = func->getLocStart();
+	//endLoc = func->getLocEnd();
+		
         //Calculate the SourceLocation of the first token of the function,
 	// handling a number of corner cases
         //TODO find first specifier location
         //TODO find storage class specifier
-        startLoc = func->getTypeSourceInfo()->getTypeLoc().getBeginLoc();
+        tempLoc = func->getTypeSourceInfo()->getTypeLoc().getBeginLoc();
+	if (SM->isBeforeInTranslationUnit(tempLoc, startLoc)) startLoc = tempLoc;
         if (tk == FunctionDecl::TK_FunctionTemplate) {
             FunctionTemplateDecl *ftd = func->getDescribedFunctionTemplate();
             tempLoc = ftd->getSourceRange().getBegin();
@@ -3102,8 +3137,9 @@ emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Note", "Rewriting single dec
                 startLoc = tempLoc;
         }
         if (func->hasAttrs()) {
-            Attr *attr = (func->getAttrs())[0];
-
+            //Attr *attr = (func->getAttrs())[0];
+	    //Attributes are stored in reverse order of spelling, get the outermost
+            Attr *attr = *(func->attr_end()-1);
 	    //Some functions have attributes on both prototype and definition.
 	    // This loop ensures we grab the LAST copy of the first attribute
 	    int i;
@@ -3122,10 +3158,26 @@ emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Note", "Rewriting single dec
             if (startLoc.getRawEncoding() != 0) emitCU2CLDiagnostic(startLoc, "CU2CL Note", "Removed constructor/deconstructor", replace);
         }
 
+	//If there is an extern "C"  qualifier on a function declaration
+	// move startLoc back to it (unless it is a block extern)
+	if (func->isExternC()) {
+	    //Get the function's DeclContext
+	    DeclContext * dc = FunctionDecl::castToDeclContext(func);
+	    //Find the nearest ancestor that is a terminal extern "C" LinkageSpecDecl
+	    //I have not found a case in which this loop iterates more than once
+	    // i.e. it always find the extern on the immediate parent
+	    // but it remains in-case that is not always the case
+	    for (; dc->getParent()->isExternCContext() && !(LinkageSpecDecl::castFromDeclContext(dc)->getExternLoc().isValid()); dc = dc->getParent());
+	    //Make a LinkageSpecDecl from the ancestor
+	    LinkageSpecDecl * lsd = LinkageSpecDecl::castFromDeclContext(dc);
+	    //Exclude block "extern "C" { ... }" variants as these are often quite a distance from the immediate function being deleted.
+	    if (!(lsd->hasBraces()) && (tempLoc = lsd->getExternLoc()).isValid()) startLoc = tempLoc;
+	}
+
 	//If we still haven't found an appropriate startLoc, something's atypical
 	//Grab whatever Clang thinks is the startLoc, and remove from there
         if (startLoc.getRawEncoding() == 0) {
-            startLoc = func->getLocStart();
+	    startLoc = func->getLocStart();
 	    //If even Clang doesn't have any idea where to start, give up
             if (startLoc.getRawEncoding() == 0) {
                 emitCU2CLDiagnostic(startLoc, "CU2CL Error", "Unable to determine valid start location for function \"" + func->getNameAsString() + "\"", replace);
@@ -3143,6 +3195,10 @@ emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Note", "Rewriting single dec
         else {
             //Find location of semi-colon
             endLoc = func->getSourceRange().getEnd();
+	    if ((tempLoc = Lexer::findLocationAfterToken(endLoc, tok::semi, *SM, *LO, false)).isValid()) {
+		//found a semicolon, replace the endLoc with the semicolon's loc
+		endLoc = tempLoc;
+	    }
         }
 	replace.push_back(Replacement(*SM, startLoc, getRangeSize(*SM, CharSourceRange::getTokenRange(SourceRange(startLoc,endLoc))), ""));
     }
@@ -3153,30 +3209,53 @@ emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Note", "Rewriting single dec
         SourceLocation startLoc, endLoc, tempLoc;
 
         //Find startLoc
-        //TODO find first specifier location
-        //TODO find storage class specifier
-        startLoc = var->getTypeSourceInfo()->getTypeLoc().getBeginLoc();
+	//Try just getting the raw startLoc, should grab storage specifiers
+	// (i.e. "extern", "const", et.)
+	startLoc = var->getLocStart();
+        tempLoc = var->getTypeSourceInfo()->getTypeLoc().getBeginLoc();
+	if (SM->isBeforeInTranslationUnit(tempLoc, startLoc) || !startLoc.isValid()) {
+		startLoc = tempLoc;
+		//llvm::errs() << "VarLoc was after TypeLoc\n";
+	}
         if (var->hasAttrs()) {
-            Attr *attr = (var->getAttrs())[0];
+	    //Find any __shared__, __constant__, __device__, or other attribs
+	    //Attributes are stored in reverse order of spelling, get the outermost
+            Attr *attr = *(var->attr_end()-1);
             tempLoc = SM->getExpansionLoc(attr->getLocation());
             if (SM->isBeforeInTranslationUnit(tempLoc, startLoc))
                 startLoc = tempLoc;
         }
-
-        //Find endLoc
+	
+	//default to the perceived end
+	endLoc = var->getLocEnd();
+        //Check if an initializer is accounted for
         if (var->hasInit()) {
             Expr *init = var->getInit();
-            endLoc = SM->getExpansionLoc(init->getLocEnd());
+            tempLoc = SM->getExpansionLoc(init->getLocEnd());
+	    if (SM->isBeforeInTranslationUnit(endLoc, tempLoc) || !endLoc.isValid()) endLoc = tempLoc;
         }
         else {
-            //Find location of semi-colon
+            //Find the end of the declaration
             TypeLoc tl = var->getTypeSourceInfo()->getTypeLoc();
             if (ArrayTypeLoc atl = tl.getAs<ArrayTypeLoc>()) {
-                endLoc = SM->getExpansionLoc(atl.getRBracketLoc());
+                tempLoc = SM->getExpansionLoc(atl.getRBracketLoc());
+		if (SM->isBeforeInTranslationUnit(endLoc, tempLoc) || !endLoc.isValid()) endLoc = tempLoc;
+		//llvm::errs() << "Found ArrayTypeLoc\n";
+		
             }
-            else
-                endLoc = SM->getExpansionLoc(var->getSourceRange().getEnd());
+            else {
+                tempLoc = SM->getExpansionLoc(var->getSourceRange().getEnd());
+		if (SM->isBeforeInTranslationUnit(endLoc, tempLoc) || !endLoc.isValid()) endLoc = tempLoc;
+		//llvm::errs() << "Found non-array TypeLoc\n";
+	    }
         }
+	//then find the semicolon
+	if ((tempLoc = Lexer::findLocationAfterToken(endLoc, tok::semi, *SM, *LO, false)).isValid()) {
+	    //found a semicolon, replace the endLoc with the semicolon's loc
+	    endLoc = tempLoc;
+	}
+	//TODO Read ahead to the trailing newline if no active code elements are between it and the semicolon
+	// (i.e. remove trailing comments identifying the variable and the newline)
 	replace.push_back(Replacement(*SM, startLoc, getRangeSize(*SM, CharSourceRange::getTokenRange(SourceRange(startLoc, endLoc))), ""));
     }
 
@@ -3226,6 +3305,7 @@ emitCU2CLDiagnostic(cudaCall->getLocStart(), "CU2CL Note", "Rewriting single dec
                 str[i] = '_';
         return str;
     }
+
 
 public:
     RewriteCUDA(CompilerInstance *comp, std::string origFilename, OutputFile * HostOS,
@@ -3299,13 +3379,13 @@ public:
             if (fileExt.equals(".cu") || fileExt.equals(".cuh")) {
                 //If #included and a .cu or .cuh file, rewrite
                 //TODO: accept .c/.h/.cpp/.hpp files but only if they contain CUDA Runtime calls
-                if (OutFiles.find(SM->getPresumedLoc(loc).getFilename()) == OutFiles.end()) {
+                if (OutFiles.find(kernelNameFilter(SM->getPresumedLoc(loc).getFilename())) == OutFiles.end()) {
                     //Create new files
                     FileID fileid = SM->getFileID(loc);
                     std::string filename = SM->getPresumedLoc(loc).getFilename();
 		    std::string origFilename = filename;
                     size_t dotPos = filename.rfind('.');
-		    filename = filename + "-cl" + filename.substr(dotPos);
+		    filename = kernelNameFilter(filename) + "-cl" + filename.substr(dotPos);
 			//PAUL: These calls had to be replaced so the CompilerInstance wouldn't destroy the raw_ostream after translation finished
 		    std::string error, HostOutputPathName, HostTempPathName, KernOutputPathName, KernTempPathName;
 		    llvm::raw_ostream *hostOS = CI->createOutputFile(StringRef(CI->getFrontendOpts().OutputFile), error, false, true, filename, "h", true, true, &HostOutputPathName, &HostTempPathName);
@@ -3499,10 +3579,18 @@ return true;
 	    }
 	    CLInit = "void __cu2cl_Init_" + file + "() {\n";
             std::list<llvm::StringRef> &l = (*i).second;
-            CLInit += "    progLen = __cu2cl_LoadProgramSource(\"" + filename((*i).first).str() + "-cl.cl\", &progSrc);\n";
+	//Paul: Addition to generate ALTERA .aocx build from binary with an ifdef
+	    CLInit += "    #ifdef WITH_ALTERA\n";
+	    CLInit += "    progLen = __cu2cl_LoadProgramSource(\"" + kernelNameFilter(idCharFilter(filename((*i).first))) + "_cl.aocx\", &progSrc);\n";
+	    CLInit += "    __cu2cl_Program_" + file + " = clCreateProgramWithBinary(__cu2cl_Context, 1, &__cu2cl_Device, &progLen, (const unsigned char **)&progSrc, NULL, NULL);\n";
+	    CLInit += "    #else\n";
+            CLInit += "    progLen = __cu2cl_LoadProgramSource(\"" + kernelNameFilter(filename((*i).first).str()) + "-cl.cl\", &progSrc);\n";
             CLInit += "    __cu2cl_Program_" + file + " = clCreateProgramWithSource(__cu2cl_Context, 1, &progSrc, &progLen, NULL);\n";
+	    CLInit += "    #endif\n";
             CLInit += "    free((void *) progSrc);\n";
-            CLInit += "    clBuildProgram(__cu2cl_Program_" + file + ", 1, &__cu2cl_Device, \"-I .\", NULL, NULL);\n";
+            CLInit += "    clBuildProgram(__cu2cl_Program_" + file + ", 1, &__cu2cl_Device, \"-I . ";
+		CLInit += ExtraBuildArgs;
+		CLInit += "\", NULL, NULL);\n";
 	    // and initialize all its kernels
             for (std::list<llvm::StringRef>::iterator li = l.begin(), le = l.end();
                  li != le; li++) {
@@ -3665,11 +3753,17 @@ return true;
                 SourceLocation fileStartLoc = SM->getLocForStartOfFile(fileID);
                 llvm::StringRef fileBuf = SM->getBufferData(fileID);
                 const char *fileBufStart = fileBuf.begin();
-                SourceLocation start = fileStartLoc.getLocWithOffset(includedExt.begin() - fileBufStart);
+                SourceLocation start = fileStartLoc.getLocWithOffset(includedFile.begin() - fileBufStart);
                 SourceLocation end = fileStartLoc.getLocWithOffset((includedExt.end()) - fileBufStart);
-		//append new file-type to output sourcefile name
-		HostReplace.push_back(Replacement(*SM, end, 0, "-cl.h"));
-		KernReplace.push_back(Replacement(*SM, end, 0, "-cl.cl"));
+		//replace filename and type
+		std::string hostname = kernelNameFilter(includedFile.str()) + "-cl.h";		
+		std::string kernname = kernelNameFilter(includedFile.str()) + "-cl.cl";
+		//FIXME: I am not sure why it's calculating one character larger than it should be, but regression tests indicate the static -1 is working
+		// We should figure out the root of the problem to guarantee the fix
+		HostReplace.push_back(Replacement(*SM, start, getRangeSize(*SM, CharSourceRange::getTokenRange(SourceRange(start, end)))-1, hostname));
+		KernReplace.push_back(Replacement(*SM, start, getRangeSize(*SM, CharSourceRange::getTokenRange(SourceRange(start, end)))-1, kernname));
+		//HostReplace.push_back(Replacement(*SM, end, 0, "-cl.h"));
+		//KernReplace.push_back(Replacement(*SM, end, 0, "-cl.cl"));
             }
             else {
                 //TODO: store include info to rewrite later?
@@ -3679,16 +3773,16 @@ return true;
 
 };
 
-
-class RewriteCUDAAction : public PluginASTAction {
+class RewriteCUDAAction : public SyntaxOnlyAction {
 protected:
+
     //The factory method needeed to initialize the plugin as an ASTconsumer
     ASTConsumer *CreateASTConsumer(CompilerInstance &CI, llvm::StringRef InFile) {
         
         std::string filename = InFile.str();
 	std::string origFilename = filename;
         size_t dotPos = filename.rfind('.');
-	filename = filename + "-cl" + filename.substr(dotPos);
+	filename = kernelNameFilter(filename) + "-cl" + filename.substr(dotPos);
 		    std::string error, HostOutputPathName, HostTempPathName, KernOutputPathName, KernTempPathName;
 		    llvm::raw_ostream *hostOS = CI.createOutputFile(StringRef(CI.getFrontendOpts().OutputFile), error, false, true, filename, "cpp", true, true, &HostOutputPathName, &HostTempPathName);
 		    llvm::raw_ostream *kernelOS = CI.createOutputFile(StringRef(CI.getFrontendOpts().OutputFile), error, false, true, filename, "cl", true, true, &KernOutputPathName, &KernTempPathName);
@@ -3696,32 +3790,10 @@ protected:
 			OutputFile *KernOF = new OutputFile(KernOutputPathName, KernTempPathName, kernelOS);
                     if (hostOS && kernelOS) 
             return new RewriteCUDA(&CI, origFilename, HostOF, KernOF);
-        //TODO cleanup files?
+        //TODO cleanup files?	
         return NULL;
     }
 
-    //Handle parsing of arguments to the plugin
-    bool ParseArgs(const CompilerInstance &CI,
-                   const std::vector<std::string> &args) {
-        for (unsigned i = 0, e = args.size(); i != e; ++i) {
-            llvm::errs() << "RewriteCUDA arg = " << args[i] << "\n";
-
-	    //a toggle for inline comment generation, default is ON
-	    if (args[i] == "no-comments") {
-		AddInlineComments = false;		
-	    }
-	    //TODO: Add ocl-version option, default to 1.0, to account for API changes needed in output
-        }
-        if (args.size() && args[0] == "help")
-            PrintHelp(llvm::errs());
-
-        return true;
-    }
-
-    //TODO: implement help output, potentially for additional options
-    void PrintHelp(llvm::raw_ostream &ros) {
-        ros << "Help for RewriteCUDA plugin goes here\n";
-    }
 
 };
 
@@ -3771,10 +3843,63 @@ private:
     CommandLineArguments AddV;
 };
 
-static FrontendPluginRegistry::Add<RewriteCUDAAction>
-X("rewrite-cuda", "translate CUDA to OpenCL");
+
+//Add custom cu2cl arguments
+llvm::cl::opt<bool, true> Comments("inline-comments", llvm::cl::desc("Add inline descriptive comments to output (boolean, default \"true\")."),  llvm::cl::location(AddInlineComments));
+llvm::cl::opt<std::string, true> ExtraArgs("cl-extra-args", llvm::cl::desc("Additional compiler arguments to append to all generated clBuildProgram calls."), llvm::cl::value_desc("<\"args\">"), llvm::cl::location(ExtraBuildArgs), llvm::cl::init(""));
+llvm::cl::opt<bool, true> KernelRename("rename-kernel-files", llvm::cl::desc("Replace instances of \"kernel\" in filenames with \"knl\""), llvm::cl::location(FilterKernelName));
+llvm::cl::opt<bool, true> ImportGCCPaths("import-gcc-paths", llvm::cl::desc("Use GCC to infer search path(s) for system include directories"), llvm::cl::location(UseGCCPaths));
+
+std::string parseGCCPaths() {
+    //create a temporary file
+	llvm::SmallVectorImpl<char> * tmpPath = new llvm::SmallVector<char, 128>();
+	int tempFD;
+	//Even though we don't use the FD, we use this variant to force the file to persist long enough for GCC to use it
+	llvm::sys::fs::createTemporaryFile("cu2cl-gcc-dummy", "c", tempFD, *tmpPath);
+    //generate a comand
+	llvm::SmallString<128> * tmpPathStr = new llvm::SmallString<128>();
+	tmpPathStr->assign("gcc -v ");
+	tmpPathStr->append(*tmpPath);
+	tmpPathStr->append(" 2>&1");
+	const char * cmd = tmpPathStr->c_str();
+//	llvm::errs() << "Generated GCC Search command: " << cmd << "\n";
+    //run GCC and buffer all the data
+    std::shared_ptr<FILE> pipe(popen(cmd, "r"), pclose);
+    if (!pipe) return "ERROR";
+    char buffer[128];
+    std::string result = "";
+    while (!feof(pipe.get())) {
+        if (fgets(buffer, 128, pipe.get()) != NULL)
+            result += buffer;
+    }
+//	llvm::errs() << "GCC Search Output:\n" << result << "\n";
+
+	//Generate a StringRef for simpler search ops
+	StringRef parseStr(result);
+
+	//Find the start demarcator
+	size_t start = parseStr.find("#include <...> search starts here:\n");
+	//Skip ahead to the first character after the demarcator line
+	start = 1 + parseStr.find("\n", start);
+	//Find the end demarcator
+	size_t end = parseStr.find("End of search list.\n", start);
+	//Slice out just the chunk of paths, separated by newlines
+	StringRef pathsRef = parseStr.slice(start, end);
+	//For each line, add a new -I directive
+    std::string directives = " ";
+	start = 0, end = pathsRef.find("\n");
+	for (; start < pathsRef.size(); start = end +1, end = pathsRef.find("\n", start)) directives += "-I" + pathsRef.slice(start, end).rtrim().str() + " ";
+//	llvm::errs() << "GCC pathsRef:" << pathsRef.str() << "\n";
+	llvm::errs() << "GCC final directives:" << directives << "\n";
+    //use llvm regex to find the important lines
+    //and add -I directives
+
+    return directives;
+}
 
 int main(int argc, const char ** argv) {
+	
+//	llvm::cl::ParseCommandLineOptions(argc, argv);
 	//Before we do anything, parse off common arguments, a la MPI
 	CommonOptionsParser options(argc, argv);
 
@@ -3784,8 +3909,22 @@ int main(int argc, const char ** argv) {
 	//Inject extra default arguments
 	//These are needed to override parsing of some CUDA headers Clang doesn't like
 	// and putting them here removes the need to put them on every call or in a static compilation database
-	cu2cl.appendArgumentsAdjuster(new AppendAdjuster("-D CUDA_SAFE_CALL(X)=X -D __CUDACC__ -D __SM_32_INTRINSICS_H__ -D __SM_35_INTRINSICS_H__ -D __SURFACE_INDIRECT_FUNCTIONS_H__ -include cuda_runtime.h"));
-        
+	std::string embeddedArgs = "-D CUDA_SAFE_CALL(X)=X -D __CUDACC__ -D __SM_32_INTRINSICS_H__ -D __SM_35_INTRINSICS_H__ -D __SURFACE_INDIRECT_FUNCTIONS_H__ -include cuda_runtime.h";
+      
+	//TODO: Add a verbose diagnostic function specifying the status of all options 
+	if (AddInlineComments) llvm::errs() << "Commenting is enabled\n";
+	else llvm::errs() << "Commenting is disabled\n";
+	llvm::errs() << "clBuild arguments appended: " << ExtraBuildArgs << "\n";
+	if (FilterKernelName) llvm::errs() << "Name filtering is enabled\n";
+	else llvm::errs() << "Name filtering is disabled\n";
+
+	if (UseGCCPaths) {
+	    llvm::errs() << "GCC include directory import is enabled\n";
+	    //logic to spawn a "gcc -v foo.c" proc and parse search path(s)
+	    embeddedArgs += parseGCCPaths();
+	} else llvm::errs() << "GCC include directory import is disabled\n";
+	cu2cl.appendArgumentsAdjuster(new AppendAdjuster(embeddedArgs.c_str()));
+
 	//Boilerplate generation has to start before the tool runs, so the tool
 	// instances can contribute their local init calls to it
 	//Construct OpenCL initialization boilerplate
@@ -3821,10 +3960,17 @@ int main(int argc, const char ** argv) {
 	if (UsesCU2CLUtilCL) {
 	    //Declare and build the __cu2cl_Util_Program 
             GlobalCDecls["cu2cl_util.c"].push_back("cl_program __cu2cl_Util_Program;\n");
+	    CU2CLInit += "    #ifdef WITH_ALTERA\n";
+	    CU2CLInit += "    progLen = __cu2cl_LoadProgramSource(\"cu2cl_util.aocx\", &progSrc);\n";
+	    CU2CLInit += "    __cu2cl_Util_Program = clCreateProgramWithBinary(__cu2cl_Context, 1, &__cu2cl_Device, &progLen, (const unsigned char **)&progSrc, NULL, NULL);\n";
+	    CU2CLInit += "    #else\n";
             CU2CLInit += "    progLen = __cu2cl_LoadProgramSource(\"cu2cl_util.cl\", &progSrc);\n";
             CU2CLInit += "    __cu2cl_Util_Program = clCreateProgramWithSource(__cu2cl_Context, 1, &progSrc, &progLen, NULL);\n";
+	    CU2CLInit += "    #endif\n";
             CU2CLInit += "    free((void *) progSrc);\n";
-            CU2CLInit += "    clBuildProgram(__cu2cl_Util_Program, 1, &__cu2cl_Device, \"-I .\", NULL, NULL);\n";
+            CU2CLInit += "    clBuildProgram(__cu2cl_Util_Program, 1, &__cu2cl_Device, \"-I . ";
+		CU2CLInit += ExtraBuildArgs;
+		CU2CLInit += "\", NULL, NULL);\n";
 	    // and initialize all its kernels
             for (std::vector<std::string>::iterator i = UtilKernels.begin(), e = UtilKernels.end();
                  i != e; i++) {
@@ -3855,7 +4001,7 @@ int main(int argc, const char ** argv) {
 	raw_ostream * cu2cl_util = new llvm::raw_fd_ostream("cu2cl_util.c", error);
 	raw_ostream * cu2cl_header = new llvm::raw_fd_ostream("cu2cl_util.h", error);
 	raw_ostream * cu2cl_kernel = new llvm::raw_fd_ostream("cu2cl_util.cl", error);
-
+	
 	//Add licensing info to all generated files
 	*cu2cl_header << CU2CL_LICENSE;
 	*cu2cl_util << CU2CL_LICENSE;
@@ -3981,6 +4127,7 @@ int main(int argc, const char ** argv) {
 	//Flush all rewritten #included host files
         for (IDOutFileMap::iterator i = OutFiles.begin(), e = OutFiles.end();
              i != e; i++) {
+		
 		const FileEntry * FE = Files.getFile((*i).first);
             	FileID fid = RewriteSM.translateFile(FE);
             	OutputFile * outFile = (*i).second;

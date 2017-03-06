@@ -1,4 +1,3 @@
-CU2CL Beta Release (0.7.0b)
 ========================================
 Welcome to the CU2CL (CUDA-to-OpenCL) source-to-source translator project. CU2CL is a work-in progress academic prototype translator that endeavors to provide translation of many of the most frequently used CUDA features. However, CUDA is a large, moving target and CU2CL may not support all syntax and API elements of the current CUDA specification.
 
@@ -6,7 +5,7 @@ Currently it targets OpenCL 1.0 as the output standard. Further it aims to provi
 
 The tool translated both host- and device-side code, generating separate families of output files suitable for a standard C++ compiler (*-cl.cpp/h files), as well as an OpenCL kernel compiler (*-cl.cl files). The majority of supported translations are focused on core Runtime API calls for memory, device, thread, stream, and event management as well as the CUDA C-style kernel invocation and full kernel function translation.
 
-Additionally, the 0.7.0b release has added a range of new features to support global translation of large, multi-file codebases. Please see ReleaseNotes.txt for more information. 
+Additionally, the 0.7.1b release has added a range of new features to support global translation of large, multi-file codebases. Please see ReleaseNotes.txt for more information. 
 
 This release currently has limited or no support for several features including (but not limited to):
 
@@ -22,7 +21,6 @@ We have endeavored to provide translation-time warnings for as many of these cas
 
 Installation from Source
 ========================================
-Currently only tested and officially supported on 64-bit variants of Ubuntu Linux (10.04 and later). (But likely to work on other 64-bit Debian variants.)
 
 Dependencies:
 
@@ -32,7 +30,7 @@ Dependencies:
     CUDA Runtime >=3.2
     GNU C Library (glibc) >= 2.11.1
 
-Ensure you have internet access as the install process will download the LLVM/Clang tarballs necessary to build the CU2CL binary.
+Ensure you have internet access as the install process will download the LLVM/Clang tarballs necessary to build the CU2CL binary. (If you do not have open internet access, a source install will still work, you will just need to manually fetch the LLVM and Clang 3.4 source tarballs and disable the two wget lines at the top of the installer script.)
 
 Unpack this tarball, and invoke the install.sh BASH script to start the install process. The script will use wget to download the necessary revision of the LLVM/Clang source, and unpack it to subdirectory llvm-3.4 and create the build directory llvm-build. It will then configure cmake and build the LLVM/Clang binaries required by CU2CL. Compiling Clang can take some time, so by default the installation script is configured to use two make jobs for compilation. To change this behavior, edit line 23 of the script "make -j2" to reflect the desired number of jobs.
 
@@ -45,16 +43,19 @@ Usage
 ========================================
 Once built, the "cu2cl-tool" binary can be used to translate sets of CUDA source files, along with any *.cu or *.cuh source files they include. However, it will not provide translation of any included headers specified with the system include "<...>" syntax. After successful translation, CU2CL will output *-cl.cpp, *-cl.cl, and *-cl.h files as appropriate for host, device, and header code. (*-cl.h headers will only be generated from *-.cuh input.)
 
-In order to run the tool the following syntax must be used:
-./cu2cl_tool <CUDA source files> -- <Compiler options>
+In order to run the tool the following syntax must be used. (The double-dash is critical for separating CU2CL input from Clang parameters):
+./cu2cl_tool [CU2CL options] <CUDA source files> -- <Compiler options>
+
+Where [CU2CL options] are options specific to CU2CL or the libTooling framework. These can be queried with ./cu2cl_tool --help.
 
 Where <CUDA source files> is an unordered list of any source files which contain CUDA C, CUDA kernel code, or CUDA API calls, and collectively make up a complete binary. (Either by compiling to separate *.o files, and later linking, or specifying all sources to a combined compile+link step.) The important part is making sure all files that would be linked together are translated in the same invocation, so that global OpenCL state can be appropriately generated and shared between separate compilations. (CUDA files which are #included with local-include "*.cuh" syntax will automatically be included in the translation.)
 
 And <Compiler options> are any standard build options that may need to be passed, such as command-line #defines (-D arguments) or include directories (-I arguments).
+*** Default header search paths are not included by default, and will need to be included with -I directives.
 
 So a sample invocation would look like:
 
-./cu2cl_tool fooRuntimeMain.cpp fooKernels.cu -- -DGPU_ON -I ./fooIncludes
+./cu2cl_tool --cl-extra-args="-DGPU_ON -I ./fooIncludes" fooRuntimeMain.cpp fooKernels.cu -- -DGPU_ON -I /usr/local/include -I /other/sys/includeDir -I ./fooIncludes
 
 Which would generate fooRuntimeMain.cpp-cl.cpp, fooRuntimeMain.cpp-cl.cl, fooKernels.cu-cl.cpp, fooKernels.cu-cl.cl, and any associated translated header files.
 

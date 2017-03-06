@@ -23,13 +23,13 @@ make -j2
 
 ## Repair a few unlinked header files in this Clang Revision
 echo "CU2CL: Repairing Clang headers"
-ln -s `pwd`/tools/clang/include/clang/Basic/AttrList.inc ../llvm-3.4/tools/clang/include/clang/Basic/AttrList.inc
-ln -s `pwd`/tools/clang/include/clang/Basic/DiagnosticCommonKinds.inc ../llvm-3.4/tools/clang/include/clang/Basic/DiagnosticCommonKinds.inc
-ln -s `pwd`/tools/clang/include/clang/AST/DeclNodes.inc ../llvm-3.4/tools/clang/include/clang/AST/DeclNodes.inc
-ln -s `pwd`/tools/clang/include/clang/AST/StmtNodes.inc ../llvm-3.4/tools/clang/include/clang/AST/StmtNodes.inc
-ln -s `pwd`/tools/clang/include/clang/AST/CommentCommandList.inc ../llvm-3.4/tools/clang/include/clang/AST/CommentCommandList.inc
-ln -s `pwd`/tools/clang/include/clang/AST/Attrs.inc ../llvm-3.4/tools/clang/include/clang/AST/Attrs.inc
-ln -s `pwd`/tools/clang/include/clang/Driver/Options.inc ../llvm-3.4/tools/clang/include/clang/Driver/Options.inc
+ln -s "$(pwd)"/tools/clang/include/clang/Basic/AttrList.inc ../llvm-3.4/tools/clang/include/clang/Basic/AttrList.inc
+ln -s "$(pwd)"/tools/clang/include/clang/Basic/DiagnosticCommonKinds.inc ../llvm-3.4/tools/clang/include/clang/Basic/DiagnosticCommonKinds.inc
+ln -s "$(pwd)"/tools/clang/include/clang/AST/DeclNodes.inc ../llvm-3.4/tools/clang/include/clang/AST/DeclNodes.inc
+ln -s "$(pwd)"/tools/clang/include/clang/AST/StmtNodes.inc ../llvm-3.4/tools/clang/include/clang/AST/StmtNodes.inc
+ln -s "$(pwd)"/tools/clang/include/clang/AST/CommentCommandList.inc ../llvm-3.4/tools/clang/include/clang/AST/CommentCommandList.inc
+ln -s "$(pwd)"/tools/clang/include/clang/AST/Attrs.inc ../llvm-3.4/tools/clang/include/clang/AST/Attrs.inc
+ln -s "$(pwd)"/tools/clang/include/clang/Driver/Options.inc ../llvm-3.4/tools/clang/include/clang/Driver/Options.inc
 
 ## Make a directory for the cu2cl shared library.
 mkdir ../cu2cl-build
