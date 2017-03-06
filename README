@@ -22,6 +22,7 @@ We have endeavored to provide translation-time warnings for as many of these cas
 
 Installation from Source
 ========================================
+Currently only tested and officially supported on 64-bit variants of Debian 8.7 "Jessie" and later and Centos 6.5. (But likely to work on other 64-bit Debian or Fedora-based distributions.)
 
 Dependencies:
 
