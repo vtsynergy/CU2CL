@@ -1,3 +1,4 @@
+CU2CL Beta Release (0.7.1b)
 ========================================
 Welcome to the CU2CL (CUDA-to-OpenCL) source-to-source translator project. CU2CL is a work-in progress academic prototype translator that endeavors to provide translation of many of the most frequently used CUDA features. However, CUDA is a large, moving target and CU2CL may not support all syntax and API elements of the current CUDA specification.
 
