@@ -1,0 +1,18 @@
+CU2CL Release Notes
+
+v0.8.0b - Cross-AST and CFG-spanning Inferred Translations
+
+Summary
+- Major revision
+- Adds an architecture for storing and deferring translations identified in a single AST until after all other ASTs are processed.
+  - Adds tracking to bidirectionally navigate Decl <-> DeclRefExpr relationships
+    -(Clang natively supports looking up the Decl referred to by a DeclRefExpr, we add a mechanism to take a Decl and get a list of all DeclRefExprs that refer to it)
+  - With the above tracking, all device variable declarations that would be converted to cl_mems are now deferred until after all ASTs are processed
+- The above deferred translation and bidirectional mapping allows a conversion of a device buffer to a cl_mem type to trigger other translations
+  - Right now this feature propagates cl_mem conversions when a device buffer is either declared as a function parameter, or provided as an argument to a function call
+    - Downward propgation: If a cl_mem is provided as an argument to a function, ensure that parameter is also converted to a cl_mem
+	- Upward propagation: If a cl_mem is a parameter of a function prototype, ensure any variables that are provided as arguments for that parameter are also converted.
+	- Horizontal propagation: If a function parameter is changed to a cl_mem (and propagated up/down) in one AST, ensure it is propagated up/down in all other ASTs (i.e. if a prototype in a shared header is changed, multiple ASTs may call or implement that function)
+- Overhauls #include handling so that it can now handle translate inside files without *.cu/*.cuh extensions.
+  - Will still reject anything using the system includes <...> angle braces, and most CUDA-specific header files
+- Improvements to how arrays of, or pointers to [pointers to ...] device buffers are converted to cl_mems 

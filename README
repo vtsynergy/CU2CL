@@ -1,14 +1,14 @@
-CU2CL Beta Release (0.7.1b)
+CU2CL Beta Release (0.8.0b)
 ========================================
 Welcome to the CU2CL (CUDA-to-OpenCL) source-to-source translator project. CU2CL is a work-in progress academic prototype translator that endeavors to provide translation of many of the most frequently used CUDA features. However, CUDA is a large, moving target and CU2CL may not support all syntax and API elements of the current CUDA specification.
 
-Currently it targets OpenCL 1.0 as the output standard. Further it aims to provide an easily-maintained translated source by preserving formatting and developer comments from the original CUDA, as well as injecting searchable comment tags for untranslated structures. (These are intended to aid manual post-translation intervention.)
+Currently it targets OpenCL as the output standard. Further it aims to provide an easily-maintained translated source by preserving formatting and developer comments from the original CUDA, as well as injecting searchable comment tags for untranslated structures. (These are intended to aid manual post-translation intervention.)
 
 The tool translated both host- and device-side code, generating separate families of output files suitable for a standard C++ compiler (*-cl.cpp/h files), as well as an OpenCL kernel compiler (*-cl.cl files). The majority of supported translations are focused on core Runtime API calls for memory, device, thread, stream, and event management as well as the CUDA C-style kernel invocation and full kernel function translation.
 
-Additionally, the 0.7.1b release has added a range of new features to support global translation of large, multi-file codebases. Please see ReleaseNotes.txt for more information. 
+Additionally, the 0.8.0b release has added a range of new features to support global translation of large, multi-file, separately-compiled codebases. Please see ReleaseNotes.txt for more information. 
 
-This release currently has limited or no support for several features including (but not limited to):
+This bleeding-edge release currently has limited or no support for several features including (but not limited to):
 
     CUDA Textures and Surfaces
     CUDA/OpenGL Interoperability
@@ -17,6 +17,8 @@ This release currently has limited or no support for several features including 
     CUDA Runtime API features newer than 3.2
     CUDA Kernel features newer than 3.2
     Precompiled CUDA libraries
+	
+Many of these features are supportable in OpenCL but have not been necessitated by the applications of interest that CU2CL has been provisioned for. Pull requests to add or improve support for the one-to-one mappings that exist are always appreciated.
 
 We have endeavored to provide translation-time warnings for as many of these cases as possible, but the tool is undergoing active development and the CUDA specification is a moving target so there are likely cases we've missed. There is also a potential for the translator to produce small mistranslations in the presence of atypical usage of CUDA syntax. There will be bugs, and we'd love to hear about them so that we can improve the tool. Contact us at cu2cl-info@cs.vt.edu.
 
@@ -30,7 +32,7 @@ Dependencies:
     cmake >= 2.8
     wget
     CUDA Runtime >=3.2
-    GNU C Library (glibc) >= 2.11.1
+    GNU C Library (glibc) >= 2.19
 
 Ensure you have internet access as the install process will download the LLVM/Clang tarballs necessary to build the CU2CL binary. (If you do not have open internet access, a source install will still work, you will just need to manually fetch the LLVM and Clang 3.4 source tarballs and disable the two wget lines at the top of the installer script.)
 
