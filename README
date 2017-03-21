@@ -45,7 +45,7 @@ After compiling LLVM/Clang and CU2CL, the installation should be complete. The b
 
 Usage
 ========================================
-Once built, the "cu2cl-tool" binary can be used to translate sets of CUDA source files, along with any *.cu or *.cuh source files they include. However, it will not provide translation of any included headers specified with the system include "<...>" syntax. After successful translation, CU2CL will output *-cl.cpp, *-cl.cl, and *-cl.h files as appropriate for host, device, and header code. (*-cl.h headers will only be generated from *-.cuh input.)
+Once built, the "cu2cl-tool" binary can be used to translate sets of CUDA source files, along with any local CUDA source files they include. However, it will not provide translation of any included headers specified with the system include "<...>" syntax. After successful translation, CU2CL will output *-cl.cpp, *-cl.cl, and *-cl.h files as appropriate for host, device, and header code. 
 
 In order to run the tool the following syntax must be used. (The double-dash is critical for separating CU2CL input from Clang parameters):
 ./cu2cl_tool [CU2CL options] <CUDA source files> -- <Compiler options>
@@ -65,7 +65,7 @@ Which would generate fooRuntimeMain.cpp-cl.cpp, fooRuntimeMain.cpp-cl.cl, fooKer
 
 Additionally, a set of CU2CL utility functions will be generated in cu2cl_util.c/h/cl. cu2cl_util.c must be compiled and linked into the finished executable for the linking to succeed, as it includes requisite initialization, cleanup, and other OpenCL utility functions. 
 
-It will not attempt to translate any *.c *.h, *.cpp, *.hpp or other included source file types, regardless of whether they contain CUDA syntax (variables, runtime function calls, or special syntax) or not, ONLY *.cu or *.cuh. It will also not attempt to translate any includes specified with the #include <...> syntax reserved for system headers - project headers should use the #include "..." syntax. Finally, it does not support the CUDA SDK Samples' shrUtils or cutils, and will likely emit malformed source code if they are present. Please manually refactor your code to handle these constraints before attempting translation. 
+It will selectively attempt to translate any *.c *.h, *.cpp, *.hpp or other included source file types, if they contain CUDA syntax (variables, runtime function calls, or special syntax) and are not a system include (i.e. are local to the project). It will not attempt to translate any includes specified with the #include <...> syntax reserved for system headers - project headers should use the #include "..." syntax. Finally, it does not support the CUDA SDK Samples' shrUtils or cutils, and will likely emit malformed source code if they are present. Please manually refactor your code to handle these constraints before attempting translation. 
 
 Please visit http://chrec.cs.vt.edu/cu2cl for answers to other frequently asked questions.
 
