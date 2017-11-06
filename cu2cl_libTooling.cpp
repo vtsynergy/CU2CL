@@ -2,7 +2,7 @@
 * CU2CL - A prototype CUDA-to-OpenCL translator built on the Clang compiler infrastructure
 * Version 0.8.0b (beta)
 *
-* (c) 2010-2016 Virginia Tech
+* (c) 2010-2017 Virginia Tech
 *
 *    This library is free software; you can redistribute it and/or modify it under the terms of the attached GNU Lesser General Public License v2.1 as published by the Free Software Foundation.
 *
@@ -15,7 +15,7 @@
 */
 
 #define CU2CL_LICENSE \
-	"/* (c) 2010-2016 Virginia Tech\n" \
+	"/* (c) 2010-2017 Virginia Tech\n" \
 	"*\n" \
 	"*    This library is free software; you can redistribute it and/or modify it under the terms of the attached GNU Lesser General Public License v2.1 as published by the Free Software Foundation.\n" \
 	"*\n" \
