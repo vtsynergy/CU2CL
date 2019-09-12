@@ -16,7 +16,7 @@
 */
 
 #define CU2CL_LICENSE \
-	"/* (C) 2010-2017 Virginia Polytechnic Institute & State University (also known as "Virginia Tech"). All Rights Reserved.\n" \
+	"/* (C) 2010-2017 Virginia Polytechnic Institute & State University (also known as \"Virginia Tech\"). All Rights Reserved.\n" \
 	"/* This software is provided as-is.  Neither the authors, Virginia Tech nor Virginia Tech Intellectual Properties, Inc. assert, warrant, or guarantee that the software is fit for any purpose whatsoever, nor do they collectively or individually accept any responsibility or liability for any action or activity that results from the use of this software.  The entire risk as to the quality and performance of the software rests with the user, and no remedies shall be provided by the authors, Virginia Tech or Virginia Tech Intellectual Properties, Inc.\n" \
 	"*\n" \
 	"*    This library is free software; you can redistribute it and/or modify it under the terms of the attached GNU Lesser General Public License v2.1 as published by the Free Software Foundation.\n" \
@@ -4413,15 +4413,17 @@ int main(int argc, const char ** argv) {
 						//Get the target parameter
 						//Upwards propagate it
 						std::string funcDeclLoc = func->getLocStart().printToString(*(std::get<0>(*((*fitr).second))));
+//						llvm::errs() << "CU2CL DEBUG: inspection loc: \"" << funcDeclLoc << "\"\n";
 						std::vector<DeclRefExpr *> funcRefs = AllDeclRefsByDecl[funcDeclLoc];
 						for (std::vector<DeclRefExpr *>::iterator funcRef = funcRefs.begin(); funcRef != funcRefs.end(); funcRef++) {
 						 //Loop over all references to that function declaration
-							ASTContext::ParentVector fParents = AST->getParents(*(dyn_cast<Stmt>(*funcRef)));
+							//ASTContext::ParentVector fParents = AST->getParents(*(dyn_cast<Stmt>(*funcRef)));
+							ASTContext::ParentVector fParents = (std::get<3>(*((*fitr).second)))->getParents(*(dyn_cast<Stmt>(*funcRef)));
 							//The above should give us *all* the ancestors, look backwards until the next parent is a Stmt but not an Expr
 							ASTContext::ParentVector::iterator fPitr;
 							Stmt * fStmt;
 							Expr *  ancestor;
-							for (fPitr = fParents.begin(); fPitr != fParents.end(); fParents = AST->getParents(*fPitr), fPitr = fParents.begin()) {
+							for (fPitr = fParents.begin(); fPitr != fParents.end(); fParents = (std::get<3>(*((*fitr).second)))->getParents(*fPitr), fPitr = fParents.begin()) {
 								fStmt = (Stmt*) ((fPitr)->get<Stmt>());
 								if (fStmt != NULL) {
 									const Expr * fExpr = dyn_cast<Expr>(fStmt) ;
