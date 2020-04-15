@@ -1660,6 +1660,7 @@ emitCU2CLDiagnostic(SM, cudaCall->getLocStart(), "CU2CL Note", "Rewriting single
             Expr *arg = cast->getSubExprAsWritten();
             std::string s;
             RewriteHostExpr(arg, s);
+            args << "localWorkSize[0] = " << s << ";\n";
         }
 
 	//Rewrite the grid expression
