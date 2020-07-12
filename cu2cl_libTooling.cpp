@@ -758,6 +758,7 @@ private:
     //Preamble string to insert at top of main kernel file
     std::string DevPreamble;
     std::string DevFunctions;
+    std::string DevExtensions;
 
     //Pre- and Postamble strings that bundle OpenCL boilerplate for a translation unit
     //Global boilerplate is generated in CU2CLInit and CU2CLClean
@@ -1190,6 +1191,9 @@ void TraverseStmt(Stmt *e, unsigned int indent) {
             RewriteHostExpr(prop, newProp);
             RewriteHostExpr(device, newDevice);
             newExpr = "__cu2cl_GetDeviceProperties(" + newProp + ", " + newDevice + ")";
+        }
+        else if (funcName == "cudaDeviceSynchronize") {
+            newExpr = "clFinish(__cu2cl_CommandQueue)";
         }
 
         //Stream Management
@@ -2967,7 +2971,71 @@ emitCU2CLDiagnostic(SM, cudaCall->getLocStart(), "CU2CL Note", "Rewriting single
 	    //Begin double intrinsics
 	    //TODO: support double intrinsics
 	    //Begin integer intrinsics
-	    //TODO: support integer intrinsics
+            else if (funcName == "__hadd") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "hadd(" + newX + ", " + newY + ")";
+            }
+            else if (funcName == "__mulhi") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "mul_hi(" + newX + ", " + newY + ")";
+            }
+            else if (funcName == "__mul24") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "mul24(" + newX + ", " + newY + ")";
+            }
+            else if (funcName == "__uhadd") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "hadd(" + newX + ", " + newY + ")";
+            }
+            else if (funcName == "__umulhi") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "mul_hi(" + newX + ", " + newY + ")";
+            }
+            else if (funcName == "__umul24") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "mul24(" + newX + ", " + newY + ")";
+            }
+            else if (funcName == "__rhadd") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "rhadd(" + newX + ", " + newY + ")";
+            }
+            else if (funcName == "__urhadd") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "rhadd(" + newX + ", " + newY + ")";
+            }
+	    //TODO: support remaining integer intrinsics
 	    //Begin type casting intrinsics
             else if (funcName == "__double2float_rd") {
                 Expr *x = ce->getArg(0);
@@ -3017,6 +3085,257 @@ emitCU2CLDiagnostic(SM, cudaCall->getLocStart(), "CU2CL Note", "Rewriting single
                 std::string newX;
                 RewriteKernelExpr(x, newX);
                 newExpr = "convert_int_rtz(" + newX + ")";
+            }
+        //Begin half comparison functions
+            else if (funcName == "__heq") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "isequal(" + newX + ", " + newY + ")";
+                DevExtensions += "#pragma OPENCL EXTENSION cl_khr_fp16 : enable\n";
+            }
+            else if (funcName == "__hge") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "isgreaterequal(" + newX + ", " + newY + ")";
+                DevExtensions += "#pragma OPENCL EXTENSION cl_khr_fp16 : enable\n";
+            }
+            else if (funcName == "__hgt") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "isgreater(" + newX + ", " + newY + ")";
+                DevExtensions += "#pragma OPENCL EXTENSION cl_khr_fp16 : enable\n";
+            }
+            else if (funcName == "__hisinf") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "isinf(" + newX + ")";
+                DevExtensions += "#pragma OPENCL EXTENSION cl_khr_fp16 : enable\n";
+            }
+            else if (funcName == "__hisnan") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "isnan(" + newX + ")";
+                DevExtensions += "#pragma OPENCL EXTENSION cl_khr_fp16 : enable\n";
+            }
+            else if (funcName == "__hle") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "isgreater(" + newX + ", " + newY + ")";
+                DevExtensions += "#pragma OPENCL EXTENSION cl_khr_fp16 : enable\n";
+            }
+            else if (funcName == "__hlt") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "isgreater(" + newX + ", " + newY + ")";
+                DevExtensions += "#pragma OPENCL EXTENSION cl_khr_fp16 : enable\n";
+            }
+            else if (funcName == "__hne") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "isgreater(" + newX + ", " + newY + ")";
+                DevExtensions += "#pragma OPENCL EXTENSION cl_khr_fp16 : enable\n";
+            }
+        //TODO: support remaining half comparison function
+        //Begin: half math functions
+            else if (funcName == "hcos") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "cos(" + newX + ")";
+                DevExtensions += "#pragma OPENCL EXTENSION cl_khr_fp16 : enable\n";
+            }
+            else if (funcName == "hexp") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "exp(" + newX + ")";
+                DevExtensions += "#pragma OPENCL EXTENSION cl_khr_fp16 : enable\n";
+            }
+            else if (funcName == "hexp2") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "exp2(" + newX + ")";
+                DevExtensions += "#pragma OPENCL EXTENSION cl_khr_fp16 : enable\n";
+            }
+            else if (funcName == "hexp10") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "exp10(" + newX + ")";
+                DevExtensions += "#pragma OPENCL EXTENSION cl_khr_fp16 : enable\n";
+            }
+            else if (funcName == "hlog") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "log(" + newX + ")";
+                DevExtensions += "#pragma OPENCL EXTENSION cl_khr_fp16 : enable\n";
+            }
+            else if (funcName == "hlog2") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "log2(" + newX + ")";
+                DevExtensions += "#pragma OPENCL EXTENSION cl_khr_fp16 : enable\n";
+            }
+            else if (funcName == "hlog10") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "log10(" + newX + ")";
+                DevExtensions += "#pragma OPENCL EXTENSION cl_khr_fp16 : enable\n";
+            }
+            else if (funcName == "hrsqrt") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "rsqrt(" + newX + ")";
+                DevExtensions += "#pragma OPENCL EXTENSION cl_khr_fp16 : enable\n";
+            }
+            else if (funcName == "hsqrt") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "sqrt(" + newX + ")";
+                DevExtensions += "#pragma OPENCL EXTENSION cl_khr_fp16 : enable\n";
+            }
+            else if (funcName == "hsin") {
+                Expr *x = ce->getArg(0);
+                std::string newX;
+                RewriteKernelExpr(x, newX);
+                newExpr = "sin(" + newX + ")";
+                DevExtensions += "#pragma OPENCL EXTENSION cl_khr_fp16 : enable\n";
+            }
+        //TODO: support remaining half math functions
+        //Begin: atomin functions
+        //Note: Note: include the following in OpenCL program
+        // #pragma OPENCL EXTENSION extension-name : enable
+        // extension-name:
+        // "cl_khr_int64_base_atomics" for : atom_add atom_sub atom_inc
+        // atom_dec atom_xchg atom_cmpxchg
+        // "cl_khr_int64_extended_atomics" for: atom_min atom_max atom_and
+        // atom_or atom_xor"
+            else if (funcName == "atomicAdd") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "atomic_add(" + newX + ", " + newY + ")";
+                DevExtensions += "#pragma OPENCL EXTENSION cl_khr_int64_base_atomics : enable\n";
+            }
+            else if (funcName == "atomicSub") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "atomic_sub(" + newX + ", " + newY + ")";
+                DevExtensions += "#pragma OPENCL EXTENSION cl_khr_int64_base_atomics : enable\n";
+            }
+            else if (funcName == "atomicExch") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "atomic_xchg(" + newX + ", " + newY + ")";
+                DevExtensions += "#pragma OPENCL EXTENSION cl_khr_int64_base_atomics : enable\n";
+            }
+            else if (funcName == "atomicMin") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "atomic_min(" + newX + ", " + newY + ")";
+                DevExtensions += "#pragma OPENCL EXTENSION cl_khr_int64_extended_atomics : enable\n";
+            }
+            else if (funcName == "atomicMax") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "atomic_max(" + newX + ", " + newY + ")";
+                DevExtensions += "#pragma OPENCL EXTENSION cl_khr_int64_extended_atomics : enable\n";
+            }
+            else if (funcName == "atomicInc") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "atomic_inc(" + newX + ", " + newY + ")";
+                DevExtensions += "#pragma OPENCL EXTENSION cl_khr_int64_base_atomics : enable\n";
+            }
+            else if (funcName == "atomicDec") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "atomic_dec(" + newX + ", " + newY + ")";
+                DevExtensions += "#pragma OPENCL EXTENSION cl_khr_int64_base_atomics : enable\n";
+            }
+            else if (funcName == "atomicCAS") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                Expr *z = ce->getArg(2);
+                std::string newX, newY, newZ;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                RewriteKernelExpr(z, newZ);
+                newExpr = "atomic_cmpxchg(" + newX + ", " + newY + ", " + newZ + ")";
+                DevExtensions += "#pragma OPENCL EXTENSION cl_khr_int64_base_atomics : enable\n";
+            }
+            else if (funcName == "atomicAnd") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "atomic_and(" + newX + ", " + newY + ")";
+                DevExtensions += "#pragma OPENCL EXTENSION cl_khr_int64_extended_atomics : enable\n";
+            }
+            else if (funcName == "atomicOr") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "atomic_or(" + newX + ", " + newY + ")";
+                DevExtensions += "#pragma OPENCL EXTENSION cl_khr_int64_extended_atomics : enable\n";
+            }
+            else if (funcName == "atomicXor") {
+                Expr *x = ce->getArg(0);
+                Expr *y = ce->getArg(1);
+                std::string newX, newY;
+                RewriteKernelExpr(x, newX);
+                RewriteKernelExpr(y, newY);
+                newExpr = "atomic_xor(" + newX + ", " + newY + ")";
+                DevExtensions += "#pragma OPENCL EXTENSION cl_khr_int64_extended_atomics : enable\n";
             }
             else {
 		//TODO: Make sure every possible function call goes through here, or else we may not get rewrites on interior nested calls.
@@ -3671,7 +3990,7 @@ return true;
         HostPreamble = HostIncludes + "\n" + HostDecls + "\n" + HostGlobalVars + "\n" + HostKernels + "\n" + HostFunctions;
 	generateReplacement(HostReplace, SM, SM->getLocForStartOfFile(MainFileID), 0, HostPreamble);
         //Insert device preamble at top of main kernel file
-        DevPreamble = DevFunctions;
+        DevPreamble = DevExtensions +"\n" + DevFunctions;
 	generateReplacement(KernReplace, SM, SM->getLocForStartOfFile(MainFileID), 0, DevPreamble);
 
 	//Generate Local init for this TU
